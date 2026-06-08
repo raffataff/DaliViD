@@ -1,0 +1,354 @@
+/* ═══════════════════════════════════════════════════════════
+   DaliVid — Toolbar Styles
+   ═══════════════════════════════════════════════════════════ */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  height: var(--toolbar-height);
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border-default);
+  padding: 0 var(--space-sm);
+  gap: var(--space-xs);
+  user-select: none;
+  z-index: 1000;
+}
+
+/* ── Sections ── */
+.toolbar__section {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+.toolbar__section--left {
+  flex: 0 0 auto;
+}
+.toolbar__section--center {
+  flex: 1;
+  justify-content: center;
+  gap: var(--space-md);
+}
+.toolbar__section--right {
+  flex: 0 0 auto;
+  gap: var(--space-sm);
+}
+
+/* ── Logo ── */
+.toolbar__logo {
+  padding: 0 var(--space-sm);
+}
+.toolbar__logo-text {
+  font-family: var(--font-code);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: var(--accent-cyan);
+  text-shadow: 0 0 12px var(--accent-cyan-glow),
+               0 0 24px rgba(0, 229, 255, 0.15);
+}
+
+/* ── Divider ── */
+.toolbar__divider {
+  width: 1px;
+  height: 20px;
+  background: var(--border-default);
+  margin: 0 var(--space-xs);
+}
+
+/* ── Buttons ── */
+.toolbar__btn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
+  transition: background var(--duration-fast), color var(--duration-fast);
+}
+.toolbar__btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.toolbar__btn--export {
+  background: linear-gradient(135deg, rgba(0, 229, 255, 0.12), rgba(255, 0, 170, 0.08));
+  border: 1px solid rgba(0, 229, 255, 0.2);
+}
+.toolbar__btn--export:hover {
+  background: linear-gradient(135deg, rgba(0, 229, 255, 0.2), rgba(255, 0, 170, 0.14));
+  border-color: var(--accent-cyan);
+}
+
+/* ── Transport Buttons ── */
+.toolbar__playback {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--bg-base);
+  border-radius: var(--radius-md);
+  padding: 2px;
+}
+.toolbar__transport-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  transition: background var(--duration-fast), color var(--duration-fast);
+}
+.toolbar__transport-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.toolbar__transport-btn--play {
+  width: 34px;
+}
+.toolbar__transport-btn--play.active {
+  color: var(--accent-cyan);
+}
+
+/* ── Timecode ── */
+.toolbar__timecode {
+  font-size: 13px;
+  letter-spacing: 1px;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  min-width: 120px;
+  text-align: center;
+}
+
+/* ── Selects ── */
+.toolbar__speed-select,
+.toolbar__resolution-select {
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+.toolbar__speed-select:hover,
+.toolbar__resolution-select:hover {
+  border-color: var(--border-strong);
+}
+
+/* ── Toggle Buttons ── */
+.toolbar__toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  transition: all var(--duration-fast);
+}
+.toolbar__toggle-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.toolbar__toggle-btn--active {
+  color: var(--accent-cyan);
+  background: rgba(0, 229, 255, 0.1);
+}
+.toolbar__toggle-btn--active.toolbar__toggle-btn--cyan {
+  box-shadow: 0 0 8px var(--accent-cyan-glow);
+}
+
+/* ── FPS Counter ── */
+.toolbar__fps {
+  font-size: 11px;
+  color: var(--text-secondary);
+  padding: 0 var(--space-sm);
+  min-width: 50px;
+  text-align: right;
+}
+
+/* ── Autosave Dot ── */
+.toolbar__autosave-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: background var(--duration-normal);
+}
+.toolbar__autosave-dot--saved {
+  background: var(--status-success);
+}
+.toolbar__autosave-dot--unsaved {
+  background: var(--accent-amber);
+}
+.toolbar__autosave-dot--saving {
+  background: var(--accent-amber);
+  animation: autosave-spin 1s linear infinite;
+}
+
+@keyframes autosave-spin {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+/* ── Project Name ── */
+.toolbar__project-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px var(--space-sm);
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  transition: all var(--duration-fast);
+  max-width: 220px;
+}
+.toolbar__project-name:hover {
+  border-color: rgba(0, 229, 255, 0.2);
+  background: rgba(0, 229, 255, 0.04);
+}
+.toolbar__project-name-icon {
+  font-size: 9px;
+  color: var(--accent-cyan);
+  opacity: 0.7;
+  transition: opacity var(--duration-fast), transform var(--duration-fast);
+  flex-shrink: 0;
+}
+.toolbar__project-name:hover .toolbar__project-name-icon {
+  opacity: 1;
+  transform: translateX(1px);
+}
+.toolbar__project-name-text {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toolbar__project-name--untitled .toolbar__project-name-text {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-style: italic;
+}
+.toolbar__project-name-input {
+  padding: 3px var(--space-sm);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent-cyan);
+  background: rgba(0, 229, 255, 0.06);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  font-family: var(--font-code);
+  outline: none;
+  width: 220px;
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.15), inset 0 1px 3px rgba(0, 0, 0, 0.2);
+  caret-color: var(--accent-cyan);
+}
+.toolbar__project-name-input::selection {
+  background: rgba(0, 229, 255, 0.25);
+}
+
+/* ── Project Folder Workspace Badge ── */
+.toolbar__folder-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-hover);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 3px var(--space-sm);
+  font-size: 11px;
+  color: var(--text-primary);
+}
+
+.toolbar__folder-badge--active {
+  border-color: rgba(0, 229, 255, 0.3);
+  background: rgba(0, 229, 255, 0.05);
+}
+
+.toolbar__folder-disconnect {
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0 2px;
+  margin-left: var(--space-xs);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  width: 14px;
+  height: 14px;
+  line-height: 1;
+}
+
+.toolbar__folder-disconnect:hover {
+  background: rgba(255, 0, 0, 0.15);
+  color: #ff3344;
+}
+
+.toolbar__btn--cyan {
+  border: 1px solid rgba(0, 229, 255, 0.3);
+  background: rgba(0, 229, 255, 0.05);
+  color: var(--accent-cyan);
+}
+
+.toolbar__btn--cyan:hover {
+  background: rgba(0, 229, 255, 0.15);
+  color: #fff;
+  border-color: var(--accent-cyan);
+}
+
+.toolbar__btn--warning {
+  border: 1px solid rgba(255, 170, 0, 0.3);
+  background: rgba(255, 170, 0, 0.05);
+  color: var(--accent-amber);
+}
+
+.toolbar__btn--warning:hover {
+  background: rgba(255, 170, 0, 0.15);
+  color: #fff;
+  border-color: var(--accent-amber);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot--green {
+  background: var(--status-success);
+  box-shadow: 0 0 6px var(--status-success);
+}
+
+.dot--orange {
+  background: var(--accent-amber);
+  box-shadow: 0 0 6px var(--accent-amber);
+}
+
+.animate-pulse {
+  animation: pulse-border 2s infinite;
+}
+
+@keyframes pulse-border {
+  0%, 100% {
+    border-color: rgba(255, 170, 0, 0.3);
+  }
+  50% {
+    border-color: rgba(255, 170, 0, 0.8);
+    box-shadow: 0 0 4px rgba(255, 170, 0, 0.2);
+  }
+}

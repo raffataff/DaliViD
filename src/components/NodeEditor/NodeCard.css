@@ -1,0 +1,374 @@
+/* ══════════════════════════════════════════════════════════
+   DaliVid — NodeCard.css
+   Styles for individual node cards in the graph editor.
+   ══════════════════════════════════════════════════════════ */
+
+.node-card {
+  position: absolute;
+  width: 270px;
+  min-height: 60px;
+  background: var(--bg-secondary, #1a1a2e);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-left: 3px solid #00e5ff;
+  border-radius: 6px;
+  cursor: default;
+  user-select: none;
+  transition: box-shadow 0.15s, border-color 0.15s;
+  z-index: 1;
+  overflow: visible;
+}
+
+.node-card:hover {
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.node-card--selected {
+  border-color: var(--accent-cyan, #00e5ff) !important;
+  box-shadow: 0 0 12px rgba(0, 229, 255, 0.25);
+  z-index: 10;
+}
+
+.node-card--preview-tap {
+  box-shadow: 0 0 16px rgba(0, 229, 255, 0.4);
+}
+
+.node-card--orphaned {
+  opacity: 0.55;
+}
+
+.node-card--bypassed {
+  opacity: 0.45;
+}
+
+.node-card--dragging {
+  z-index: 100;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+
+/* ── Header ── */
+.node-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  min-height: 28px;
+}
+
+.node-card__type {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.node-card__header-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.node-card__action-btn {
+  width: 27px;
+  height: 27px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.12s;
+}
+
+.node-card__action-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(136, 252, 252, 0.7);
+}
+
+.node-card__action-btn--active {
+  color: var(--accent-cyan, #00e5ff);
+}
+
+.node-card__action-btn--delete:hover {
+  background: rgba(255, 50, 50, 0.15);
+  color: #ff4444;
+}
+
+/* ── Socket Area (multi-socket layout) ── */
+.node-card__socket-area {
+  display: flex;
+  position: relative;
+  min-height: 26px;
+}
+
+.node-card__sockets-left {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 0;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.node-card__sockets-right {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 0;
+  min-width: 0;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.node-card__center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 4px;
+  min-height: 20px;
+  position: relative;
+}
+
+/* ── Socket Rows ── */
+.node-card__socket-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-height: 20px;
+}
+
+.node-card__socket-row--input {
+  margin-left: -7px;
+}
+
+.node-card__socket-row--output {
+  margin-right: -7px;
+  justify-content: flex-end;
+}
+
+/* ── Bypass / Preview overlays ── */
+.node-card__bypass-overlay {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: rgba(255, 255, 255, 0.5);
+  background: rgba(255, 80, 80, 0.15);
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+
+.node-card__preview-badge {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--accent-cyan, #00e5ff);
+  background: rgba(0, 229, 255, 0.08);
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+/* ── Parameters Section ── */
+.node-card__params {
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  padding: 0 6px 6px;
+}
+
+.node-card__params-divider {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: rgba(255, 255, 255, 0.2);
+  text-align: center;
+  padding: 4px 0 2px;
+}
+
+/* Param row with inline socket */
+.node-card__param-row-with-socket {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.node-card__param-socket {
+  position: absolute;
+  left: -13px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+}
+
+/* ── Slider Row ── */
+.node-card__slider-row {
+  display: grid;
+  grid-template-columns: 60px 1fr 40px;
+  align-items: center;
+  gap: 8px;
+  padding: 1px 6px;
+  min-height: 22px;
+}
+
+.node-card__slider-label {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-card__slider {
+  flex: 1;
+  width: 100%;
+  height: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.node-card__slider-value {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.4);
+  text-align: right;
+  cursor: text;
+}
+
+.node-card__slider-row--disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.node-card__slider-label {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+  min-width: 48px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-card__slider {
+  flex: 1;
+  height: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+  min-width: 40px;
+}
+
+.node-card__slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent-cyan, #00e5ff);
+  cursor: pointer;
+  box-shadow: 0 0 4px rgba(0, 229, 255, 0.3);
+}
+
+.node-card__slider-value {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.4);
+  min-width: 28px;
+  text-align: flex-end;
+  cursor: text;
+}
+
+.node-card__slider-value-input {
+  width: 36px;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--accent-cyan, #00e5ff);
+  color: #fff;
+  border-radius: 2px;
+  padding: 1px 3px;
+  text-align: right;
+}
+
+/* Checkbox */
+.node-card__checkbox {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.node-card__checkbox input {
+  display: none;
+}
+
+.node-card__checkbox-mark {
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+  background: transparent;
+  transition: all 0.12s;
+}
+
+.node-card__checkbox input:checked + .node-card__checkbox-mark {
+  background: var(--accent-cyan, #00e5ff);
+  border-color: var(--accent-cyan, #00e5ff);
+}
+
+/* Select */
+.node-card__select {
+  flex: 1;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #2bff00;
+  border-radius: 3px;
+  padding: 2px 4px;
+  cursor: pointer;
+  min-width: 50px;
+}
+
+/* Color Input */
+.node-card__color-input {
+  width: 28px;
+  height: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  padding: 0;
+  cursor: pointer;
+  background: transparent;
+}
+
+/* Audio Bind Icon */
+.node-card__audio-bind-icon {
+  font-size: 10px;
+  cursor: pointer;
+}
+
+/* ── Execution Order ── */
+.node-card__exec-order {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  font-size: 8px;
+  color: rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.3);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+/* ── Orphan Warning ── */
+.node-card__orphan-warning {
+  position: absolute;
+  bottom: 2px;
+  right: 4px;
+  font-size: 12px;
+  cursor: help;
+}

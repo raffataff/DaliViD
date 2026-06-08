@@ -1,0 +1,204 @@
+/* ═══════════════════════════════════════════════════════════
+   DaliVid — Inspector Panel Styles
+   ═══════════════════════════════════════════════════════════ */
+
+.inspector__content {
+  padding: var(--space-sm);
+  overflow-y: auto;
+}
+
+.inspector__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.inspector__section-header {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-muted);
+  padding-bottom: var(--space-xs);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.inspector__field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  min-height: 24px;
+}
+
+.inspector__field-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.inspector__label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.inspector__value {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inspector__value--mono {
+  font-family: var(--font-code);
+  font-size: 10px;
+}
+
+.inspector__select {
+  padding: 3px 6px;
+  font-size: 11px;
+  min-width: 80px;
+}
+
+.inspector__input {
+  font-size: 11px;
+  width: 100%;
+}
+.inspector__input--small {
+  width: 60px;
+  text-align: center;
+}
+
+.inspector__separator {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* ── Toggle Switch ── */
+.inspector__toggle {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  height: 16px;
+  cursor: pointer;
+}
+.inspector__toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.inspector__toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  transition: background var(--duration-fast), border-color var(--duration-fast);
+}
+.inspector__toggle-slider::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: transform var(--duration-fast), background var(--duration-fast);
+}
+.inspector__toggle input:checked + .inspector__toggle-slider {
+  background: rgba(0, 229, 255, 0.2);
+  border-color: var(--accent-cyan);
+}
+.inspector__toggle input:checked + .inspector__toggle-slider::after {
+  transform: translateX(16px);
+  background: var(--accent-cyan);
+}
+
+/* ── Slider Control ── */
+.inspector__slider {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+.inspector__slider input[type="range"] {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  background: var(--bg-base);
+  border-radius: 2px;
+  outline: none;
+  border: none;
+  padding: 0;
+}
+.inspector__slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  cursor: pointer;
+  transition: background var(--duration-fast);
+}
+.inspector__slider input[type="range"]::-webkit-slider-thumb:hover {
+  background: var(--accent-cyan);
+}
+.inspector__slider-value {
+  font-size: 10px;
+  font-family: var(--font-code);
+  color: var(--text-muted);
+  min-width: 32px;
+  text-align: right;
+}
+
+/* ── Button ── */
+.inspector__btn {
+  padding: var(--space-xs) var(--space-md);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--bg-hover);
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+  transition: all var(--duration-fast);
+  width: 100%;
+  text-align: center;
+}
+.inspector__btn:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+.inspector__btn--primary {
+  background: rgba(0, 229, 255, 0.1);
+  border-color: rgba(0, 229, 255, 0.3);
+  color: var(--accent-cyan);
+}
+.inspector__btn--primary:hover {
+  background: rgba(0, 229, 255, 0.2);
+  border-color: var(--accent-cyan);
+}
+
+/* ── Context Badge ── */
+.inspector__context-badge {
+  font-size: 9px;
+  font-weight: 400;
+  color: var(--text-disabled);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* ── Empty State ── */
+.inspector__empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 80px;
+  color: var(--text-disabled);
+  font-size: 12px;
+}
+

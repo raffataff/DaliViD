@@ -1,0 +1,100 @@
+/* ═══════════════════════════════════════════════════════════
+   DaliVid — Monaco Drawer Styles
+   ═══════════════════════════════════════════════════════════ */
+
+.monaco-drawer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--bg-primary);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  transform: translateY(100%);
+  transition: transform var(--duration-panel) var(--ease-panel);
+}
+
+.monaco-drawer--open {
+  transform: translateY(0);
+}
+
+.monaco-drawer__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--space-md);
+  height: 32px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.monaco-drawer__title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.monaco-drawer__title-badge {
+  color: var(--accent-cyan);
+  font-family: var(--font-code);
+  font-size: 10px;
+  background: rgba(0, 229, 255, 0.1);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+
+.monaco-drawer__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.monaco-drawer__btn {
+  padding: 4px 12px;
+  font-size: 11px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  transition: all var(--duration-fast);
+}
+
+.monaco-drawer__btn:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.monaco-drawer__btn--save {
+  background: rgba(0, 229, 255, 0.1);
+  color: var(--accent-cyan);
+  border: 1px solid rgba(0, 229, 255, 0.3);
+}
+.monaco-drawer__btn--save:hover {
+  background: rgba(0, 229, 255, 0.2);
+  border-color: var(--accent-cyan);
+}
+
+.monaco-drawer__btn--close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+}
+.monaco-drawer__btn--close:hover {
+  background: rgba(255, 68, 102, 0.2);
+  color: var(--status-error);
+}
+
+.monaco-drawer__editor-wrapper {
+  flex: 1;
+  position: relative;
+}

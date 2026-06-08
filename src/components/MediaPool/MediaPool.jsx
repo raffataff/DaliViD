@@ -1,0 +1,471 @@
+import { useState, useCallback, useMemo } from 'react'
+import useTimelineStore from '../../store/useTimelineStore'
+import useGraphStore from '../../store/useGraphStore'
+import useAudioStore from '../../store/useAudioStore'
+import useAppStore from '../../store/useAppStore'
+import { copyFileToProjectFolder } from '../../utils/projectSerializer'
+import { COMPOUND_PRESETS } from '../../shaders/compoundPresets'
+import './MediaPool.css'
+
+const TABS = [
+  { id: 'videos', label: 'Videos' },
+  { id: 'cameras', label: 'Cameras' },
+  { id: 'audio', label: 'Audio' },
+  { id: 'effects', label: 'Effects' },
+  { id: 'scopes', label: 'Scopes' },
+]
+
+export default function MediaPool() {
+  const [activeTab, setActiveTab] = useState('videos')
+  const [importedVideos, setImportedVideos] = useState([])
+  const [importedAudio, setImportedAudio] = useState([])
+  const [cameras, setCameras] = useState([])
+
+  const clips = useTimelineStore(s => s.clips)
+  const addTrack = useTimelineStore(s => s.addTrack)
+  const addClip = useTimelineStore(s => s.addClip)
+  const tracks = useTimelineStore(s => s.tracks)
+  const initClipGraph = useGraphStore(s => s.initClipGraph)
+  const projectFolderHandle = useAppStore(s => s.projectFolderHandle)
+
+  // Derive media pool entries from timeline clips so loaded projects show their media
+  const videoEntries = useMemo(() => {
+    const fromClips = clips
+      .filter(c => c.fileType === 'video')
+      .map(c => ({
+        id: `clip_video_${c.id}`,
+        filename: c.filename,
+        fileUrl: c.fileUrl || null,
+        fileType: 'video',
+        width: c.metadata?.width || 1920,
+        height: c.metadata?.height || 1080,
+        duration: c.metadata?.duration || (c.timelineEnd - c.timelineStart),
+        fps: c.metadata?.fps || 30,
+        size: c.metadata?.size || 0,
+        fromClip: true,
+      }))
+    // Merge: imported videos take precedence (they have fresh blob URLs), then clip-derived entries
+    const importedIds = new Set(importedVideos.map(v => v.filename))
+    const clipOnly = fromClips.filter(c => !importedIds.has(c.filename))
+    return [...importedVideos, ...clipOnly]
+  }, [clips, importedVideos])
+
+  const audioEntries = useMemo(() => {
+    const fromClips = clips
+      .filter(c => c.fileType === 'audio')
+      .map(c => ({
+        id: `clip_audio_${c.id}`,
+        filename: c.filename,
+        fileUrl: c.fileUrl || null,
+        fileType: 'audio',
+        duration: c.metadata?.duration || (c.timelineEnd - c.timelineStart),
+        size: c.metadata?.size || 0,
+        fromClip: true,
+      }))
+    const importedIds = new Set(importedAudio.map(a => a.filename))
+    const clipOnly = fromClips.filter(c => !importedIds.has(c.filename))
+    return [...importedAudio, ...clipOnly]
+  }, [clips, importedAudio])
+
+  // Import video file
+  const handleImportVideo = useCallback(() => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.mp4,.mov,.webm,.avi,.mkv,.m4v'
+    input.multiple = true
+    input.onchange = async (e) => {
+      const files = Array.from(e.target.files)
+      for (const file of files) {
+        if (projectFolderHandle) {
+          try {
+            await copyFileToProjectFolder(projectFolderHandle, file, 'media')
+          } catch (err) {
+            console.error('Failed to copy imported video file to project folder:', err)
+          }
+        }
+
+        const url = URL.createObjectURL(file)
+        
+        // Get video metadata
+        const video = document.createElement('video')
+        video.preload = 'metadata'
+        video.src = url
+        
+        await new Promise(resolve => {
+          video.onloadedmetadata = resolve
+          video.onerror = resolve
+        })
+
+        const entry = {
+          id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+          filename: file.name,
+          fileUrl: url,
+          fileType: 'video',
+          width: video.videoWidth || 1920,
+          height: video.videoHeight || 1080,
+          duration: video.duration || 10,
+          fps: 30,
+          size: file.size,
+          file,
+        }
+
+        setImportedVideos(prev => [...prev, entry])
+
+        // Auto-create track and clip
+        let videoTrack = tracks.find(t => t.type === 'video')
+        if (!videoTrack) {
+          const trackId = addTrack('video')
+          videoTrack = { id: trackId }
+        }
+
+        const clipId = addClip(videoTrack.id, {
+          filename: file.name,
+          fileUrl: url,
+          fileType: 'video',
+          timelineStart: 0,
+          timelineEnd: entry.duration,
+          sourceStart: 0,
+          sourceEnd: entry.duration,
+          width: entry.width,
+          height: entry.height,
+          fps: entry.fps,
+          duration: entry.duration,
+        })
+
+        // Init clip effect graph
+        initClipGraph(clipId, file.name)
+      }
+    }
+    input.click()
+  }, [tracks, addTrack, addClip, initClipGraph, projectFolderHandle])
+
+  // Import audio file
+  const handleImportAudio = useCallback(() => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.mp3,.wav,.ogg,.flac,.aac'
+    input.multiple = true
+    input.onchange = async (e) => {
+      const files = Array.from(e.target.files)
+      for (const file of files) {
+        if (projectFolderHandle) {
+          try {
+            await copyFileToProjectFolder(projectFolderHandle, file, 'audio')
+          } catch (err) {
+            console.error('Failed to copy imported audio file to project folder:', err)
+          }
+        }
+
+        const url = URL.createObjectURL(file)
+
+        // Get audio metadata
+        const audio = document.createElement('audio')
+        audio.preload = 'metadata'
+        audio.src = url
+
+        await new Promise(resolve => {
+          audio.onloadedmetadata = resolve
+          audio.onerror = resolve
+        })
+
+        const duration = audio.duration || 30
+
+        const entry = {
+          id: `audio_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+          filename: file.name,
+          fileUrl: url,
+          fileType: 'audio',
+          duration,
+          size: file.size,
+        }
+        setImportedAudio(prev => [...prev, entry])
+
+        let audioTrack = tracks.find(t => t.type === 'audio')
+        if (!audioTrack) {
+          const trackId = addTrack('audio')
+          audioTrack = { id: trackId }
+        }
+        const clipId = addClip(audioTrack.id, {
+          filename: file.name,
+          fileUrl: url,
+          fileType: 'audio',
+          timelineStart: 0,
+          timelineEnd: duration,
+          sourceStart: 0,
+          sourceEnd: duration,
+        })
+        initClipGraph(clipId, file.name, 'audio')
+      }
+    }
+    input.click()
+  }, [tracks, addTrack, addClip, projectFolderHandle])
+
+  // Detect cameras
+  const handleDetectCameras = useCallback(async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      const videoDevices = devices.filter(d => d.kind === 'videoinput')
+      setCameras(videoDevices.map(d => ({
+        id: d.deviceId,
+        label: d.label || `Camera ${d.deviceId.substr(0, 6)}`,
+        deviceId: d.deviceId,
+      })))
+    } catch (err) {
+      console.error('Failed to enumerate devices:', err)
+    }
+  }, [])
+
+  const formatSize = (bytes) => {
+    if (bytes < 1024) return `${bytes} B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  }
+
+  return (
+    <>
+      <div className="panel__header">
+        <span className="panel__header-title">Media Pool</span>
+      </div>
+      <div className="media-pool__tabs">
+        {TABS.map(tab => (
+          <button
+            key={tab.id}
+            className={`media-pool__tab ${activeTab === tab.id ? 'media-pool__tab--active' : ''}`}
+            onClick={() => setActiveTab(tab.id)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <div className="panel__content media-pool__content">
+        {/* ── Videos Tab ── */}
+        {activeTab === 'videos' && (
+          <>
+            <button className="media-pool__import-btn" onClick={handleImportVideo}>
+              + Import Video
+            </button>
+            {videoEntries.length === 0 ? (
+              <div className="media-pool__empty">
+                <div className="media-pool__empty-icon">
+                  <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1" opacity="0.3">
+                    <rect x="4" y="6" width="24" height="20" rx="2" />
+                    <path d="M13 12L20 16L13 20V12Z" />
+                  </svg>
+                </div>
+                <p className="media-pool__empty-text">Import video files to get started</p>
+                <p className="media-pool__empty-hint">Drag files here or use Import Video</p>
+              </div>
+            ) : (
+              <div className="media-pool__file-list">
+                {videoEntries.map(v => (
+                  <div key={v.id} className="media-pool__file-item">
+                    <div className="media-pool__file-thumb">
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
+                        <rect x="2" y="4" width="20" height="16" rx="2" />
+                        <path d="M10 9L15 12L10 15V9Z" fill="currentColor" />
+                      </svg>
+                    </div>
+                    <div className="media-pool__file-info">
+                      <div className="media-pool__file-name">{v.filename}</div>
+                      <div className="media-pool__file-meta mono">
+                        {v.width}×{v.height} · {v.duration.toFixed(1)}s · {formatSize(v.size)}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ── Cameras Tab ── */}
+        {activeTab === 'cameras' && (
+          <>
+            <button className="media-pool__import-btn" onClick={handleDetectCameras}>
+              Detect Cameras
+            </button>
+            {cameras.length === 0 ? (
+              <div className="media-pool__empty">
+                <p className="media-pool__empty-text">No cameras detected</p>
+                <p className="media-pool__empty-hint">Click Detect Cameras to scan</p>
+              </div>
+            ) : (
+              <div className="media-pool__file-list">
+                {cameras.map(cam => (
+                  <div key={cam.id} className="media-pool__file-item media-pool__file-item--interactive">
+                    <div className="media-pool__file-thumb" style={{ color: 'var(--accent-cyan)' }}>
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
+                        <rect x="2" y="6" width="14" height="12" rx="1" />
+                        <path d="M16 9.5L22 7V17L16 14.5" />
+                      </svg>
+                    </div>
+                    <div className="media-pool__file-info">
+                      <div className="media-pool__file-name">{cam.label}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ── Audio Tab ── */}
+        {activeTab === 'audio' && (
+          <>
+            <button className="media-pool__import-btn" onClick={handleImportAudio}>
+              + Import Audio
+            </button>
+            {audioEntries.length === 0 ? (
+              <div className="media-pool__empty">
+                <p className="media-pool__empty-text">No audio files imported</p>
+                <p className="media-pool__empty-hint">Import audio or enable microphone</p>
+              </div>
+            ) : (
+              <div className="media-pool__file-list">
+                {audioEntries.map(a => (
+                  <div key={a.id} className="media-pool__file-item">
+                    <div className="media-pool__file-thumb" style={{ color: 'var(--accent-magenta)' }}>
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
+                        <path d="M4 9v6M8 7v10M12 5v14M16 7v10M20 9v6" />
+                      </svg>
+                    </div>
+                    <div className="media-pool__file-info">
+                      <div className="media-pool__file-name">{a.filename}</div>
+                      <div className="media-pool__file-meta mono">{formatSize(a.size)}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ── Effects Tab ── */}
+        {activeTab === 'effects' && (
+          <>
+            <div className="media-pool__effects-section">
+              <div className="media-pool__section-label">Nodes</div>
+              <div className="media-pool__effects-grid">
+                {EFFECT_PRESETS.map(effect => (
+                  <div
+                    key={effect.type}
+                    className="media-pool__effect-card"
+                    style={{ borderColor: effect.color }}
+                    draggable="true"
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData('application/dalivid-drag', JSON.stringify({
+                        kind: 'node',
+                        nodeType: effect.type,
+                        name: effect.name,
+                      }))
+                      e.dataTransfer.effectAllowed = 'copy'
+                    }}
+                  >
+                    <div className="media-pool__effect-icon" style={{ color: effect.color }}>
+                      {effect.icon}
+                    </div>
+                    <div className="media-pool__effect-name">{effect.name}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="media-pool__effects-section">
+              <div className="media-pool__section-label">Presets</div>
+              <div className="media-pool__presets-grid">
+                {COMPOUND_PRESETS.map(preset => (
+                  <div
+                    key={preset.id}
+                    className="media-pool__preset-card"
+                    style={{ borderColor: preset.color }}
+                    draggable="true"
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData('application/dalivid-drag', JSON.stringify({
+                        kind: 'preset',
+                        presetId: preset.id,
+                        name: preset.name,
+                      }))
+                      e.dataTransfer.effectAllowed = 'copy'
+                    }}
+                  >
+                    <div className="media-pool__preset-icon" style={{ color: preset.color }}>
+                      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5">
+                        <rect x="2" y="4" width="16" height="12" rx="1" />
+                        <path d="M6 8h8M6 12h5" strokeLinecap="round" />
+                      </svg>
+                    </div>
+                    <div className="media-pool__preset-name">{preset.name}</div>
+                    <div className="media-pool__preset-desc">{preset.description}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── Scopes Tab ── */}
+        {activeTab === 'scopes' && (
+          <div className="media-pool__scopes">
+            <ScopesBars />
+          </div>
+        )}
+      </div>
+    </>
+  )
+}
+
+/** Simple 8-band scope visualization */
+function ScopesBars() {
+  const smoothedBands = useAudioStore(s => s.smoothedBands)
+  const rms = useAudioStore(s => s.rms)
+
+  // smoothedBands has 7 values, RMS is the 8th value
+  const bands = smoothedBands ? [...smoothedBands, rms] : [0, 0, 0, 0, 0, 0, 0, 0]
+
+  return (
+    <div className="media-pool__scopes-bars">
+      {bands.map((v, i) => (
+        <div key={i} className="media-pool__scope-bar-container">
+          <div
+            className="media-pool__scope-bar"
+            style={{ height: `${Math.min(1, Math.max(0, v)) * 100}%` }}
+          />
+          <span className="media-pool__scope-label mono">
+            {['SUB', 'BASS', 'LO', 'MID', 'HI', 'PRES', 'BRIL', 'RMS'][i]}
+          </span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+const EFFECT_PRESETS = [
+  { type: 'EDGE_DETECTION', name: 'Edge Detection', color: '#ff8844', icon: '◈' },
+  { type: 'COLOR_INVERSION', name: 'Color / HSV', color: '#ff44cc', icon: '◐' },
+  { type: 'GLITCH', name: 'Glitch', color: '#ff3344', icon: '▦' },
+  { type: 'FEEDBACK', name: 'Feedback', color: '#aa44ff', icon: '∞' },
+  { type: 'KALEIDOSCOPE', name: 'Kaleidoscope', color: '#44ccff', icon: '✻' },
+  { type: 'CHROMATIC_ABERRATION', name: 'Chromatic', color: '#ff44aa', icon: '◎' },
+  { type: 'BLOOM', name: 'Bloom', color: '#ffcc44', icon: '✦' },
+  { type: 'CRT', name: 'CRT', color: '#88aa44', icon: '▤' },
+  { type: 'MIRROR', name: 'Mirror', color: '#cc44ff', icon: '⬔' },
+  { type: 'THRESHOLD', name: 'Posterize', color: '#ccaa44', icon: '◧' },
+  { type: 'HALFTONE', name: 'Halftone', color: '#aaaacc', icon: '◉' },
+  { type: 'BLUR', name: 'Blur', color: '#6688cc', icon: '◌' },
+  { type: 'PIXELATE', name: 'Pixelate', color: '#44aa88', icon: '▣' },
+  { type: 'NOISE', name: 'Film Grain', color: '#998877', icon: '░' },
+  { type: 'VORONOI', name: 'Voronoi', color: '#44ddaa', icon: '⬡' },
+  { type: 'FLUID_WARP', name: 'Fluid Warp', color: '#4488ff', icon: '≋' },
+  { type: 'PIXEL_SORT', name: 'Pixel Sort', color: '#ff6644', icon: '▥' },
+  { type: 'DEPTH_BLUR', name: 'Depth Blur', color: '#6666cc', icon: '◐' },
+  { type: 'PARTICLE_DISPLACE', name: 'Particles', color: '#ff88cc', icon: '✧' },
+  { type: 'LUT', name: 'LUT / Grade', color: '#ccaa66', icon: '◆' },
+  { type: 'EMBOSS', name: 'Emboss', color: '#999999', icon: '◇' },
+  { type: 'VIGNETTE', name: 'Vignette', color: '#776644', icon: '◯' },
+  { type: 'ASCII', name: 'ASCII', color: '#44cc44', icon: 'A#' },
+  { type: 'CHROMA_KEY', name: 'Chroma Key', color: '#00cc44', icon: '◫' },
+  { type: 'LENS_DISTORTION', name: 'Lens Dist.', color: '#8888cc', icon: '◠' },
+  { type: 'DISPLACEMENT', name: 'Displace', color: '#cc6644', icon: '↯' },
+  { type: 'AUDIO_VISUALIZER', name: 'Audio Viz', color: '#ff00aa', icon: '♫' },
+  { type: 'MATH_BLEND', name: 'Math/Blend', color: '#448888', icon: '⊕' },
+  { type: 'CUSTOM', name: 'Custom', color: '#00e5ff', icon: '{ }' },
+]

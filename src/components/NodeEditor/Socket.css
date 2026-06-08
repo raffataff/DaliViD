@@ -1,0 +1,62 @@
+/* ═══════════════════════════════════════════════════════════
+   DaliVid — Socket Styles
+   ═══════════════════════════════════════════════════════════ */
+
+.socket {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  padding: 2px 0;
+  position: relative;
+}
+
+.socket--input {
+  flex-direction: row;
+}
+.socket--output {
+  flex-direction: row-reverse;
+}
+
+/* Mini sockets (for inline param inputs) */
+.socket--mini {
+  padding: 1px 0;
+}
+
+.socket__circle {
+  border-radius: 50%;
+  border: 2px solid #00e5ff;
+  background: transparent;
+  transition: all 0.12s ease;
+  cursor: crosshair;
+  box-sizing: border-box;
+  flex-shrink: 0;
+  /* Default size — overridden by inline styles */
+  width: 18px;
+  height: 18px;
+}
+
+.socket__circle:hover {
+  transform: scale(1.4);
+  filter: brightness(1.3);
+}
+
+.socket__circle--connected {
+  transform: scale(1.05);
+}
+
+.socket__label {
+  font-size: 12px;
+  color: var(--text-muted, rgba(255,255,255,0.45));
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+}
+
+.socket__label--input {
+  text-align: left;
+}
+
+.socket__label--output {
+  text-align: right;
+}

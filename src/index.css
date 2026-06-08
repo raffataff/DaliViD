@@ -1,0 +1,234 @@
+/* ═══════════════════════════════════════════════════════════
+   DaliVid — Global Design Tokens & Reset
+   ═══════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* ── Backgrounds ── */
+  --bg-base: #0d0d0f;
+  --bg-primary: #141418;
+  --bg-elevated: #1a1a20;
+  --bg-surface: #1e1e26;
+  --bg-hover: #222230;
+  --bg-active: #282838;
+
+  /* ── Borders ── */
+  --border-default: #2a2a35;
+  --border-subtle: #222230;
+  --border-strong: #3a3a48;
+
+  /* ── Accent Colors ── */
+  --accent-cyan: #00e5ff;
+  --accent-cyan-dim: #00b8cc;
+  --accent-cyan-glow: rgba(0, 229, 255, 0.3);
+  --accent-magenta: #ff00aa;
+  --accent-magenta-dim: #cc0088;
+  --accent-magenta-glow: rgba(255, 0, 170, 0.3);
+  --accent-amber: #ffaa00;
+  --accent-amber-dim: #cc8800;
+  --accent-amber-glow: rgba(255, 170, 0, 0.3);
+
+  /* ── Status Colors ── */
+  --status-success: #44cc88;
+  --status-error: #ff4466;
+  --status-warning: #ffaa00;
+  --status-info: #4488ff;
+
+  /* ── Text ── */
+  --text-primary: #e8e8f0;
+  --text-secondary: #b0b0c0;
+  --text-muted: #888899;
+  --text-disabled: #555566;
+
+  /* ── Typography ── */
+  --font-ui: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-code: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+
+  /* ── Spacing ── */
+  --space-xxs: 2px;
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-xxl: 32px;
+
+  /* ── Radius ── */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  /* ── Shadows ── */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.6);
+  --shadow-glow-cyan: 0 0 12px var(--accent-cyan-glow);
+  --shadow-glow-magenta: 0 0 12px var(--accent-magenta-glow);
+  --shadow-glow-amber: 0 0 12px var(--accent-amber-glow);
+
+  /* ── Transitions ── */
+  --ease-panel: cubic-bezier(0.4, 0, 0.2, 1);
+  --duration-panel: 200ms;
+  --duration-fast: 120ms;
+  --duration-normal: 200ms;
+
+  /* ── Layout Sizes ── */
+  --toolbar-height: 44px;
+  --min-media-pool: 180px;
+  --min-preview-w: 320px;
+  --min-preview-h: 240px;
+  --min-inspector: 220px;
+  --min-node-editor: 120px;
+  --min-timeline: 80px;
+
+  /* ── Node Graph ── */
+  --dot-grid-bg: #0a0a0e;
+  --dot-grid-dot: #1e1e26;
+  --dot-grid-spacing: 20px;
+
+  /* ── Scrollbar ── */
+  --scrollbar-track: #1a1a20;
+  --scrollbar-thumb: #333340;
+  --scrollbar-thumb-hover: #555566;
+}
+
+/* ── Global Reset ── */
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Scrollbar Styling ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+::-webkit-scrollbar-corner {
+  background: var(--scrollbar-track);
+}
+
+/* ── Selection ── */
+::selection {
+  background: var(--accent-cyan);
+  color: var(--bg-base);
+}
+
+/* ── Focus Visible ── */
+:focus-visible {
+  outline: 1px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+/* ── Button Reset ── */
+button {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  cursor: pointer;
+  border: none;
+  outline: none;
+  color: var(--text-primary);
+  background: transparent;
+}
+
+/* ── Input Reset ── */
+input, select, textarea {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  padding: var(--space-xs) var(--space-sm);
+  outline: none;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 0 1px var(--accent-cyan-glow);
+}
+
+/* ── Utility Classes ── */
+.mono { font-family: var(--font-code); }
+.text-cyan { color: var(--accent-cyan); }
+.text-magenta { color: var(--accent-magenta); }
+.text-amber { color: var(--accent-amber); }
+.text-muted { color: var(--text-muted); }
+.text-error { color: var(--status-error); }
+
+/* ── Tooltip Base ── */
+[data-tooltip] {
+  position: relative;
+}
+[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%) scale(0.95);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--duration-fast), transform var(--duration-fast);
+  z-index: 10000;
+}
+[data-tooltip]:hover::after {
+  opacity: 1;
+  transform: translateX(-50%) scale(1);
+  transition-delay: 250ms;
+}
+
+/* ── Viewport Warning ── */
+.viewport-warning {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.92);
+  backdrop-filter: blur(8px);
+}
+.viewport-warning__content {
+  text-align: center;
+  padding: var(--space-xxl);
+}
+.viewport-warning__content h2 {
+  color: var(--accent-amber);
+  font-size: 20px;
+  margin-bottom: var(--space-md);
+}
+.viewport-warning__content p {
+  color: var(--text-muted);
+  font-size: 14px;
+}

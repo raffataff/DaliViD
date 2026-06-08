@@ -1,0 +1,212 @@
+/* ═══════════════════════════════════════════════════════════
+   DaliVid — Export Modal Styles
+   ═══════════════════════════════════════════════════════════ */
+
+.export-modal__overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+}
+
+.export-modal {
+  width: 420px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+.export-modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-lg) var(--space-xl);
+  border-bottom: 1px solid var(--border-default);
+}
+.export-modal__header h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.export-modal__close {
+  color: var(--text-muted);
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  transition: all var(--duration-fast);
+}
+.export-modal__close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.export-modal__body {
+  padding: var(--space-lg) var(--space-xl);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+/* Tabs */
+.export-modal__tabs {
+  display: flex;
+  gap: 4px;
+  background: var(--bg-base);
+  padding: 3px;
+  border-radius: var(--radius-md);
+}
+.export-modal__tab {
+  flex: 1;
+  padding: var(--space-xs) var(--space-md);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  transition: all var(--duration-fast);
+}
+.export-modal__tab:hover {
+  color: var(--text-secondary);
+}
+.export-modal__tab--active {
+  background: var(--bg-elevated);
+  color: var(--accent-cyan);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Fields */
+.export-modal__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+.export-modal__field label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.export-modal__field select,
+.export-modal__field input[type="number"] {
+  padding: var(--space-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.export-modal__slider-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+.export-modal__slider-row input[type="range"] {
+  flex: 1;
+}
+.export-modal__slider-row span {
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 36px;
+  text-align: right;
+}
+
+.export-modal__res-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+.export-modal__res-row input {
+  flex: 1;
+  text-align: center;
+}
+.export-modal__res-row span {
+  color: var(--text-muted);
+}
+
+/* Presets */
+.export-modal__presets {
+  display: flex;
+  gap: var(--space-xs);
+}
+.export-modal__preset-btn {
+  flex: 1;
+  padding: var(--space-xs) var(--space-sm);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--duration-fast);
+}
+.export-modal__preset-btn:hover {
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+}
+
+/* Progress */
+.export-modal__progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+.export-modal__progress-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-base);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.export-modal__progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent-magenta));
+  border-radius: 3px;
+  transition: width 0.1s ease-out;
+}
+.export-modal__progress span {
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 36px;
+  text-align: right;
+}
+
+/* Footer */
+.export-modal__footer {
+  padding: var(--space-md) var(--space-xl) var(--space-lg);
+  border-top: 1px solid var(--border-default);
+}
+.export-modal__export-btn {
+  width: 100%;
+  padding: var(--space-sm) var(--space-lg);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--bg-base);
+  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-cyan-dim));
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--duration-fast);
+  border: none;
+}
+.export-modal__export-btn:hover {
+  box-shadow: var(--shadow-glow-cyan);
+  transform: translateY(-1px);
+}
+.export-modal__cancel-btn {
+  width: 100%;
+  padding: var(--space-sm) var(--space-lg);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-hover);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}

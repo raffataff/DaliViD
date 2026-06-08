@@ -1,0 +1,28 @@
+/* ═══════════════════════════════════════════════════════════
+   DaliVid — Noodle (Connection Cable) Styles
+   ═══════════════════════════════════════════════════════════ */
+
+.noodle {
+  pointer-events: none;
+}
+
+.noodle__hitarea {
+  pointer-events: stroke;
+}
+
+.noodle__cable {
+  pointer-events: none;
+  transition: stroke-width 0.1s;
+}
+
+.noodle--selected .noodle__cable {
+  animation: marchingAnts 0.5s linear infinite;
+}
+
+@keyframes marchingAnts {
+  to { stroke-dashoffset: -12; }
+}
+
+.noodle--dragging .noodle__cable {
+  animation: marchingAnts 0.4s linear infinite;
+}

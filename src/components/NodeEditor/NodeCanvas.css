@@ -1,0 +1,214 @@
+/* ═══════════════════════════════════════════════════════════
+   DaliVid — Node Editor Canvas Styles
+   ═══════════════════════════════════════════════════════════ */
+
+.node-canvas__container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  cursor: default;
+}
+
+/* ── Dot Grid Background ── */
+.node-canvas__grid {
+  position: absolute;
+  inset: 0;
+  background-color: var(--dot-grid-bg);
+  background-image: radial-gradient(circle, var(--dot-grid-dot) 1px, transparent 1px);
+  background-size: 20px 20px;
+  pointer-events: all;
+  cursor: grab;
+}
+
+/* ── Transform Surface ── */
+.node-canvas__surface {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+/* ── Empty State ── */
+.node-canvas__empty-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  pointer-events: none;
+  opacity: 0.3;
+}
+.node-canvas__empty-hint p {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: var(--space-xs);
+}
+
+/* ── Back to Master button ── */
+.node-canvas__back-btn {
+  font-size: 11px;
+  color: var(--accent-amber);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 170, 0, 0.1);
+  border: 1px solid rgba(255, 170, 0, 0.2);
+  transition: all var(--duration-fast);
+}
+.node-canvas__back-btn:hover {
+  background: rgba(255, 170, 0, 0.2);
+  border-color: var(--accent-amber);
+}
+
+/* ── Minimap ── */
+.node-canvas__minimap {
+  position: absolute;
+  bottom: var(--space-sm);
+  right: var(--space-sm);
+  width: 180px;
+  height: 100px;
+  background: rgba(10, 10, 14, 0.8);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  opacity: 0.3;
+  transition: opacity var(--duration-fast);
+  overflow: hidden;
+}
+.node-canvas__minimap:hover { opacity: 0.7; }
+.node-canvas__minimap-label {
+  position: absolute;
+  top: 4px;
+  left: 6px;
+  font-size: 8px;
+  color: var(--text-disabled);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+/* ── Drop Target Feedback ── */
+.node-canvas__container--drop-target .node-canvas__grid {
+  box-shadow: inset 0 0 0 2px var(--accent-cyan);
+}
+.node-canvas__container--drop-target::after {
+  content: 'Drop here';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 13px;
+  color: var(--accent-cyan);
+  pointer-events: none;
+  z-index: 100;
+  opacity: 0.7;
+}
+
+/* ── Marquee Selection ── */
+.node-canvas__marquee {
+  position: absolute;
+  border: 1px solid #00e5ff;
+  background: rgba(0, 229, 255, 0.08);
+  pointer-events: none;
+  z-index: 100;
+}
+
+/* ── Context Menu ── */
+.node-canvas__context-menu {
+  position: fixed;
+  z-index: 10000;
+  width: 220px;
+  max-height: 400px;
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-xs);
+}
+
+.node-canvas__search-input {
+  width: 100%;
+  padding: var(--space-sm);
+  margin-bottom: var(--space-xs);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.node-canvas__search-input:focus { border-color: var(--accent-cyan); }
+.node-canvas__search-input::placeholder { color: var(--text-disabled); }
+
+.node-canvas__menu-section { padding: var(--space-xxs) 0; }
+.node-canvas__menu-section + .node-canvas__menu-section {
+  border-top: 1px solid var(--border-subtle);
+  margin-top: var(--space-xxs);
+  padding-top: var(--space-xs);
+}
+
+.node-canvas__menu-label {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-disabled);
+  padding: var(--space-xxs) var(--space-sm);
+}
+
+.node-canvas__menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: var(--space-xs) var(--space-sm);
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  transition: background var(--duration-fast), color var(--duration-fast);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.node-canvas__menu-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.node-canvas__menu-item:focus {
+  background: rgba(0, 229, 255, 0.1);
+  color: var(--accent-cyan);
+  outline: none;
+}
+.node-canvas__menu-item:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.node-canvas__menu-item:disabled:hover {
+  background: none;
+  color: var(--text-secondary);
+}
+
+/* ── Compound Node Card Styles ── */
+.node-card__compound-badge {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(255, 0, 170, 0.15);
+  color: #ff00aa;
+}
+
+.node-card__compound-dot {
+  flex-shrink: 0;
+}
+
+.node-card__exposed-param-row {
+  padding: 2px 6px;
+}
+
+.node-card__exposed-param-label {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-disabled);
+  display: block;
+  margin-bottom: 2px;
+}
