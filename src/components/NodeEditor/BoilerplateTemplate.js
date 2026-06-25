@@ -13,6 +13,13 @@ uniform vec2 u_resolution;
 // Current playback time in seconds
 uniform float u_time;
 
+// ── Audio drivers — auto-declared, just use them (no uniform line needed):
+//   u_bass  u_mid  u_treble  u_rms  u_sub_bass  u_low_mid  u_high_mid  u_presence
+// Each is 0.0 until you wire the matching Audio Splitter band into this node's
+// "Audio Drivers" socket. 0 is neutral for  x + u_bass  and  x * (1.0 + u_bass).
+// Also: u_beat (always live), u_audio_bands[8] (full spectrum).
+// e.g. multiply brightness with bass:  col.rgb *= 1.0 + u_bass;
+
 // You can define custom parameters that will appear in the Inspector!
 // Syntax: // @param name="Label Name" min=0.0 max=1.0 default=0.5 step=0.01
 // @param name="Intensity" min=0.0 max=1.0 default=0.5 step=0.01

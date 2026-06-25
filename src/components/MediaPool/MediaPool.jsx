@@ -24,6 +24,7 @@ export default function MediaPool() {
   const clips = useTimelineStore(s => s.clips)
   const addTrack = useTimelineStore(s => s.addTrack)
   const addClip = useTimelineStore(s => s.addClip)
+  const updateClip = useTimelineStore(s => s.updateClip)
   const tracks = useTimelineStore(s => s.tracks)
   const initClipGraph = useGraphStore(s => s.initClipGraph)
   const projectFolderHandle = useAppStore(s => s.projectFolderHandle)
@@ -109,35 +110,46 @@ export default function MediaPool() {
           file,
         }
 
-        setImportedVideos(prev => [...prev, entry])
+        // Replace any existing pool entry with the same filename (avoid duplicates)
+        setImportedVideos(prev => [...prev.filter(v => v.filename !== file.name), entry])
 
-        // Auto-create track and clip
-        let videoTrack = tracks.find(t => t.type === 'video')
-        if (!videoTrack) {
-          const trackId = addTrack('video')
-          videoTrack = { id: trackId }
+        // If clips already reference this filename (e.g. a project whose media
+        // couldn't be restored), relink them to the fresh URL and keep their
+        // existing effect graphs — don't add a duplicate clip.
+        const existing = useTimelineStore.getState().clips.filter(
+          c => c.filename === file.name && c.fileType === 'video'
+        )
+        if (existing.length > 0) {
+          for (const c of existing) updateClip(c.id, { fileUrl: url })
+        } else {
+          // Auto-create track and clip
+          let videoTrack = tracks.find(t => t.type === 'video')
+          if (!videoTrack) {
+            const trackId = addTrack('video')
+            videoTrack = { id: trackId }
+          }
+
+          const clipId = addClip(videoTrack.id, {
+            filename: file.name,
+            fileUrl: url,
+            fileType: 'video',
+            timelineStart: 0,
+            timelineEnd: entry.duration,
+            sourceStart: 0,
+            sourceEnd: entry.duration,
+            width: entry.width,
+            height: entry.height,
+            fps: entry.fps,
+            duration: entry.duration,
+          })
+
+          // Init clip effect graph
+          initClipGraph(clipId, file.name)
         }
-
-        const clipId = addClip(videoTrack.id, {
-          filename: file.name,
-          fileUrl: url,
-          fileType: 'video',
-          timelineStart: 0,
-          timelineEnd: entry.duration,
-          sourceStart: 0,
-          sourceEnd: entry.duration,
-          width: entry.width,
-          height: entry.height,
-          fps: entry.fps,
-          duration: entry.duration,
-        })
-
-        // Init clip effect graph
-        initClipGraph(clipId, file.name)
       }
     }
     input.click()
-  }, [tracks, addTrack, addClip, initClipGraph, projectFolderHandle])
+  }, [tracks, addTrack, addClip, updateClip, initClipGraph, projectFolderHandle])
 
   // Import audio file
   const handleImportAudio = useCallback(() => {
@@ -178,27 +190,35 @@ export default function MediaPool() {
           duration,
           size: file.size,
         }
-        setImportedAudio(prev => [...prev, entry])
+        setImportedAudio(prev => [...prev.filter(a => a.filename !== file.name), entry])
 
-        let audioTrack = tracks.find(t => t.type === 'audio')
-        if (!audioTrack) {
-          const trackId = addTrack('audio')
-          audioTrack = { id: trackId }
+        // Relink existing audio clips with this filename instead of duplicating.
+        const existing = useTimelineStore.getState().clips.filter(
+          c => c.filename === file.name && c.fileType === 'audio'
+        )
+        if (existing.length > 0) {
+          for (const c of existing) updateClip(c.id, { fileUrl: url })
+        } else {
+          let audioTrack = tracks.find(t => t.type === 'audio')
+          if (!audioTrack) {
+            const trackId = addTrack('audio')
+            audioTrack = { id: trackId }
+          }
+          const clipId = addClip(audioTrack.id, {
+            filename: file.name,
+            fileUrl: url,
+            fileType: 'audio',
+            timelineStart: 0,
+            timelineEnd: duration,
+            sourceStart: 0,
+            sourceEnd: duration,
+          })
+          initClipGraph(clipId, file.name, 'audio')
         }
-        const clipId = addClip(audioTrack.id, {
-          filename: file.name,
-          fileUrl: url,
-          fileType: 'audio',
-          timelineStart: 0,
-          timelineEnd: duration,
-          sourceStart: 0,
-          sourceEnd: duration,
-        })
-        initClipGraph(clipId, file.name, 'audio')
       }
     }
     input.click()
-  }, [tracks, addTrack, addClip, projectFolderHandle])
+  }, [tracks, addTrack, addClip, updateClip, initClipGraph, projectFolderHandle])
 
   // Detect cameras
   const handleDetectCameras = useCallback(async () => {
@@ -468,4 +488,15 @@ const EFFECT_PRESETS = [
   { type: 'AUDIO_VISUALIZER', name: 'Audio Viz', color: '#ff00aa', icon: '♫' },
   { type: 'MATH_BLEND', name: 'Math/Blend', color: '#448888', icon: '⊕' },
   { type: 'CUSTOM', name: 'Custom', color: '#00e5ff', icon: '{ }' },
+  // Generators (Procedural)
+  { type: 'BIOMATH', name: 'Bio-Digital', color: '#44aaff', icon: '◈' },
+  { type: 'PLASMA', name: 'Plasma', color: '#ff00aa', icon: '◐' },
+  { type: 'FRACTAL', name: 'Fractal', color: '#cc44ff', icon: '❋' },
+  { type: 'TUNNEL', name: 'Tunnel', color: '#ff8844', icon: '◎' },
+  { type: 'GEOMETRIC', name: 'Geometric', color: '#88aa44', icon: '⬡' },
+  { type: 'LIGHTNING', name: 'Lightning', color: '#44ffaa', icon: '⚡' },
+  { type: 'CRYSTAL', name: 'Crystal', color: '#aaccff', icon: '◇' },
+  { type: 'COSMIC', name: 'Cosmic', color: '#aa44ff', icon: '✦' },
+  { type: 'WAVES', name: 'Waves', color: '#4488ff', icon: '≋' },
+  { type: 'SPACE_DISTORTION', name: 'Distortion', color: '#ccaa44', icon: '↯' },
 ]

@@ -29,6 +29,17 @@ export function getRegisteredTypes() {
   return Object.keys(SHADER_SOURCES)
 }
 
+/**
+ * Resolve the single source-of-truth GLSL for a node.
+ * Priority: user-edited custom source → node-attached shaderCode → registry default.
+ * Used by the compiler, the inspector (param parsing), and the Monaco editor so all
+ * three always read the exact same shader.
+ */
+export function getNodeSource(node) {
+  if (!node) return null
+  return node.customShaderSource || node.shaderCode || getShaderSource(node.type) || null
+}
+
 // ═══════════════════════════════════════════════════════════
 // Built-in Shader Sources
 // ═══════════════════════════════════════════════════════════
@@ -59,7 +70,8 @@ void main() {
   float br = length(texture(u_texture, v_uv + vec2(px.x, -px.y)).rgb);
   float gx = -tl - 2.0*l - bl + tr + 2.0*r + br;
   float gy = -tl - 2.0*t - tr + bl + 2.0*b + br;
-  float edge = sqrt(gx*gx + gy*gy) * u_strength;
+  // Audio driver (0 until wired): treble sharpens the edges.
+  float edge = sqrt(gx*gx + gy*gy) * (u_strength + u_treble * 2.0);
   edge = step(u_threshold, edge);
   vec4 original = texture(u_texture, v_uv);
   fragColor = u_show_original
@@ -102,9 +114,10 @@ void main() {
   vec3 c = col.rgb;
   if (u_invert) c = 1.0 - c;
   vec3 hsv = rgb2hsv(c);
-  hsv.x = fract(hsv.x + u_hue_shift);
-  hsv.y *= u_saturation;
-  hsv.z *= u_brightness;
+  // Audio drivers (0 until wired): treble spins the hue, bass pumps brightness.
+  hsv.x = fract(hsv.x + u_hue_shift + u_treble * 0.15);
+  hsv.y *= u_saturation * (1.0 + u_mid * 0.5);
+  hsv.z *= u_brightness * (1.0 + u_bass * 0.6);
   fragColor = vec4(hsv2rgb(hsv), col.a);
 }
 `)
@@ -130,14 +143,16 @@ float random(vec2 st) {
 
 void main() {
   vec2 uv = v_uv;
+  // Audio drivers (0 until wired): bass drives glitch density, treble the tear.
+  float gIntensity = u_intensity + u_bass * 0.4;
   float blockY = floor(uv.y * u_resolution.y / u_block_size);
   float rnd = random(vec2(blockY, floor(u_time * u_speed)));
-  if (rnd < u_intensity) {
-    float offset = (random(vec2(blockY, floor(u_time * u_speed * 3.0))) - 0.5) * 0.1 * u_intensity;
+  if (rnd < gIntensity) {
+    float offset = (random(vec2(blockY, floor(u_time * u_speed * 3.0))) - 0.5) * 0.1 * gIntensity;
     uv.x += offset;
   }
   float rnd2 = random(vec2(floor(u_time * u_speed * 2.0), 0.0));
-  if (rnd2 < u_intensity * 0.3) {
+  if (rnd2 < gIntensity * 0.3 + u_treble * 0.15) {
     float rgbOffset = u_intensity * 0.01;
     float r = texture(u_texture, vec2(uv.x + rgbOffset, uv.y)).r;
     float g = texture(u_texture, uv).g;
@@ -161,7 +176,9 @@ uniform bool u_radial;
 out vec4 fragColor;
 
 void main() {
-  vec2 dir = u_radial ? normalize(v_uv - 0.5) * u_offset : vec2(u_offset, 0.0);
+  // Audio driver (0 until wired): treble widens the chromatic split.
+  float off = u_offset * (1.0 + u_treble * 2.0);
+  vec2 dir = u_radial ? normalize(v_uv - 0.5) * off : vec2(off, 0.0);
   float r = texture(u_texture, v_uv + dir).r;
   float g = texture(u_texture, v_uv).g;
   float b = texture(u_texture, v_uv - dir).b;
@@ -189,20 +206,28 @@ void main() {
   vec2 px = 1.0 / u_resolution;
   vec3 bloom = vec3(0.0);
   float total = 0.0;
-  int rad = int(u_radius);
-  for (int x = -rad; x <= rad; x++) {
-    for (int y = -rad; y <= rad; y++) {
+  // Clamp the radius so a modulated / out-of-range value can't blow up the loop.
+  float r = clamp(u_radius, 1.0, 32.0);
+  int rad = int(r);
+  // Constant loop bounds for portability; taps beyond the active radius are skipped.
+  const int MAX_RAD = 32;
+  for (int x = -MAX_RAD; x <= MAX_RAD; x++) {
+    if (x < -rad || x > rad) continue;
+    for (int y = -MAX_RAD; y <= MAX_RAD; y++) {
+      if (y < -rad || y > rad) continue;
       vec2 off = vec2(float(x), float(y)) * px * 2.0;
       vec4 s = texture(u_texture, v_uv + off);
       float lum = dot(s.rgb, vec3(0.299, 0.587, 0.114));
       float bright = max(0.0, lum - u_threshold);
-      float weight = exp(-float(x*x + y*y) / (u_radius * u_radius * 0.5));
+      float weight = exp(-float(x*x + y*y) / (r * r * 0.5));
       bloom += s.rgb * bright * weight;
       total += weight;
     }
   }
   bloom /= max(total, 1.0);
-  fragColor = vec4(original.rgb + bloom * u_bloom_intensity, original.a);
+  // Audio drivers (0 until wired): bass swells the glow, presence adds sparkle.
+  float bloomAmt = u_bloom_intensity * (1.0 + u_bass * 1.2) + u_presence * 0.5;
+  fragColor = vec4(original.rgb + bloom * bloomAmt, original.a);
 }
 `)
 
@@ -223,7 +248,8 @@ out vec4 fragColor;
 
 void main() {
   vec2 uv = v_uv * 2.0 - 1.0;
-  uv *= 1.0 + u_curvature * (uv.yx * uv.yx);
+  // Audio driver (0 until wired): bass bulges the tube curvature.
+  uv *= 1.0 + (u_curvature + u_bass * 0.05) * (uv.yx * uv.yx);
   uv = uv * 0.5 + 0.5;
   if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
     fragColor = vec4(0.0);
@@ -231,7 +257,8 @@ void main() {
   }
   vec4 col = texture(u_texture, uv);
   float scanline = sin(uv.y * u_resolution.y * 3.14159) * 0.5 + 0.5;
-  col.rgb *= 1.0 - u_scanline_intensity * (1.0 - scanline);
+  // Treble deepens the scanline flicker.
+  col.rgb *= 1.0 - (u_scanline_intensity + u_treble * 0.3) * (1.0 - scanline);
   float vig = 1.0 - u_vignette * length(uv - 0.5) * 1.5;
   col.rgb *= vig;
   fragColor = col;
@@ -251,11 +278,13 @@ out vec4 fragColor;
 
 void main() {
   vec2 uv = v_uv;
+  // Audio driver (0 until wired): mid sways the mirror axis.
+  float mOff = u_mirror_offset + u_mid * 0.1;
   if (u_axis == 0 || u_axis == 2) {
-    uv.x = uv.x < 0.5 + u_mirror_offset ? uv.x : 1.0 - uv.x;
+    uv.x = uv.x < 0.5 + mOff ? uv.x : 1.0 - uv.x;
   }
   if (u_axis == 1 || u_axis == 2) {
-    uv.y = uv.y < 0.5 + u_mirror_offset ? uv.y : 1.0 - uv.y;
+    uv.y = uv.y < 0.5 + mOff ? uv.y : 1.0 - uv.y;
   }
   if (u_axis == 3) {
     if (uv.x > uv.y) { float t = uv.x; uv.x = uv.y; uv.y = t; }
@@ -279,11 +308,13 @@ out vec4 fragColor;
 
 void main() {
   vec4 col = texture(u_texture, v_uv);
+  // Audio drivers (0 until wired): mid adds posterize levels, bass shifts the cut.
+  float lv = u_levels * (1.0 + u_mid * 1.0);
   if (u_mode == 0) {
-    col.rgb = floor(col.rgb * u_levels + 0.5) / u_levels;
+    col.rgb = floor(col.rgb * lv + 0.5) / lv;
   } else {
     float lum = dot(col.rgb, vec3(0.299, 0.587, 0.114));
-    col.rgb = vec3(step(u_threshold_val, lum));
+    col.rgb = vec3(step(u_threshold_val - u_bass * 0.2, lum));
   }
   fragColor = col;
 }
@@ -305,8 +336,9 @@ out vec4 fragColor;
 
 void main() {
   vec2 uv = v_uv - 0.5;
-  float angle = atan(uv.y, uv.x) + u_rotation;
-  float radius = length(uv) * u_zoom;
+  // Audio drivers (0 until wired): treble spins, bass zooms.
+  float angle = atan(uv.y, uv.x) + u_rotation + u_treble * 1.5;
+  float radius = length(uv) * u_zoom * (1.0 + u_bass * 0.5);
   float segAngle = 3.14159265 * 2.0 / u_segments;
   angle = mod(angle, segAngle);
   if (angle > segAngle * 0.5) angle = segAngle - angle;
@@ -337,7 +369,8 @@ void main() {
   vec4 col = texture(u_texture, origCenter / u_resolution);
   float lum = dot(col.rgb, vec3(0.299, 0.587, 0.114));
   float dist = distance(rotUV, cellCenter);
-  float radius = lum * u_dot_size * 0.5;
+  // Audio driver (0 until wired): bass fattens the dots.
+  float radius = lum * u_dot_size * 0.5 * (1.0 + u_bass * 0.8);
   float dot = smoothstep(radius, radius - 1.0, dist);
   fragColor = vec4(vec3(dot), 1.0);
 }
@@ -352,6 +385,13 @@ uniform vec2 u_resolution;
 uniform float u_time;
 uniform int u_frame;
 
+// ── Audio drivers — just USE them, they're auto-declared (no uniform line needed):
+//   u_bass  u_mid  u_treble  u_rms  u_sub_bass  u_low_mid  u_high_mid  u_presence
+// Each is 0.0 until you wire the matching Audio Splitter band into this node's
+// "Audio Drivers" socket — then it's live. 0 is neutral for additive code
+// (x + u_bass) and for multiplicative code written as x * (1.0 + u_bass).
+// Also available: u_beat (always live), u_audio_bands[8] (full spectrum).
+
 // @param name="Intensity" min=0.0 max=1.0 default=0.5 step=0.01
 uniform float u_intensity;
 
@@ -359,10 +399,80 @@ out vec4 fragColor;
 
 void main() {
   vec4 col = texture(u_texture, v_uv);
-  
-  // Your custom shader code here!
-  col.rgb = mix(col.rgb, col.rgb * vec3(1.0, 0.8, 0.6), u_intensity);
-  
+
+  // Example: pump brightness with the bass, tint highs toward the treble.
+  // (u_bass / u_treble are 0 until you connect the splitter to Audio Drivers.)
+  col.rgb *= 1.0 + u_bass * u_intensity;
+  col.rgb += vec3(0.2, 0.1, 0.4) * u_treble * u_intensity;
+
+  fragColor = col;
+}
+`)
+
+// ── Audio Warp (audio-driver EXAMPLE: bass zoom-punch + treble RGB split) ──
+// Wire the Audio Splitter's Bass and Treble outputs into this node's
+// "Audio Drivers" socket to activate. The drivers are 0.0 until connected.
+registerShader('AUDIO_WARP', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+
+// Audio drivers (0.0 until wired into the Audio Drivers socket):
+uniform float u_bass;
+uniform float u_treble;
+
+// @param name="Zoom Punch" min=0.0 max=0.5 default=0.15 step=0.01
+uniform float u_zoom_amt;
+// @param name="RGB Split" min=0.0 max=0.05 default=0.012 step=0.001
+uniform float u_rgb_amt;
+out vec4 fragColor;
+
+void main() {
+  vec2 centered = v_uv - 0.5;
+  // Bass punches a radial zoom (multiplicative, neutral when u_bass == 0).
+  centered *= 1.0 - u_bass * u_zoom_amt;
+  vec2 uv = centered + 0.5;
+  // Treble drives a chromatic split along the radial direction (additive).
+  vec2 dir = normalize(centered + 1e-5) * (u_treble * u_rgb_amt);
+  float r = texture(u_texture, uv + dir).r;
+  float g = texture(u_texture, uv).g;
+  float b = texture(u_texture, uv - dir).b;
+  fragColor = vec4(r, g, b, texture(u_texture, uv).a);
+}
+`)
+
+// ── Spectrum Glow (audio-driver EXAMPLE: per-band color grading) ──
+// Wire Bass / Mid / Treble into the "Audio Drivers" socket to activate.
+registerShader('SPECTRUM_GLOW', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+
+// Audio drivers (0.0 until wired into the Audio Drivers socket):
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
+
+// @param name="Glow" min=0.0 max=2.0 default=0.8 step=0.05
+uniform float u_glow;
+// @param name="Saturation" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_sat;
+out vec4 fragColor;
+
+vec3 saturate_rgb(vec3 c, float s) {
+  float l = dot(c, vec3(0.299, 0.587, 0.114));
+  return mix(vec3(l), c, s);
+}
+
+void main() {
+  vec4 col = texture(u_texture, v_uv);
+  // Bass lifts brightness (x * (1.0 + u_bass) is neutral at 0).
+  col.rgb *= 1.0 + u_bass * u_glow;
+  // Mid pushes saturation.
+  col.rgb = saturate_rgb(col.rgb, u_sat * (1.0 + u_mid));
+  // Treble adds a cool sparkle (additive, neutral at 0).
+  col.rgb += vec3(0.1, 0.2, 0.4) * u_treble * u_glow;
   fragColor = col;
 }
 `)
@@ -408,11 +518,17 @@ void main() {
   vec2 px = 1.0 / u_resolution;
   vec4 color = vec4(0.0);
   float totalSpace = 0.0;
-  int rad = int(u_radius);
-  for(int x = -rad; x <= rad; x++) {
-    for(int y = -rad; y <= rad; y++) {
-      float w = exp(-(float(x*x + y*y)) / (u_radius * u_radius * 0.5));
-      color += texture(u_texture, v_uv + vec2(x, y) * px) * w;
+  // Clamp the radius so a modulated / out-of-range value can't blow up the loop.
+  float r = clamp(u_radius, 0.0, 16.0);
+  int rad = int(r);
+  // Constant loop bounds for portability; taps beyond the active radius are skipped.
+  const int MAX_RAD = 16;
+  for (int x = -MAX_RAD; x <= MAX_RAD; x++) {
+    if (x < -rad || x > rad) continue;
+    for (int y = -MAX_RAD; y <= MAX_RAD; y++) {
+      if (y < -rad || y > rad) continue;
+      float w = exp(-(float(x*x + y*y)) / max(r * r * 0.5, 0.001));
+      color += texture(u_texture, v_uv + vec2(float(x), float(y)) * px) * w;
       totalSpace += w;
     }
   }
@@ -431,7 +547,8 @@ uniform float u_size;
 out vec4 fragColor;
 
 void main() {
-  vec2 grid = u_resolution / u_size;
+  // Audio driver (0 until wired): treble shrinks the blocks (more detail on highs).
+  vec2 grid = u_resolution / (u_size * (1.0 + u_treble * 1.5));
   vec2 uv = floor(v_uv * grid) / grid + 0.5 / grid;
   fragColor = texture(u_texture, uv);
 }
@@ -456,7 +573,8 @@ float rand(vec2 n) {
 void main() {
   vec4 col = texture(u_texture, v_uv);
   float t = u_animated ? u_time : 0.0;
-  float noise = (rand(v_uv + t) - 0.5) * u_amount;
+  // Audio driver (0 until wired): overall loudness drives grain.
+  float noise = (rand(v_uv + t) - 0.5) * (u_amount + u_rms * 0.3);
   col.rgb += noise;
   fragColor = col;
 }
@@ -475,7 +593,8 @@ out vec4 fragColor;
 void main() {
   vec4 disp = texture(u_disp_map, v_uv);
   vec2 mapOffset = (disp.rg - 0.5) * 2.0;
-  vec2 uv = v_uv + mapOffset * u_scale;
+  // Audio driver (0 until wired): bass deepens the displacement.
+  vec2 uv = v_uv + mapOffset * u_scale * (1.0 + u_bass * 1.5);
   fragColor = texture(u_texture, uv);
 }
 `)
@@ -526,7 +645,8 @@ void main() {
   vec4 c00 = texture(u_texture, v_uv + vec2(-px.x, -px.y));
   vec4 c22 = texture(u_texture, v_uv + vec2(px.x, px.y));
   vec3 diff = c00.rgb - c22.rgb;
-  float lum = dot(diff, vec3(0.299, 0.587, 0.114)) * u_intensity;
+  // Audio driver (0 until wired): treble deepens the relief.
+  float lum = dot(diff, vec3(0.299, 0.587, 0.114)) * (u_intensity + u_treble * 2.0);
   fragColor = vec4(vec3(0.5 + lum), 1.0);
 }
 `)
@@ -547,7 +667,8 @@ out vec4 fragColor;
 void main() {
   vec4 col = texture(u_texture, v_uv);
   float dist = distance(v_uv, vec2(0.5));
-  float vig = smoothstep(u_size, u_size - u_softness, dist);
+  // Audio driver (0 until wired): bass opens the vignette (pulses to the beat).
+  float vig = smoothstep(u_size + u_bass * 0.3, u_size - u_softness, dist);
   fragColor = vec4(mix(u_color, col.rgb, vig), col.a);
 }
 `)
@@ -571,7 +692,8 @@ float character(float n, vec2 p) {
 }
 
 void main() {
-  vec2 px = u_resolution / u_scale;
+  // Audio driver (0 until wired): bass enlarges the character cells.
+  vec2 px = u_resolution / (u_scale * (1.0 + u_bass * 0.6));
   vec2 uv = floor(v_uv * px) / px;
   vec4 col = texture(u_texture, uv);
   float gray = dot(col.rgb, vec3(0.299, 0.587, 0.114));
@@ -605,7 +727,8 @@ out vec4 fragColor;
 void main() {
   vec2 uv = v_uv - 0.5;
   float r2 = dot(uv, uv);
-  float f = 1.0 + r2 * u_distortion;
+  // Audio driver (0 until wired): bass bulges the lens.
+  float f = 1.0 + r2 * (u_distortion + u_bass * 0.4);
   uv = uv * f * u_scale + 0.5;
   if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
     fragColor = vec4(0.0);
@@ -1403,5 +1526,1509 @@ void main() {
   fragColor = vec4(clamp(result, 0.0, 1.0), max(a.a, b.a));
 }
 `)
+
+// ── BIOMATH (Procedural Raymarching) ──
+registerShader('BIOMATH', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=6 default=0 step=1 type=select options="Xor Neural,Gyroid Lattice,Crystalline Lattice,Hypnotic Spiral,Alien Terrain,Digital Sphere,Orchard"
+uniform int u_mode;
+// @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
+uniform int u_palette;
+// @param name="Complexity" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_complexity;
+// @param name="Intensity" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+// @param name="Blend Mode" min=0 max=4 default=0 step=1 type=select options="Replace,Add,Screen,Multiply,Overlay"
+uniform int u_blend_mode;
+// @param name="Background Mix" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bg_mix;
+
+out vec4 fragColor;
+
+float random(vec2 st) {
+  return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(random(i + vec2(0.0, 0.0)), random(i + vec2(1.0, 0.0)), u.x),
+             mix(random(i + vec2(0.0, 1.0)), random(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+vec2 rotate(vec2 p, float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+vec3 palette(int palette_idx, float t) {
+  if (palette_idx == 0) return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  if (palette_idx == 1) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(2.0, 1.0, 0.0) * t + vec3(0.5, 0.2, 0.25)));
+  if (palette_idx == 2) return mix(vec3(0.2, 0.0, 0.8), vec3(0.8, 0.2, 1.0), sin(t * 3.14159) * 0.5 + 0.5);
+  if (palette_idx == 3) return mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), clamp(t, 0.0, 1.0));
+  if (palette_idx == 4) return mix(vec3(0.0, 0.3, 0.8), vec3(0.0, 0.8, 0.6), clamp(t, 0.0, 1.0));
+  if (palette_idx == 5) return vec3(0.9, 0.8, 0.8) * (0.5 + 0.5 * cos(6.28318 * t + vec3(0.0, 0.1, 0.2)));
+  if (palette_idx == 6) return vec3(t);
+  if (palette_idx == 7) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(1.0, 0.7, 0.4) * t + vec3(0.0, 0.15, 0.20)));
+  if (palette_idx == 8) return vec3(0.3, 0.5, 0.2) + vec3(0.4, 0.5, 0.3) * cos(6.28318 * (vec3(0.5, 0.8, 0.4) * t + vec3(0.1, 0.3, 0.6)));
+  if (palette_idx == 9) return vec3(0.2, 0.2, 0.5) + vec3(0.8, 0.6, 0.8) * cos(6.28318 * (vec3(1.5, 0.5, 0.8) * t + vec3(0.0, 0.3, 0.5)));
+  if (palette_idx == 10) return vec3(0.6, 0.6, 0.8) + vec3(0.3, 0.3, 0.4) * cos(6.28318 * (vec3(0.5, 0.4, 1.0) * t + vec3(0.0, 0.1, 0.3)));
+  if (palette_idx == 11) return vec3(0.6, 0.2, 0.0) + vec3(0.7, 0.4, 0.1) * cos(6.28318 * (vec3(0.8, 0.6, 0.2) * t + vec3(0.1, 0.0, 0.5)));
+  if (palette_idx == 12) return vec3(0.1, 0.1, 0.3) + vec3(0.5, 0.3, 0.6) * cos(6.28318 * (vec3(1.2, 0.6, 0.9) * t + vec3(0.5, 0.8, 0.3)));
+  if (palette_idx == 13) return vec3(0.2, 0.5, 0.1) + vec3(0.7, 0.8, 0.2) * cos(6.28318 * (vec3(1.3, 0.4, 0.3) * t + vec3(0.2, 0.0, 0.6)));
+  if (palette_idx == 14) return vec3(0.4, 0.3, 0.6) + vec3(0.6, 0.5, 0.6) * cos(6.28318 * (vec3(0.8, 0.3, 0.5) * t + vec3(0.3, 0.4, 0.7)));
+  if (palette_idx == 15) return vec3(0.5, 0.4, 0.1) + vec3(0.7, 0.5, 0.2) * cos(6.28318 * (vec3(0.6, 0.9, 0.3) * t + vec3(0.0, 0.2, 0.5)));
+  return vec3(0.2, 0.5, 0.6) + vec3(0.3, 0.6, 0.5) * cos(6.28318 * (vec3(0.4, 0.7, 1.0) * t + vec3(0.1, 0.5, 0.3)));
+}
+
+vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
+  if (blend_mode == 0) return fg;
+  if (blend_mode == 1) return bg + fg;
+  if (blend_mode == 2) return 1.0 - (1.0 - bg) * (1.0 - fg);
+  if (blend_mode == 3) return bg * fg;
+  return vec3(
+    bg.r < 0.5 ? 2.0*bg.r*fg.r : 1.0 - 2.0*(1.0-bg.r)*(1.0-fg.r),
+    bg.g < 0.5 ? 2.0*bg.g*fg.g : 1.0 - 2.0*(1.0-bg.g)*(1.0-fg.g),
+    bg.b < 0.5 ? 2.0*bg.b*fg.b : 1.0 - 2.0*(1.0-bg.b)*(1.0-fg.b)
+  );
+}
+
+void main() {
+  vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+  vec3 genColor = vec3(0.0);
+  float t = u_time * u_speed;
+
+  if (u_mode == 0) { // Xor Neural
+    vec3 rd = normalize(vec3(uv, -1.0));
+    vec3 p = vec3(0.0);
+    float z = 0.0;
+    for(int i=0; i<25; i++) {
+      p = z * rd;
+      p.z -= t * (2.0 + u_audio_bass * 4.0);
+      float shape = cos(dot(cos(p), sin(p.yzx / 0.6 + 0.1 * sin(p.zxy * 10.0)) * 10.0));
+      float d = 0.01 + 0.3 * abs(shape);
+      vec3 glow = vec3(0.2, 0.2, 0.3) * u_intensity + palette(u_palette, z * 0.05 + t) * 0.1;
+      genColor += glow / max(0.001, d);
+      z += d;
+    }
+    genColor = tanh(genColor * 0.002);
+  }
+  else if (u_mode == 1) { // Gyroid Lattice
+    vec3 rd = normalize(vec3(uv, 1.0));
+    vec3 p = vec3(0.0);
+    float z = 0.0;
+    vec3 acc = vec3(0.0);
+    for(int i=0; i<25; i++) {
+      p = rd * z;
+      p.z += t + u_audio_bass;
+      p.xy = rotate(p.xy, t * 0.2);
+      float d = dot(sin(p), cos(p.yzx)) / 1.5;
+      d = abs(d) - 0.1;
+      if (d < 0.01) acc += palette(u_palette, z * 0.1 + u_audio_mid) * 0.1;
+      z += max(0.05, d * 0.5);
+    }
+    genColor = acc * u_intensity;
+  }
+  else if (u_mode == 2) { // Crystalline Lattice
+    vec2 p = uv * 3.3333;
+    vec3 col = vec3(0.0);
+    float rt = t * 1.2 + u_audio_bass * 1.5;
+    float iters = 8.0 * u_complexity;
+    for(float i=1.0; i<=10.0; i++) {
+      if (i > iters) break;
+      vec2 v = p;
+      for(float f=1.0; f<=7.0; f++) {
+        v += sin(v.yx * f + i + rt) / f;
+      }
+      vec3 pal = cos(i + vec3(0.0, 1.0, 2.0)) + 1.0;
+      col += pal / (6.0 * max(0.001, length(v)));
+    }
+    genColor = tanh((col * col) * u_intensity * (1.0 + u_audio_mid * 0.3));
+  }
+  else if (u_mode == 3) { // Hypnotic Spiral
+    vec2 p = uv * 2.0;
+    vec2 v = vec2(atan(p.y, p.x), log(length(p) + 1e-6)) / 0.2 + 4.0;
+    vec4 col = vec4(0.0);
+    float rt = t + u_audio_bass;
+    float iters = 8.0 * u_complexity;
+    for(float i=1.0; i<9.0; i++) {
+      if (i > iters) break;
+      v += sin(v.yx * i - vec2(rt, i)) / i;
+      col += (sin(vec4(v.x, v.x, v.y, v.x) + i) + 1.0) * (v.y * v.y);
+    }
+    genColor = tanh(vec3(4.0, 2.0, 1.0) / (col.rgb + 0.001)) * u_intensity;
+  }
+  else if (u_mode == 4) { // Alien Terrain
+    vec3 rd = normalize(vec3(uv, -1.0));
+    vec3 p = vec3(0.0);
+    vec3 v = vec3(0.0);
+    vec3 col = vec3(0.0);
+    float z = 0.0;
+    float rt = t * 2.0 + u_audio_bass * 4.0;
+    for(int i=0; i<35; i++) {
+      p = z * rd;
+      p.xz -= rt;
+      v = p - vec3(sin(p.x), sin(p.x), sin(p.z));
+      float d = 0.4 * max(dot(cos(v.xz), sin(v.zx / 0.6)) + 0.6, v.y + 3.0);
+      vec3 fog = -rd * d * d / (z * z + 1.0);
+      vec3 pal = cos(p.y + vec3(6.0, 1.0, 2.0)) + 1.1;
+      vec2 trig = tan(p.y / 0.3) / (cos(p.xz / 0.1) + 0.1 + (2.0 * u_audio_mid));
+      float lightStruct = length(trig) + d * d / 0.01;
+      vec3 light = pal / (lightStruct + 0.01) / (z + 0.1 / (u_audio_bass + 0.01));
+      col += (fog * u_audio_treble) + (light * u_audio_mid);
+      z += max(0.02, d);
+    }
+    genColor = tanh(col * 0.1) * u_intensity;
+  }
+  else if (u_mode == 5) { // Digital Sphere
+    vec3 o = vec3(0.0);
+    vec3 p = vec3(0.0);
+    vec3 v = vec3(0.0);
+    float z = 0.0;
+    float l = 0.0;
+    vec3 FC = vec3(v_uv * u_resolution, 0.0);
+    vec3 r = vec3(u_resolution, u_resolution.x);
+    for(int i=0; i<40; i++) {
+      p = z * normalize(FC * 2.0 - r.xyy);
+      p.z += 9.0;
+      l = length(p);
+      p = vec3(atan(p.z, p.x) - t * 0.2, log(l) - t * 0.2, asin(clamp(p.y / l, -1.0, 1.0))) / 0.1;
+      v = cos(p + sin(p / 0.24 + t));
+      float d = l / 60.0 * length(max(v, v.yzx * 0.1 + u_audio_treble * 0.01));
+      z += d;
+      o += (sin(vec4(p.y) + vec4(6.0, 1.0, 3.0, 3.0)) + 0.1 + u_audio_bass).xyz / d;
+    }
+    genColor = tanh(o / 20000.0) * u_intensity * (1.0 + u_audio_bass * 0.5 + u_audio_mid * 0.3);
+  }
+  else { // Orchard
+    vec3 o = vec3(0.0);
+    vec3 p = vec3(0.0);
+    vec3 FC = vec3(v_uv * u_resolution, 0.0);
+    vec3 r = vec3(u_resolution, u_resolution.x);
+    vec3 v = normalize(FC * 2.0 - r.xyx);
+    vec3 c = v / v.y;
+    c.z += 0.5 * t;
+    float z = 0.0;
+    float b = 0.0;
+    float g = 0.0;
+    float m = 0.0;
+    for(int i=0; i<30; i++) {
+      b = length((p.y - m) / 100.0 / (abs(sin(c.xz / 0.1)) - 0.05 / v.y));
+      g = length(sin(p.xz) + vec2(1.0) - 0.1 * (vec2(1.0) + sin(p.y - p.zx * 0.5)) * m);
+      z += 0.8 * max(b, min(4.0 - m, g) - b);
+      o.rgb += (vec3(0.7) - v) / (g + b);
+      p = z * v + 1.0;
+      p.z -= t;
+      p.y += 1.0;
+      m = abs(p.y);
+    }
+    genColor = tanh(o / 500.0) * u_intensity * (1.0 + u_audio_bass * 0.5 + u_audio_mid * 0.3);
+  }
+
+  vec4 bg = texture(u_texture, v_uv);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+}
+`);
+
+// ── PLASMA (Flowing Waves) ──
+registerShader('PLASMA', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=4 default=0 step=1 type=select options="Classic,Liquid Noise,Cellular,Plasma Ball,Nebula"
+uniform int u_mode;
+// @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
+uniform int u_palette;
+// @param name="Scale" min=0.5 max=10.0 default=3.0 step=0.1
+uniform float u_scale_val;
+// @param name="Intensity" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+// @param name="Blend Mode" min=0 max=4 default=0 step=1 type=select options="Replace,Add,Screen,Multiply,Overlay"
+uniform int u_blend_mode;
+// @param name="Background Mix" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bg_mix;
+
+out vec4 fragColor;
+
+float random(vec2 st) {
+  return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(random(i + vec2(0.0, 0.0)), random(i + vec2(1.0, 0.0)), u.x),
+             mix(random(i + vec2(0.0, 1.0)), random(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+float fbm(vec2 p) {
+  float value = 0.0;
+  float amplitude = 0.5;
+  for(int i = 0; i < 4; i++) {
+    value += amplitude * noise(p);
+    p *= 2.0;
+    amplitude *= 0.5;
+  }
+  return value;
+}
+
+vec3 palette(int palette_idx, float t) {
+  if (palette_idx == 0) return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  if (palette_idx == 1) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(2.0, 1.0, 0.0) * t + vec3(0.5, 0.2, 0.25)));
+  if (palette_idx == 2) return mix(vec3(0.2, 0.0, 0.8), vec3(0.8, 0.2, 1.0), sin(t * 3.14159) * 0.5 + 0.5);
+  if (palette_idx == 3) return mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), clamp(t, 0.0, 1.0));
+  if (palette_idx == 4) return mix(vec3(0.0, 0.3, 0.8), vec3(0.0, 0.8, 0.6), clamp(t, 0.0, 1.0));
+  if (palette_idx == 5) return vec3(0.9, 0.8, 0.8) * (0.5 + 0.5 * cos(6.28318 * t + vec3(0.0, 0.1, 0.2)));
+  if (palette_idx == 6) return vec3(t);
+  if (palette_idx == 7) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(1.0, 0.7, 0.4) * t + vec3(0.0, 0.15, 0.20)));
+  if (palette_idx == 8) return vec3(0.3, 0.5, 0.2) + vec3(0.4, 0.5, 0.3) * cos(6.28318 * (vec3(0.5, 0.8, 0.4) * t + vec3(0.1, 0.3, 0.6)));
+  if (palette_idx == 9) return vec3(0.2, 0.2, 0.5) + vec3(0.8, 0.6, 0.8) * cos(6.28318 * (vec3(1.5, 0.5, 0.8) * t + vec3(0.0, 0.3, 0.5)));
+  if (palette_idx == 10) return vec3(0.6, 0.6, 0.8) + vec3(0.3, 0.3, 0.4) * cos(6.28318 * (vec3(0.5, 0.4, 1.0) * t + vec3(0.0, 0.1, 0.3)));
+  if (palette_idx == 11) return vec3(0.6, 0.2, 0.0) + vec3(0.7, 0.4, 0.1) * cos(6.28318 * (vec3(0.8, 0.6, 0.2) * t + vec3(0.1, 0.0, 0.5)));
+  if (palette_idx == 12) return vec3(0.1, 0.1, 0.3) + vec3(0.5, 0.3, 0.6) * cos(6.28318 * (vec3(1.2, 0.6, 0.9) * t + vec3(0.5, 0.8, 0.3)));
+  if (palette_idx == 13) return vec3(0.2, 0.5, 0.1) + vec3(0.7, 0.8, 0.2) * cos(6.28318 * (vec3(1.3, 0.4, 0.3) * t + vec3(0.2, 0.0, 0.6)));
+  if (palette_idx == 14) return vec3(0.4, 0.3, 0.6) + vec3(0.6, 0.5, 0.6) * cos(6.28318 * (vec3(0.8, 0.3, 0.5) * t + vec3(0.3, 0.4, 0.7)));
+  if (palette_idx == 15) return vec3(0.5, 0.4, 0.1) + vec3(0.7, 0.5, 0.2) * cos(6.28318 * (vec3(0.6, 0.9, 0.3) * t + vec3(0.0, 0.2, 0.5)));
+  return vec3(0.2, 0.5, 0.6) + vec3(0.3, 0.6, 0.5) * cos(6.28318 * (vec3(0.4, 0.7, 1.0) * t + vec3(0.1, 0.5, 0.3)));
+}
+
+vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
+  if (blend_mode == 0) return fg;
+  if (blend_mode == 1) return bg + fg;
+  if (blend_mode == 2) return 1.0 - (1.0 - bg) * (1.0 - fg);
+  if (blend_mode == 3) return bg * fg;
+  return vec3(
+    bg.r < 0.5 ? 2.0*bg.r*fg.r : 1.0 - 2.0*(1.0-bg.r)*(1.0-fg.r),
+    bg.g < 0.5 ? 2.0*bg.g*fg.g : 1.0 - 2.0*(1.0-bg.g)*(1.0-fg.g),
+    bg.b < 0.5 ? 2.0*bg.b*fg.b : 1.0 - 2.0*(1.0-bg.b)*(1.0-fg.b)
+  );
+}
+
+void main() {
+  vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+  vec3 genColor = vec3(0.0);
+  float t = u_time * u_speed;
+  vec2 p = uv * u_scale_val;
+
+  if (u_mode == 0) { // Classic
+    float rt = t + u_audio_bass;
+    float val = sin(p.x + rt) + sin(p.y + rt) + sin(p.x + p.y + rt);
+    val = (val + 3.0) / 6.0;
+    genColor = palette(u_palette, val + u_audio_mid) * u_intensity;
+  }
+  else if (u_mode == 1) { // Liquid Noise
+    float n = noise(p + t * 0.5) + noise(p * 2.0 - t) * 0.5;
+    float ring = sin(n * 10.0 + t);
+    genColor = palette(u_palette, n + u_audio_bass * 0.5) * (0.5 + 0.5 * ring) * u_intensity;
+  }
+  else if (u_mode == 2) { // Cellular
+    vec2 i_st = floor(p);
+    vec2 f_st = fract(p);
+    float m_dist = 1.0;
+    for (int y = -1; y <= 1; y++) {
+      for (int x = -1; x <= 1; x++) {
+        vec2 neighbor = vec2(float(x), float(y));
+        vec2 pt = vec2(random(i_st + neighbor), random(i_st + neighbor + 1.0));
+        pt = 0.5 + 0.5 * sin(t + 6.2831 * pt);
+        vec2 diff = neighbor + pt - f_st;
+        m_dist = min(m_dist, length(diff));
+      }
+    }
+    genColor = palette(u_palette, m_dist + u_audio_treble) * u_intensity;
+    genColor += (1.0 - step(0.02, m_dist)) * u_intensity;
+  }
+  else if (u_mode == 3) { // Plasma Ball
+    vec2 v = p;
+    float l = abs(0.7 - dot(p, p));
+    v = p * (1.0 - l) / 0.2;
+    vec3 c = vec3(0.0);
+    for(float i=0.0; i<8.0; i++) {
+      c += (sin(vec3(v.x, v.y, v.y) * 2.0) + 1.0) * abs(v.x - v.y) * 0.2 + (u_audio_treble * 1.5);
+      v += cos(v.yx * i + vec2(0.0, i) + t) / (i + 1.0) + 0.7;
+    }
+    vec3 glow = exp(p.y * vec3(1.0, -1.0, -2.0)) * exp(-4.0 * l);
+    genColor = tanh(glow / max(c, 0.1)) * (1.0 + u_audio_bass) * u_intensity;
+  }
+  else { // Nebula
+    float n = fbm(p + t * 0.1);
+    float dist = length(uv) + 0.1;
+    float core = 1.0 / dist;
+    genColor = palette(u_palette, n * 2.0) * n * core * 0.5 * (0.8 + u_audio_mid * 0.5) * u_intensity;
+  }
+
+  vec4 bg = texture(u_texture, v_uv);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+}
+`);
+
+// ── FRACTAL (Mathematical Fractals) ──
+registerShader('FRACTAL', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=7 default=0 step=1 type=select options="Julia,Mandelbrot Zoom,KIFS,Fractal Grid,Newton Fractal,Sierpinski Gasket,Burning Ship,Mainframe"
+uniform int u_mode;
+// @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
+uniform int u_palette;
+// @param name="Complexity" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_complexity;
+// @param name="Scale" min=0.1 max=5.0 default=1.0 step=0.1
+uniform float u_scale_val;
+// @param name="Intensity" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+// @param name="Blend Mode" min=0 max=4 default=0 step=1 type=select options="Replace,Add,Screen,Multiply,Overlay"
+uniform int u_blend_mode;
+// @param name="Background Mix" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bg_mix;
+
+out vec4 fragColor;
+
+float random(vec2 st) {
+  return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+vec2 rotate(vec2 p, float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+vec3 palette(int palette_idx, float t) {
+  if (palette_idx == 0) return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  if (palette_idx == 1) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(2.0, 1.0, 0.0) * t + vec3(0.5, 0.2, 0.25)));
+  if (palette_idx == 2) return mix(vec3(0.2, 0.0, 0.8), vec3(0.8, 0.2, 1.0), sin(t * 3.14159) * 0.5 + 0.5);
+  if (palette_idx == 3) return mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), clamp(t, 0.0, 1.0));
+  if (palette_idx == 4) return mix(vec3(0.0, 0.3, 0.8), vec3(0.0, 0.8, 0.6), clamp(t, 0.0, 1.0));
+  if (palette_idx == 5) return vec3(0.9, 0.8, 0.8) * (0.5 + 0.5 * cos(6.28318 * t + vec3(0.0, 0.1, 0.2)));
+  if (palette_idx == 6) return vec3(t);
+  if (palette_idx == 7) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(1.0, 0.7, 0.4) * t + vec3(0.0, 0.15, 0.20)));
+  if (palette_idx == 8) return vec3(0.3, 0.5, 0.2) + vec3(0.4, 0.5, 0.3) * cos(6.28318 * (vec3(0.5, 0.8, 0.4) * t + vec3(0.1, 0.3, 0.6)));
+  if (palette_idx == 9) return vec3(0.2, 0.2, 0.5) + vec3(0.8, 0.6, 0.8) * cos(6.28318 * (vec3(1.5, 0.5, 0.8) * t + vec3(0.0, 0.3, 0.5)));
+  if (palette_idx == 10) return vec3(0.6, 0.6, 0.8) + vec3(0.3, 0.3, 0.4) * cos(6.28318 * (vec3(0.5, 0.4, 1.0) * t + vec3(0.0, 0.1, 0.3)));
+  if (palette_idx == 11) return vec3(0.6, 0.2, 0.0) + vec3(0.7, 0.4, 0.1) * cos(6.28318 * (vec3(0.8, 0.6, 0.2) * t + vec3(0.1, 0.0, 0.5)));
+  if (palette_idx == 12) return vec3(0.1, 0.1, 0.3) + vec3(0.5, 0.3, 0.6) * cos(6.28318 * (vec3(1.2, 0.6, 0.9) * t + vec3(0.5, 0.8, 0.3)));
+  if (palette_idx == 13) return vec3(0.2, 0.5, 0.1) + vec3(0.7, 0.8, 0.2) * cos(6.28318 * (vec3(1.3, 0.4, 0.3) * t + vec3(0.2, 0.0, 0.6)));
+  if (palette_idx == 14) return vec3(0.4, 0.3, 0.6) + vec3(0.6, 0.5, 0.6) * cos(6.28318 * (vec3(0.8, 0.3, 0.5) * t + vec3(0.3, 0.4, 0.7)));
+  if (palette_idx == 15) return vec3(0.5, 0.4, 0.1) + vec3(0.7, 0.5, 0.2) * cos(6.28318 * (vec3(0.6, 0.9, 0.3) * t + vec3(0.0, 0.2, 0.5)));
+  return vec3(0.2, 0.5, 0.6) + vec3(0.3, 0.6, 0.5) * cos(6.28318 * (vec3(0.4, 0.7, 1.0) * t + vec3(0.1, 0.5, 0.3)));
+}
+
+vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
+  if (blend_mode == 0) return fg;
+  if (blend_mode == 1) return bg + fg;
+  if (blend_mode == 2) return 1.0 - (1.0 - bg) * (1.0 - fg);
+  if (blend_mode == 3) return bg * fg;
+  return vec3(
+    bg.r < 0.5 ? 2.0*bg.r*fg.r : 1.0 - 2.0*(1.0-bg.r)*(1.0-fg.r),
+    bg.g < 0.5 ? 2.0*bg.g*fg.g : 1.0 - 2.0*(1.0-bg.g)*(1.0-fg.g),
+    bg.b < 0.5 ? 2.0*bg.b*fg.b : 1.0 - 2.0*(1.0-bg.b)*(1.0-fg.b)
+  );
+}
+
+void main() {
+  vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+  vec3 genColor = vec3(0.0);
+  float t = u_time * u_speed;
+
+  if (u_mode == 0) { // Julia
+    vec2 p = uv * 1.5;
+    vec2 c = vec2(sin(t * 0.3), cos(t * 0.4));
+    float iter = 0.0;
+    int maxIters = int(10.0 * u_complexity);
+    for(int i=0; i<16; i++) {
+      if (i >= maxIters) break;
+      p = vec2(p.x*p.x - p.y*p.y, 2.0*p.x*p.y) + c;
+      if (length(p) > 4.0) break;
+      iter += 1.0;
+    }
+    genColor = palette(u_palette, iter * 0.1 + t) * u_intensity;
+  }
+  else if (u_mode == 1) { // Mandelbrot Zoom
+    vec2 p = uv / (u_scale_val + 0.1) - vec2(0.7, 0.0);
+    vec2 c = p;
+    vec2 z = vec2(0.0);
+    float iter = 0.0;
+    int maxIters = int(12.0 * u_complexity);
+    for(int i=0; i<16; i++) {
+      if (i >= maxIters) break;
+      z = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
+      if (length(z) > 2.0) break;
+      iter += 1.0;
+    }
+    genColor = palette(u_palette, iter / 8.0 + t * 0.2) * u_audio_bass * u_intensity;
+  }
+  else if (u_mode == 2) { // KIFS
+    vec2 p = uv * 2.0;
+    float a = 0.0;
+    int maxIters = int(5.0 * u_complexity);
+    for(int i=0; i<8; i++) {
+      if (i >= maxIters) break;
+      p = abs(p) / dot(p, p) - 0.5;
+      p = rotate(p, t * 0.2);
+      a += length(p);
+    }
+    genColor = palette(u_palette, a * 0.2 + u_audio_mid) * ((1.5 * u_audio_bass) + 0.5 * sin(a)) * u_intensity;
+  }
+  else if (u_mode == 3) { // Fractal Grid
+    vec2 p = uv * 20.0;
+    vec3 col = vec3(0.0);
+    float rt = t + u_audio_bass * 2.0;
+    int maxIters = int(10.0 * u_complexity);
+    for(int i=0; i<12; i++) {
+      if (i >= maxIters) break;
+      vec3 pal = cos(p.x + vec3(2.0, 1.0, 0.0)) + 1.0;
+      vec2 distortion = sin(p + rt).yx;
+      float d = length(sin(p + distortion + u_audio_mid * 0.3));
+      col += pal / max(0.001, d - u_audio_bass * 0.15) / 0.2;
+      p *= mat2(0.8, -0.6, 0.6, 0.8);
+    }
+    genColor = tanh(col * col / 20000.0) * u_intensity;
+  }
+  else if (u_mode == 4) { // Newton Fractal
+    vec2 z = uv * 3.0;
+    float rt = t * 0.2;
+    int maxIters = int(12.0 * u_complexity);
+    for(int i=0; i<16; i++) {
+      if (i >= maxIters) break;
+      vec2 z2 = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y);
+      vec2 z3 = vec2(z2.x*z.x - z2.y*z.y, z2.x*z.y + z2.y*z.x);
+      vec2 deriv = 3.0 * z2;
+      vec2 f = z3 - vec2(cos(rt), sin(rt)) * 0.5;
+      float denom = dot(deriv, deriv) + 0.001;
+      vec2 div = vec2(dot(f, deriv), f.y * deriv.x - f.x * deriv.y) / denom;
+      z = z - div;
+    }
+    float r_d = length(z - vec2(1.0, 0.0));
+    float g_d = length(z - vec2(-0.5, 0.866));
+    float b_d = length(z - vec2(-0.5, -0.866));
+    vec3 col = vec3(1.0 / (r_d + 0.1), 1.0 / (g_d + 0.1), 1.0 / (b_d + 0.1));
+    col = tanh(col * 0.3);
+    genColor = col * (0.8 + u_audio_bass * 0.5) * u_intensity;
+  }
+  else if (u_mode == 5) { // Sierpinski Gasket
+    vec2 p = uv * 2.0;
+    p += vec2(sin(t * 0.3), cos(t * 0.4)) * 0.1;
+    vec3 col = vec3(0.0);
+    float scale = 1.0;
+    int maxIters = int(8.0 * u_complexity);
+    for(int i=0; i<10; i++) {
+      if (i >= maxIters) break;
+      p = abs(p);
+      float angle = t * 0.1 + float(i) * 0.2;
+      p = rotate(p, angle);
+      p = p * 2.0 - vec2(1.0, 0.0);
+      vec3 pal = cos(p.x + vec3(1.0, 2.0, 3.0) + t * 0.2) + 1.0;
+      col += pal * scale * 0.1;
+      scale *= 0.5;
+    }
+    genColor = col * (0.8 + u_audio_bass * 0.5) * u_intensity;
+  }
+  else if (u_mode == 6) { // Burning Ship
+    vec2 c = vec2(-0.4 + sin(t * 0.2) * 0.1, -0.5 + cos(t * 0.15) * 0.1);
+    vec2 z = vec2(0.0);
+    float iter = 0.0;
+    int maxIters = int(16.0 * u_complexity);
+    for(int i=0; i<20; i++) {
+      if (i >= maxIters) break;
+      float x = (z.x * z.x - z.y * z.y) + c.x;
+      float y = (2.0 * abs(z.x) * abs(z.y)) + c.y;
+      z = vec2(x, y);
+      if (length(z) > 4.0) break;
+      iter += 1.0;
+    }
+    float smoothIter = iter - log2(log2(dot(z, z) + 1e-6)) + 4.0;
+    vec3 col = palette(u_palette, smoothIter * 0.1 + t * 0.1);
+    col *= smoothstep(0.0, 1.0, iter / 16.0);
+    genColor = col * (0.7 + u_audio_bass * 0.8) * u_intensity;
+  }
+  else { // Mainframe
+    vec2 p = abs(uv) * 2.5;
+    vec3 col = vec3(0.0);
+    float rt = t * 1.5 + u_audio_bass * 2.0;
+    int maxIters = int(9.0 * u_complexity);
+    for(float i = 1.0; i <= 9.0; i++) {
+      if (i > float(maxIters)) break;
+      vec2 v = p - i * 0.2;
+      for(float f = 1.0; f <= 7.0; f++) {
+        vec2 cell = ceil(v.yx + i * 0.1) * 9.0 + rt;
+        vec2 offset = sin(cell) / f;
+        v = (v + offset).yx;
+      }
+      float l = length(sin(v));
+      vec3 pal = cos(i * 0.3 + l - vec3(4.0, 5.0, 6.0)) + 1.0;
+      col += 0.02 * pal / max(0.0001, l * l);
+    }
+    genColor = max(tanh(col * u_intensity * (1.2 + u_audio_mid * 0.8)), 0.0);
+  }
+
+  vec4 bg = texture(u_texture, v_uv);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+}
+`);
+
+// ── TUNNEL (Tunnel Effects) ──
+registerShader('TUNNEL', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=4 default=0 step=1 type=select options="Cylindrical,Box,Warp Speed,Hyper Tunnel,Bio-Tunnel"
+uniform int u_mode;
+// @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
+uniform int u_palette;
+// @param name="Complexity" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_complexity;
+// @param name="Intensity" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+// @param name="Blend Mode" min=0 max=4 default=0 step=1 type=select options="Replace,Add,Screen,Multiply,Overlay"
+uniform int u_blend_mode;
+// @param name="Background Mix" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bg_mix;
+
+out vec4 fragColor;
+
+float random(vec2 st) {
+  return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+vec2 rotate(vec2 p, float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+vec3 palette(int palette_idx, float t) {
+  if (palette_idx == 0) return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  if (palette_idx == 1) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(2.0, 1.0, 0.0) * t + vec3(0.5, 0.2, 0.25)));
+  if (palette_idx == 2) return mix(vec3(0.2, 0.0, 0.8), vec3(0.8, 0.2, 1.0), sin(t * 3.14159) * 0.5 + 0.5);
+  if (palette_idx == 3) return mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), clamp(t, 0.0, 1.0));
+  if (palette_idx == 4) return mix(vec3(0.0, 0.3, 0.8), vec3(0.0, 0.8, 0.6), clamp(t, 0.0, 1.0));
+  if (palette_idx == 5) return vec3(0.9, 0.8, 0.8) * (0.5 + 0.5 * cos(6.28318 * t + vec3(0.0, 0.1, 0.2)));
+  if (palette_idx == 6) return vec3(t);
+  if (palette_idx == 7) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(1.0, 0.7, 0.4) * t + vec3(0.0, 0.15, 0.20)));
+  if (palette_idx == 8) return vec3(0.3, 0.5, 0.2) + vec3(0.4, 0.5, 0.3) * cos(6.28318 * (vec3(0.5, 0.8, 0.4) * t + vec3(0.1, 0.3, 0.6)));
+  if (palette_idx == 9) return vec3(0.2, 0.2, 0.5) + vec3(0.8, 0.6, 0.8) * cos(6.28318 * (vec3(1.5, 0.5, 0.8) * t + vec3(0.0, 0.3, 0.5)));
+  if (palette_idx == 10) return vec3(0.6, 0.6, 0.8) + vec3(0.3, 0.3, 0.4) * cos(6.28318 * (vec3(0.5, 0.4, 1.0) * t + vec3(0.0, 0.1, 0.3)));
+  if (palette_idx == 11) return vec3(0.6, 0.2, 0.0) + vec3(0.7, 0.4, 0.1) * cos(6.28318 * (vec3(0.8, 0.6, 0.2) * t + vec3(0.1, 0.0, 0.5)));
+  if (palette_idx == 12) return vec3(0.1, 0.1, 0.3) + vec3(0.5, 0.3, 0.6) * cos(6.28318 * (vec3(1.2, 0.6, 0.9) * t + vec3(0.5, 0.8, 0.3)));
+  if (palette_idx == 13) return vec3(0.2, 0.5, 0.1) + vec3(0.7, 0.8, 0.2) * cos(6.28318 * (vec3(1.3, 0.4, 0.3) * t + vec3(0.2, 0.0, 0.6)));
+  if (palette_idx == 14) return vec3(0.4, 0.3, 0.6) + vec3(0.6, 0.5, 0.6) * cos(6.28318 * (vec3(0.8, 0.3, 0.5) * t + vec3(0.3, 0.4, 0.7)));
+  if (palette_idx == 15) return vec3(0.5, 0.4, 0.1) + vec3(0.7, 0.5, 0.2) * cos(6.28318 * (vec3(0.6, 0.9, 0.3) * t + vec3(0.0, 0.2, 0.5)));
+  return vec3(0.2, 0.5, 0.6) + vec3(0.3, 0.6, 0.5) * cos(6.28318 * (vec3(0.4, 0.7, 1.0) * t + vec3(0.1, 0.5, 0.3)));
+}
+
+vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
+  if (blend_mode == 0) return fg;
+  if (blend_mode == 1) return bg + fg;
+  if (blend_mode == 2) return 1.0 - (1.0 - bg) * (1.0 - fg);
+  if (blend_mode == 3) return bg * fg;
+  return vec3(
+    bg.r < 0.5 ? 2.0*bg.r*fg.r : 1.0 - 2.0*(1.0-bg.r)*(1.0-fg.r),
+    bg.g < 0.5 ? 2.0*bg.g*fg.g : 1.0 - 2.0*(1.0-bg.g)*(1.0-fg.g),
+    bg.b < 0.5 ? 2.0*bg.b*fg.b : 1.0 - 2.0*(1.0-bg.b)*(1.0-fg.b)
+  );
+}
+
+void main() {
+  vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+  vec3 genColor = vec3(0.0);
+  float t = u_time * u_speed;
+
+  if (u_mode == 0) { // Cylindrical
+    float r = 1.0 / length(uv) + t;
+    float a = atan(uv.y, uv.x);
+    float v = sin(r * 10.0 + u_audio_bass) * cos(a * 8.0);
+    genColor = palette(u_palette, v * 0.5 + 0.5) * u_intensity;
+  }
+  else if (u_mode == 1) { // Box
+    vec2 p = abs(uv);
+    float maxAx = max(p.x, p.y);
+    float r = 0.1 / maxAx + t * 0.5;
+    float squares = step(0.5, sin(r * 20.0));
+    genColor = vec3(squares) * palette(u_palette, r) * u_intensity;
+    genColor *= maxAx * 2.0;
+  }
+  else if (u_mode == 2) { // Warp Speed
+    float r = length(uv);
+    float a = atan(uv.y, uv.x);
+    float stars = 0.0;
+    int maxIters = int(4.0 * u_complexity);
+    for(float i=1.0; i<5.0; i++) {
+      if (i > float(maxIters)) break;
+      float rt = t * i + 100.0;
+      float depth = fract(1.0/r + rt);
+      float size = 0.05 * i * r;
+      float angle_seed = floor(a * 10.0 * i);
+      if (random(vec2(angle_seed, floor(depth * 10.0))) > 0.95) {
+        stars += 1.0 / (abs(fract(depth * 10.0) - 0.5) * 20.0);
+      }
+    }
+    genColor = vec3(stars) * (0.5 + 0.5 * u_audio_bass) * u_intensity;
+  }
+  else if (u_mode == 3) { // Hyper Tunnel
+    vec3 rd = normalize(vec3(uv, -1.0));
+    vec3 p = vec3(0.0);
+    vec3 col = vec3(0.0);
+    float z = 0.0;
+    float rt = t * 2.0;
+    for(int i=0; i<15; i++) {
+      p = z * rd;
+      vec3 a = p;
+      for(float j=2.0; j<7.0; j++) {
+        a -= sin(a * j + rt + float(i)).yzx / j;
+      }
+      vec3 ap = abs(p);
+      float d_box = abs(2.0 - max(ap.x, ap.y));
+      float s = a.z + a.y - rt;
+      float d_detail = abs(cos(s)) / 7.0;
+      float d = d_box + d_detail;
+      vec3 pal = cos(vec3(s - z) + vec3(0.0, 1.0, 8.0)) + 1.0;
+      col += pal / max(0.001, d);
+      z += max(0.05, d);
+    }
+    genColor = tanh(col * 0.005) * u_intensity;
+  }
+  else { // Bio-Tunnel
+    vec3 rd = normalize(vec3(uv, -1.0));
+    vec3 p = vec3(0.0);
+    vec4 col = vec4(0.0);
+    float z = 0.0;
+    float rt = t + u_audio_bass * 4.0;
+    for(int i=0; i<15; i++) {
+      p = z * rd;
+      float angle = atan(p.y / 0.2, p.x) * 2.0;
+      float depth = p.z / 3.0;
+      float radius = length(p.xy) - 5.0 - z * 0.2;
+      p = vec3(angle, depth, radius);
+      for(float j=1.0; j<7.0; j++) {
+        p += sin(p.yzx * j + rt + 0.3 * float(i)) / j;
+      }
+      float d = length(vec4(0.4 * cos(p) - 0.4, p.z));
+      z += d;
+      vec4 pal = cos(p.x + float(i) * 0.4 + z + vec4(6.0, 1.0, 2.0, 0.0)) + (1.0 + u_audio_treble);
+      col += pal / max(0.001, (d + u_audio_bass * 0.5));
+    }
+    genColor = tanh(col.rgb * col.rgb / 400.0) * u_intensity;
+  }
+
+  vec4 bg = texture(u_texture, v_uv);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+}
+`);
+
+// ── GEOMETRIC (Symmetric Geometry) ──
+registerShader('GEOMETRIC', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Sacred Geometry,Hexagonal Grid,Rotating Crosses,Geode"
+uniform int u_mode;
+// @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
+uniform int u_palette;
+// @param name="Complexity" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_complexity;
+// @param name="Intensity" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+// @param name="Blend Mode" min=0 max=4 default=0 step=1 type=select options="Replace,Add,Screen,Multiply,Overlay"
+uniform int u_blend_mode;
+// @param name="Background Mix" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bg_mix;
+
+out vec4 fragColor;
+
+vec2 rotate(vec2 p, float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+vec3 palette(int palette_idx, float t) {
+  if (palette_idx == 0) return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  if (palette_idx == 1) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(2.0, 1.0, 0.0) * t + vec3(0.5, 0.2, 0.25)));
+  if (palette_idx == 2) return mix(vec3(0.2, 0.0, 0.8), vec3(0.8, 0.2, 1.0), sin(t * 3.14159) * 0.5 + 0.5);
+  if (palette_idx == 3) return mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), clamp(t, 0.0, 1.0));
+  if (palette_idx == 4) return mix(vec3(0.0, 0.3, 0.8), vec3(0.0, 0.8, 0.6), clamp(t, 0.0, 1.0));
+  if (palette_idx == 5) return vec3(0.9, 0.8, 0.8) * (0.5 + 0.5 * cos(6.28318 * t + vec3(0.0, 0.1, 0.2)));
+  if (palette_idx == 6) return vec3(t);
+  if (palette_idx == 7) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(1.0, 0.7, 0.4) * t + vec3(0.0, 0.15, 0.20)));
+  if (palette_idx == 8) return vec3(0.3, 0.5, 0.2) + vec3(0.4, 0.5, 0.3) * cos(6.28318 * (vec3(0.5, 0.8, 0.4) * t + vec3(0.1, 0.3, 0.6)));
+  if (palette_idx == 9) return vec3(0.2, 0.2, 0.5) + vec3(0.8, 0.6, 0.8) * cos(6.28318 * (vec3(1.5, 0.5, 0.8) * t + vec3(0.0, 0.3, 0.5)));
+  if (palette_idx == 10) return vec3(0.6, 0.6, 0.8) + vec3(0.3, 0.3, 0.4) * cos(6.28318 * (vec3(0.5, 0.4, 1.0) * t + vec3(0.0, 0.1, 0.3)));
+  if (palette_idx == 11) return vec3(0.6, 0.2, 0.0) + vec3(0.7, 0.4, 0.1) * cos(6.28318 * (vec3(0.8, 0.6, 0.2) * t + vec3(0.1, 0.0, 0.5)));
+  if (palette_idx == 12) return vec3(0.1, 0.1, 0.3) + vec3(0.5, 0.3, 0.6) * cos(6.28318 * (vec3(1.2, 0.6, 0.9) * t + vec3(0.5, 0.8, 0.3)));
+  if (palette_idx == 13) return vec3(0.2, 0.5, 0.1) + vec3(0.7, 0.8, 0.2) * cos(6.28318 * (vec3(1.3, 0.4, 0.3) * t + vec3(0.2, 0.0, 0.6)));
+  if (palette_idx == 14) return vec3(0.4, 0.3, 0.6) + vec3(0.6, 0.5, 0.6) * cos(6.28318 * (vec3(0.8, 0.3, 0.5) * t + vec3(0.3, 0.4, 0.7)));
+  if (palette_idx == 15) return vec3(0.5, 0.4, 0.1) + vec3(0.7, 0.5, 0.2) * cos(6.28318 * (vec3(0.6, 0.9, 0.3) * t + vec3(0.0, 0.2, 0.5)));
+  return vec3(0.2, 0.5, 0.6) + vec3(0.3, 0.6, 0.5) * cos(6.28318 * (vec3(0.4, 0.7, 1.0) * t + vec3(0.1, 0.5, 0.3)));
+}
+
+vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
+  if (blend_mode == 0) return fg;
+  if (blend_mode == 1) return bg + fg;
+  if (blend_mode == 2) return 1.0 - (1.0 - bg) * (1.0 - fg);
+  if (blend_mode == 3) return bg * fg;
+  return vec3(
+    bg.r < 0.5 ? 2.0*bg.r*fg.r : 1.0 - 2.0*(1.0-bg.r)*(1.0-fg.r),
+    bg.g < 0.5 ? 2.0*bg.g*fg.g : 1.0 - 2.0*(1.0-bg.g)*(1.0-fg.g),
+    bg.b < 0.5 ? 2.0*bg.b*fg.b : 1.0 - 2.0*(1.0-bg.b)*(1.0-fg.b)
+  );
+}
+
+void main() {
+  vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+  vec3 genColor = vec3(0.0);
+  float t = u_time * u_speed;
+
+  if (u_mode == 0) { // Sacred Geometry
+    vec2 p = abs(uv) - 0.5;
+    float d = length(p);
+    float s = sin(d * 20.0 * u_complexity - t * 4.0 + u_audio_bass);
+    s = smoothstep(0.4, 0.5, s);
+    genColor = palette(u_palette, d) * s * u_intensity;
+  }
+  else if (u_mode == 1) { // Hexagonal Grid
+    vec2 p = uv * 5.0 * u_complexity;
+    vec2 q = vec2(p.x * 2.0 * 0.5773503, p.y + p.x * 0.5773503);
+    vec2 pi = floor(q);
+    vec2 pf = fract(q);
+    float ca = step(1.0, max(abs(pf.x - 0.5) * 1.5 + abs(pf.y - 0.5), abs(pf.y - 0.5) * 2.0));
+    genColor = vec3(ca) * palette(u_palette, pi.x * 0.1 + t) * u_intensity;
+  }
+  else if (u_mode == 2) { // Rotating Crosses
+    vec2 p = fract(uv * 4.0 * u_complexity) - 0.5;
+    p = rotate(p, t + u_audio_bass);
+    float crossShape = min(abs(p.x), abs(p.y));
+    float mask = smoothstep(0.1, 0.09, crossShape);
+    genColor = mask * palette(u_palette, uv.x + uv.y + t) * u_intensity;
+  }
+  else { // Geode
+    vec3 p = vec3(0.0);
+    vec3 v = vec3(0.0);
+    vec3 rd = normalize(vec3(uv, -1.0));
+    vec4 o = vec4(0.0);
+    float z = 0.0;
+    v = normalize(cos(t * 0.25 + vec3(0.0, 1.0, 4.0)));
+    for(float i=0.0; i<30.0; i++) {
+      p = z * rd;
+      float dotP = dot(v, p);
+      p = dotP * v + cross(v, p);
+      p.z -= t;
+      vec3 folded = abs(fract(p) - 0.5);
+      p += folded.yzx - sin(z * 0.7);
+      float d = 0.3 * length(min(p, p.yzx));
+      vec4 colShift = cos(i * 0.2 + t + vec4(0.0, 1.0, 3.0, 0.0)) + 1.0;
+      o += colShift / max(0.001, d);
+      z += d;
+    }
+    genColor = tanh(o.rgb / 2000.0) * (1.0 + u_audio_treble) * u_intensity;
+  }
+
+  vec4 bg = texture(u_texture, v_uv);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+}
+`);
+
+// ── LIGHTNING (Electric Discharges) ──
+registerShader('LIGHTNING', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=2 default=0 step=1 type=select options="Spectral Tesla,Waveform Bolt,Chaos Storm"
+uniform int u_mode;
+// @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
+uniform int u_palette;
+// @param name="Complexity" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_complexity;
+// @param name="Intensity" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+// @param name="Blend Mode" min=0 max=4 default=0 step=1 type=select options="Replace,Add,Screen,Multiply,Overlay"
+uniform int u_blend_mode;
+// @param name="Background Mix" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bg_mix;
+
+out vec4 fragColor;
+
+float random(vec2 st) {
+  return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+vec3 palette(int palette_idx, float t) {
+  if (palette_idx == 0) return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  if (palette_idx == 1) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(2.0, 1.0, 0.0) * t + vec3(0.5, 0.2, 0.25)));
+  if (palette_idx == 2) return mix(vec3(0.2, 0.0, 0.8), vec3(0.8, 0.2, 1.0), sin(t * 3.14159) * 0.5 + 0.5);
+  if (palette_idx == 3) return mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), clamp(t, 0.0, 1.0));
+  if (palette_idx == 4) return mix(vec3(0.0, 0.3, 0.8), vec3(0.0, 0.8, 0.6), clamp(t, 0.0, 1.0));
+  if (palette_idx == 5) return vec3(0.9, 0.8, 0.8) * (0.5 + 0.5 * cos(6.28318 * t + vec3(0.0, 0.1, 0.2)));
+  if (palette_idx == 6) return vec3(t);
+  if (palette_idx == 7) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(1.0, 0.7, 0.4) * t + vec3(0.0, 0.15, 0.20)));
+  if (palette_idx == 8) return vec3(0.3, 0.5, 0.2) + vec3(0.4, 0.5, 0.3) * cos(6.28318 * (vec3(0.5, 0.8, 0.4) * t + vec3(0.1, 0.3, 0.6)));
+  if (palette_idx == 9) return vec3(0.2, 0.2, 0.5) + vec3(0.8, 0.6, 0.8) * cos(6.28318 * (vec3(1.5, 0.5, 0.8) * t + vec3(0.0, 0.3, 0.5)));
+  if (palette_idx == 10) return vec3(0.6, 0.6, 0.8) + vec3(0.3, 0.3, 0.4) * cos(6.28318 * (vec3(0.5, 0.4, 1.0) * t + vec3(0.0, 0.1, 0.3)));
+  if (palette_idx == 11) return vec3(0.6, 0.2, 0.0) + vec3(0.7, 0.4, 0.1) * cos(6.28318 * (vec3(0.8, 0.6, 0.2) * t + vec3(0.1, 0.0, 0.5)));
+  if (palette_idx == 12) return vec3(0.1, 0.1, 0.3) + vec3(0.5, 0.3, 0.6) * cos(6.28318 * (vec3(1.2, 0.6, 0.9) * t + vec3(0.5, 0.8, 0.3)));
+  if (palette_idx == 13) return vec3(0.2, 0.5, 0.1) + vec3(0.7, 0.8, 0.2) * cos(6.28318 * (vec3(1.3, 0.4, 0.3) * t + vec3(0.2, 0.0, 0.6)));
+  if (palette_idx == 14) return vec3(0.4, 0.3, 0.6) + vec3(0.6, 0.5, 0.6) * cos(6.28318 * (vec3(0.8, 0.3, 0.5) * t + vec3(0.3, 0.4, 0.7)));
+  if (palette_idx == 15) return vec3(0.5, 0.4, 0.1) + vec3(0.7, 0.5, 0.2) * cos(6.28318 * (vec3(0.6, 0.9, 0.3) * t + vec3(0.0, 0.2, 0.5)));
+  return vec3(0.2, 0.5, 0.6) + vec3(0.3, 0.6, 0.5) * cos(6.28318 * (vec3(0.4, 0.7, 1.0) * t + vec3(0.1, 0.5, 0.3)));
+}
+
+vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
+  if (blend_mode == 0) return fg;
+  if (blend_mode == 1) return bg + fg;
+  if (blend_mode == 2) return 1.0 - (1.0 - bg) * (1.0 - fg);
+  if (blend_mode == 3) return bg * fg;
+  return vec3(
+    bg.r < 0.5 ? 2.0*bg.r*fg.r : 1.0 - 2.0*(1.0-bg.r)*(1.0-fg.r),
+    bg.g < 0.5 ? 2.0*bg.g*fg.g : 1.0 - 2.0*(1.0-bg.g)*(1.0-fg.g),
+    bg.b < 0.5 ? 2.0*bg.b*fg.b : 1.0 - 2.0*(1.0-bg.b)*(1.0-fg.b)
+  );
+}
+
+float lightning(vec2 uv, float offset, float t) {
+  float col = 0.0;
+  float y = 0.5;
+  float segCount = 8.0 * u_complexity;
+  for (float i = 0.0; i < 12.0; i++) {
+    if (i > segCount) break;
+    float seg = i / segCount;
+    float nextY = 0.5 + (random(vec2(i, offset)) - 0.5) * 0.8;
+    float x = seg + offset * 0.1 + t * 0.2;
+    float dx = x - uv.x;
+    float dy = mix(y, nextY, smoothstep(0.0, 1.0, (uv.x - seg + offset * 0.1 + t * 0.2) / (0.1 / u_complexity)));
+    float d = abs(uv.y - dy) / (0.02 + seg * 0.01);
+    col += exp(-d * d) * (1.0 - seg * 0.5);
+    y = nextY;
+  }
+  return col;
+}
+
+void main() {
+  vec2 uv = v_uv;
+  vec3 genColor = vec3(0.0);
+  float t = u_time * u_speed;
+
+  if (u_mode == 0) { // Spectral Tesla
+    float bolt = 0.0;
+    for (float i = 0.0; i < 3.0; i++) {
+      bolt += lightning(uv, i * 100.0 + floor(t * 2.0 + i * 10.0), t);
+    }
+    bolt *= 0.3 + u_audio_bass * 0.5;
+    vec3 glow = palette(u_palette, bolt * 2.0 + t * 0.1);
+    genColor = glow * bolt * u_intensity;
+    genColor += palette(u_palette, 0.5 + t * 0.05) * exp(-abs(uv.y - 0.5) * 10.0) * bolt * 0.3 * u_intensity;
+  }
+  else if (u_mode == 1) { // Waveform Bolt
+    float wave = sin(uv.x * 20.0 + t * 5.0) * 0.1;
+    wave += sin(uv.x * 40.0 - t * 3.0) * 0.05 * u_audio_mid;
+    float lightningY = 0.5 + wave * (0.5 + u_audio_bass);
+    float d = abs(uv.y - lightningY);
+    float bolt = exp(-d * d * 200.0) * (0.5 + u_audio_treble);
+    bolt += exp(-d * d * 50.0) * 0.2;
+    genColor = palette(u_palette, uv.x + t * 0.2) * bolt * u_intensity;
+  }
+  else { // Chaos Storm
+    vec3 col = vec3(0.0);
+    vec2 p = (uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+    float rt = t + u_audio_bass * 3.0;
+    for (float i = 0.0; i < 5.0; i++) {
+      vec2 origin = vec2(sin(rt * 0.7 + i * 2.0) * 0.8, cos(rt * 0.5 + i * 3.0) * 0.8);
+      vec2 dir = normalize(p - origin);
+      float angle = atan(dir.y, dir.x) + rt * 0.1;
+      float boltLen = 0.0;
+      vec2 pos = origin;
+      for (float j = 0.0; j < 10.0; j++) {
+        float r = random(vec2(i * 100.0 + j, floor(rt)));
+        pos += dir * 0.05;
+        dir = normalize(vec2(cos(angle + r * 2.0), sin(angle + r * 2.0)));
+        angle += (r - 0.5) * 2.0;
+        float d = length(p - pos);
+        boltLen += exp(-d * d * 100.0) * 0.3;
+      }
+      col += palette(u_palette, i * 0.2 + rt * 0.1) * boltLen;
+    }
+    genColor = col * u_intensity * (0.7 + u_audio_treble * 0.3);
+  }
+
+  vec4 bg = texture(u_texture, uv);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+}
+`);
+
+// ── CRYSTAL (Shattered Patterns) ──
+registerShader('CRYSTAL', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Radial Facets,Glass Shatter,Isometric Cubes,Ethereal Gem"
+uniform int u_mode;
+// @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
+uniform int u_palette;
+// @param name="Complexity" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_complexity;
+// @param name="Intensity" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+// @param name="Blend Mode" min=0 max=4 default=0 step=1 type=select options="Replace,Add,Screen,Multiply,Overlay"
+uniform int u_blend_mode;
+// @param name="Background Mix" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bg_mix;
+
+out vec4 fragColor;
+
+float random(vec2 st) {
+  return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+vec2 rotate(vec2 p, float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+vec3 palette(int palette_idx, float t) {
+  if (palette_idx == 0) return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  if (palette_idx == 1) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(2.0, 1.0, 0.0) * t + vec3(0.5, 0.2, 0.25)));
+  if (palette_idx == 2) return mix(vec3(0.2, 0.0, 0.8), vec3(0.8, 0.2, 1.0), sin(t * 3.14159) * 0.5 + 0.5);
+  if (palette_idx == 3) return mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), clamp(t, 0.0, 1.0));
+  if (palette_idx == 4) return mix(vec3(0.0, 0.3, 0.8), vec3(0.0, 0.8, 0.6), clamp(t, 0.0, 1.0));
+  if (palette_idx == 5) return vec3(0.9, 0.8, 0.8) * (0.5 + 0.5 * cos(6.28318 * t + vec3(0.0, 0.1, 0.2)));
+  if (palette_idx == 6) return vec3(t);
+  if (palette_idx == 7) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(1.0, 0.7, 0.4) * t + vec3(0.0, 0.15, 0.20)));
+  if (palette_idx == 8) return vec3(0.3, 0.5, 0.2) + vec3(0.4, 0.5, 0.3) * cos(6.28318 * (vec3(0.5, 0.8, 0.4) * t + vec3(0.1, 0.3, 0.6)));
+  if (palette_idx == 9) return vec3(0.2, 0.2, 0.5) + vec3(0.8, 0.6, 0.8) * cos(6.28318 * (vec3(1.5, 0.5, 0.8) * t + vec3(0.0, 0.3, 0.5)));
+  if (palette_idx == 10) return vec3(0.6, 0.6, 0.8) + vec3(0.3, 0.3, 0.4) * cos(6.28318 * (vec3(0.5, 0.4, 1.0) * t + vec3(0.0, 0.1, 0.3)));
+  if (palette_idx == 11) return vec3(0.6, 0.2, 0.0) + vec3(0.7, 0.4, 0.1) * cos(6.28318 * (vec3(0.8, 0.6, 0.2) * t + vec3(0.1, 0.0, 0.5)));
+  if (palette_idx == 12) return vec3(0.1, 0.1, 0.3) + vec3(0.5, 0.3, 0.6) * cos(6.28318 * (vec3(1.2, 0.6, 0.9) * t + vec3(0.5, 0.8, 0.3)));
+  if (palette_idx == 13) return vec3(0.2, 0.5, 0.1) + vec3(0.7, 0.8, 0.2) * cos(6.28318 * (vec3(1.3, 0.4, 0.3) * t + vec3(0.2, 0.0, 0.6)));
+  if (palette_idx == 14) return vec3(0.4, 0.3, 0.6) + vec3(0.6, 0.5, 0.6) * cos(6.28318 * (vec3(0.8, 0.3, 0.5) * t + vec3(0.3, 0.4, 0.7)));
+  if (palette_idx == 15) return vec3(0.5, 0.4, 0.1) + vec3(0.7, 0.5, 0.2) * cos(6.28318 * (vec3(0.6, 0.9, 0.3) * t + vec3(0.0, 0.2, 0.5)));
+  return vec3(0.2, 0.5, 0.6) + vec3(0.3, 0.6, 0.5) * cos(6.28318 * (vec3(0.4, 0.7, 1.0) * t + vec3(0.1, 0.5, 0.3)));
+}
+
+vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
+  if (blend_mode == 0) return fg;
+  if (blend_mode == 1) return bg + fg;
+  if (blend_mode == 2) return 1.0 - (1.0 - bg) * (1.0 - fg);
+  if (blend_mode == 3) return bg * fg;
+  return vec3(
+    bg.r < 0.5 ? 2.0*bg.r*fg.r : 1.0 - 2.0*(1.0-bg.r)*(1.0-fg.r),
+    bg.g < 0.5 ? 2.0*bg.g*fg.g : 1.0 - 2.0*(1.0-bg.g)*(1.0-fg.g),
+    bg.b < 0.5 ? 2.0*bg.b*fg.b : 1.0 - 2.0*(1.0-bg.b)*(1.0-fg.b)
+  );
+}
+
+void main() {
+  vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+  vec3 genColor = vec3(0.0);
+  float t = u_time * u_speed;
+
+  if (u_mode == 0) { // Radial Facets
+    float angle = atan(uv.y, uv.x);
+    float radius = length(uv);
+    float facets = 6.0 * u_complexity;
+    float sector = floor(angle / (6.28318 / facets));
+    float sectorAngle = sector * (6.28318 / facets);
+    vec2 facetUV = rotate(uv, -sectorAngle);
+    float sparkle = sin(facetUV.x * 30.0 + t * 2.0) * sin(facetUV.y * 30.0 - t);
+    sparkle = smoothstep(0.0, 0.1, sparkle);
+    float edge = smoothstep(abs(angle - sectorAngle), 0.02, 0.0);
+    genColor = palette(u_palette, sector / facets + radius + t * 0.1) * (sparkle + edge * 0.5) * u_intensity;
+    genColor *= 1.0 + u_audio_bass * 0.5;
+  }
+  else if (u_mode == 1) { // Glass Shatter
+    vec2 p = uv * 3.0;
+    vec3 col = vec3(0.0);
+    float rt = t + u_audio_bass * 2.0;
+    for (float i = 0.0; i < 8.0; i++) {
+      vec2 cell = floor(p + i * 0.1);
+      vec2 shard = fract(p + i * 0.1) - 0.5;
+      float r = random(cell);
+      shard = rotate(shard, r * 6.28318 + rt * 0.5);
+      float d = length(shard);
+      float edge = smoothstep(0.3, 0.28, d);
+      vec3 shardCol = palette(u_palette, r + i * 0.1);
+      col += shardCol * edge * 0.5;
+      // Crack lines
+      float crack = exp(-d * d * 100.0) * 0.3;
+      col += vec3(1.0) * crack * u_intensity;
+    }
+    genColor = col * u_intensity;
+  }
+  else if (u_mode == 2) { // Isometric Cubes
+    vec2 p = uv * 4.0;
+    float isoAngle = 0.5236;
+    vec2 iso = vec2(p.x * cos(isoAngle) + p.y * cos(isoAngle), -p.x * sin(isoAngle) + p.y * sin(isoAngle));
+    vec2 cell = floor(iso);
+    vec2 f = fract(iso);
+    float cubeHeight = random(cell) * 0.5;
+    float top = smoothstep(0.9, 0.95, f.x) + smoothstep(0.9, 0.95, f.y);
+    float front = smoothstep(0.05, 0.0, abs(f.x + f.y - 1.0));
+    float side = smoothstep(0.05, 0.0, abs(f.x - f.y));
+    float cube = max(max(top, front), side) * step(f.y, 1.0 - cubeHeight);
+    genColor = palette(u_palette, cell.x * 0.1 + cell.y * 0.1 + t * 0.05) * cube * u_intensity * (0.8 + u_audio_mid * 0.5);
+  }
+  else { // Ethereal Gem
+    vec3 rd = normalize(vec3(uv, -1.5));
+    vec3 p = vec3(0.0);
+    vec3 col = vec3(0.0);
+    float z = 0.0;
+    float rt = t * 0.5;
+    for (int i = 0; i < 12; i++) {
+      p = z * rd;
+      p = rotate(p.xy, rt) + rotate(p.xz, rt * 0.7).xzy;
+      float d = 0.0;
+      for (float j = 1.0; j < 5.0; j++) {
+        vec3 ap = abs(p) - j * 0.15;
+        d = max(d, max(ap.x, max(ap.y, ap.z)));
+      }
+      if (d < 0.05) {
+        vec3 gemCol = palette(u_palette, float(i) * 0.1 + length(p));
+        col += gemCol * (0.05 - d) * 20.0;
+      }
+      z += max(0.1, d);
+    }
+    // Inner glow
+    float glow = exp(-length(uv) * 3.0) * (0.5 + u_audio_treble * 0.5);
+    col += palette(u_palette, rt * 0.2) * glow * 0.5;
+    genColor = col * u_intensity;
+  }
+
+  vec4 bg = texture(u_texture, v_uv);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+}
+`);
+
+// ── COSMIC (Galactic Visuals) ──
+registerShader('COSMIC', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Spiral Arms,Nebula,Black Hole,Quasar"
+uniform int u_mode;
+// @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
+uniform int u_palette;
+// @param name="Complexity" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_complexity;
+// @param name="Intensity" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+// @param name="Blend Mode" min=0 max=4 default=0 step=1 type=select options="Replace,Add,Screen,Multiply,Overlay"
+uniform int u_blend_mode;
+// @param name="Background Mix" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bg_mix;
+
+out vec4 fragColor;
+
+float random(vec2 st) {
+  return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(random(i + vec2(0.0, 0.0)), random(i + vec2(1.0, 0.0)), u.x),
+             mix(random(i + vec2(0.0, 1.0)), random(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+float fbm(vec2 p) {
+  float value = 0.0;
+  float amplitude = 0.5;
+  for(int i = 0; i < 4; i++) {
+    value += amplitude * noise(p);
+    p *= 2.0;
+    amplitude *= 0.5;
+  }
+  return value;
+}
+
+vec2 rotate(vec2 p, float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+vec3 palette(int palette_idx, float t) {
+  if (palette_idx == 0) return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  if (palette_idx == 1) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(2.0, 1.0, 0.0) * t + vec3(0.5, 0.2, 0.25)));
+  if (palette_idx == 2) return mix(vec3(0.2, 0.0, 0.8), vec3(0.8, 0.2, 1.0), sin(t * 3.14159) * 0.5 + 0.5);
+  if (palette_idx == 3) return mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), clamp(t, 0.0, 1.0));
+  if (palette_idx == 4) return mix(vec3(0.0, 0.3, 0.8), vec3(0.0, 0.8, 0.6), clamp(t, 0.0, 1.0));
+  if (palette_idx == 5) return vec3(0.9, 0.8, 0.8) * (0.5 + 0.5 * cos(6.28318 * t + vec3(0.0, 0.1, 0.2)));
+  if (palette_idx == 6) return vec3(t);
+  if (palette_idx == 7) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(1.0, 0.7, 0.4) * t + vec3(0.0, 0.15, 0.20)));
+  if (palette_idx == 8) return vec3(0.3, 0.5, 0.2) + vec3(0.4, 0.5, 0.3) * cos(6.28318 * (vec3(0.5, 0.8, 0.4) * t + vec3(0.1, 0.3, 0.6)));
+  if (palette_idx == 9) return vec3(0.2, 0.2, 0.5) + vec3(0.8, 0.6, 0.8) * cos(6.28318 * (vec3(1.5, 0.5, 0.8) * t + vec3(0.0, 0.3, 0.5)));
+  if (palette_idx == 10) return vec3(0.6, 0.6, 0.8) + vec3(0.3, 0.3, 0.4) * cos(6.28318 * (vec3(0.5, 0.4, 1.0) * t + vec3(0.0, 0.1, 0.3)));
+  if (palette_idx == 11) return vec3(0.6, 0.2, 0.0) + vec3(0.7, 0.4, 0.1) * cos(6.28318 * (vec3(0.8, 0.6, 0.2) * t + vec3(0.1, 0.0, 0.5)));
+  if (palette_idx == 12) return vec3(0.1, 0.1, 0.3) + vec3(0.5, 0.3, 0.6) * cos(6.28318 * (vec3(1.2, 0.6, 0.9) * t + vec3(0.5, 0.8, 0.3)));
+  if (palette_idx == 13) return vec3(0.2, 0.5, 0.1) + vec3(0.7, 0.8, 0.2) * cos(6.28318 * (vec3(1.3, 0.4, 0.3) * t + vec3(0.2, 0.0, 0.6)));
+  if (palette_idx == 14) return vec3(0.4, 0.3, 0.6) + vec3(0.6, 0.5, 0.6) * cos(6.28318 * (vec3(0.8, 0.3, 0.5) * t + vec3(0.3, 0.4, 0.7)));
+  if (palette_idx == 15) return vec3(0.5, 0.4, 0.1) + vec3(0.7, 0.5, 0.2) * cos(6.28318 * (vec3(0.6, 0.9, 0.3) * t + vec3(0.0, 0.2, 0.5)));
+  return vec3(0.2, 0.5, 0.6) + vec3(0.3, 0.6, 0.5) * cos(6.28318 * (vec3(0.4, 0.7, 1.0) * t + vec3(0.1, 0.5, 0.3)));
+}
+
+vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
+  if (blend_mode == 0) return fg;
+  if (blend_mode == 1) return bg + fg;
+  if (blend_mode == 2) return 1.0 - (1.0 - bg) * (1.0 - fg);
+  if (blend_mode == 3) return bg * fg;
+  return vec3(
+    bg.r < 0.5 ? 2.0*bg.r*fg.r : 1.0 - 2.0*(1.0-bg.r)*(1.0-fg.r),
+    bg.g < 0.5 ? 2.0*bg.g*fg.g : 1.0 - 2.0*(1.0-bg.g)*(1.0-fg.g),
+    bg.b < 0.5 ? 2.0*bg.b*fg.b : 1.0 - 2.0*(1.0-bg.b)*(1.0-fg.b)
+  );
+}
+
+void main() {
+  vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+  vec3 genColor = vec3(0.0);
+  float t = u_time * u_speed;
+
+  if (u_mode == 0) { // Spiral Arms
+    float r = length(uv);
+    float angle = atan(uv.y, uv.x);
+    float arms = 2.0 * u_complexity;
+    float spiral = arms * log(r + 0.001) + angle - t;
+    float wave = sin(spiral * 10.0) * 0.5 + 0.5;
+    float armMask = smoothstep(0.1, 0.0, abs(sin(spiral * 5.0)));
+    // Stars
+    float stars = 0.0;
+    for (float i = 0.0; i < 5.0; i++) {
+      vec2 starPos = rotate(vec2(0.1 + i * 0.15, 0.0), t + i * 1.5) * 2.0;
+      float d = length(uv - starPos);
+      float starR = 0.002 + random(vec2(i, 0.0)) * 0.005;
+      stars += exp(-d * d / (starR * starR)) * (0.5 + u_audio_treble * 0.5);
+    }
+    vec3 armColor = palette(u_palette, r + t * 0.05);
+    genColor = armColor * armMask * wave * 0.5 * u_intensity;
+    genColor += stars * u_intensity;
+    // Center glow
+    genColor += palette(u_palette, t * 0.1) * exp(-r * 5.0) * 0.5 * u_intensity;
+  }
+  else if (u_mode == 1) { // Nebula
+    float scale = 3.0 * u_complexity;
+    float n = fbm(uv * scale + t * 0.1);
+    n += fbm(uv * scale * 2.0 - t * 0.15) * 0.5;
+    n += fbm(uv * scale * 4.0 + t * 0.2) * 0.25;
+    float dist = length(uv);
+    float falloff = exp(-dist * 2.0);
+    // Dust lanes
+    float dust = smoothstep(0.3, 0.0, abs(n - 0.5));
+    vec3 nebulaCol = palette(u_palette, n + t * 0.02) * n * falloff;
+    vec3 dustCol = palette(u_palette + 1, n + t * 0.02) * dust * falloff * 0.5;
+    genColor = (nebulaCol + dustCol) * u_intensity * (0.7 + u_audio_mid * 0.3);
+  }
+  else if (u_mode == 2) { // Black Hole
+    float r = length(uv);
+    float angle = atan(uv.y, uv.x);
+    // Gravitational lensing distortion
+    float distortion = 0.3 / (r + 0.1);
+    vec2 distortedUV = uv + normalize(uv) * distortion * 0.5;
+    // Accretion disk
+    float diskAngle = angle + t * 0.5 + r * 3.0;
+    float diskWave = sin(diskAngle * 8.0) * 0.5 + 0.5;
+    float diskWidth = 0.1 + u_audio_bass * 0.05;
+    float diskDisk = smoothstep(diskWidth, 0.0, abs(r - 0.5));
+    vec3 diskCol = palette(u_palette, r + t * 0.2) * diskWave * diskDisk;
+    // Event horizon
+    float horizon = smoothstep(0.15, 0.1, r);
+    // Photon ring
+    float ring = exp(-abs(r - 0.2) * 50.0) * (1.0 + u_audio_treble);
+    genColor = diskCol * u_intensity * horizon + ring * palette(u_palette, t * 0.3) * 0.5 * u_intensity;
+  }
+  else { // Quasar
+    float r = length(uv);
+    float angle = atan(uv.y, uv.x);
+    // Jets
+    float jetUpper = smoothstep(0.1, 0.0, abs(angle - 1.5708));
+    float jetLower = smoothstep(0.1, 0.0, abs(angle + 1.5708));
+    float jetDecay = exp(-r * 3.0);
+    float jetPulse = sin(r * 50.0 - t * 5.0) * 0.5 + 0.5;
+    jetPulse *= (0.5 + u_audio_bass * 0.5);
+    vec3 jetCol = palette(u_palette, r + t * 0.5) * (jetUpper + jetLower) * jetDecay * jetPulse;
+    // Core flash
+    float core = exp(-r * 10.0) * (1.0 + u_audio_treble * 2.0);
+    float flash = step(0.9, sin(t * 10.0 + r * 20.0)) * core;
+    // Radial rays
+    float rays = sin(angle * 12.0 + t * 2.0) * 0.5 + 0.5;
+    rays *= smoothstep(0.8, 0.2, r);
+    vec3 rayCol = palette(u_palette + 1, angle / 6.28318 + t * 0.1) * rays * 0.3;
+    genColor = (jetCol + rayCol + flash * vec3(1.0, 0.9, 0.7)) * u_intensity;
+  }
+
+  vec4 bg = texture(u_texture, v_uv);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+}
+`);
+
+// ── WAVES (Wave Interference) ──
+registerShader('WAVES', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Interference,Ripples,Beam Scanlines,Sliding Interference"
+uniform int u_mode;
+// @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
+uniform int u_palette;
+// @param name="Complexity" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_complexity;
+// @param name="Intensity" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+// @param name="Blend Mode" min=0 max=4 default=0 step=1 type=select options="Replace,Add,Screen,Multiply,Overlay"
+uniform int u_blend_mode;
+// @param name="Background Mix" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bg_mix;
+
+out vec4 fragColor;
+
+vec2 rotate(vec2 p, float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+vec3 palette(int palette_idx, float t) {
+  if (palette_idx == 0) return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  if (palette_idx == 1) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(2.0, 1.0, 0.0) * t + vec3(0.5, 0.2, 0.25)));
+  if (palette_idx == 2) return mix(vec3(0.2, 0.0, 0.8), vec3(0.8, 0.2, 1.0), sin(t * 3.14159) * 0.5 + 0.5);
+  if (palette_idx == 3) return mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), clamp(t, 0.0, 1.0));
+  if (palette_idx == 4) return mix(vec3(0.0, 0.3, 0.8), vec3(0.0, 0.8, 0.6), clamp(t, 0.0, 1.0));
+  if (palette_idx == 5) return vec3(0.9, 0.8, 0.8) * (0.5 + 0.5 * cos(6.28318 * t + vec3(0.0, 0.1, 0.2)));
+  if (palette_idx == 6) return vec3(t);
+  if (palette_idx == 7) return vec3(0.5) + vec3(0.5) * cos(6.28318 * (vec3(1.0, 0.7, 0.4) * t + vec3(0.0, 0.15, 0.20)));
+  if (palette_idx == 8) return vec3(0.3, 0.5, 0.2) + vec3(0.4, 0.5, 0.3) * cos(6.28318 * (vec3(0.5, 0.8, 0.4) * t + vec3(0.1, 0.3, 0.6)));
+  if (palette_idx == 9) return vec3(0.2, 0.2, 0.5) + vec3(0.8, 0.6, 0.8) * cos(6.28318 * (vec3(1.5, 0.5, 0.8) * t + vec3(0.0, 0.3, 0.5)));
+  if (palette_idx == 10) return vec3(0.6, 0.6, 0.8) + vec3(0.3, 0.3, 0.4) * cos(6.28318 * (vec3(0.5, 0.4, 1.0) * t + vec3(0.0, 0.1, 0.3)));
+  if (palette_idx == 11) return vec3(0.6, 0.2, 0.0) + vec3(0.7, 0.4, 0.1) * cos(6.28318 * (vec3(0.8, 0.6, 0.2) * t + vec3(0.1, 0.0, 0.5)));
+  if (palette_idx == 12) return vec3(0.1, 0.1, 0.3) + vec3(0.5, 0.3, 0.6) * cos(6.28318 * (vec3(1.2, 0.6, 0.9) * t + vec3(0.5, 0.8, 0.3)));
+  if (palette_idx == 13) return vec3(0.2, 0.5, 0.1) + vec3(0.7, 0.8, 0.2) * cos(6.28318 * (vec3(1.3, 0.4, 0.3) * t + vec3(0.2, 0.0, 0.6)));
+  if (palette_idx == 14) return vec3(0.4, 0.3, 0.6) + vec3(0.6, 0.5, 0.6) * cos(6.28318 * (vec3(0.8, 0.3, 0.5) * t + vec3(0.3, 0.4, 0.7)));
+  if (palette_idx == 15) return vec3(0.5, 0.4, 0.1) + vec3(0.7, 0.5, 0.2) * cos(6.28318 * (vec3(0.6, 0.9, 0.3) * t + vec3(0.0, 0.2, 0.5)));
+  return vec3(0.2, 0.5, 0.6) + vec3(0.3, 0.6, 0.5) * cos(6.28318 * (vec3(0.4, 0.7, 1.0) * t + vec3(0.1, 0.5, 0.3)));
+}
+
+vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
+  if (blend_mode == 0) return fg;
+  if (blend_mode == 1) return bg + fg;
+  if (blend_mode == 2) return 1.0 - (1.0 - bg) * (1.0 - fg);
+  if (blend_mode == 3) return bg * fg;
+  return vec3(
+    bg.r < 0.5 ? 2.0*bg.r*fg.r : 1.0 - 2.0*(1.0-bg.r)*(1.0-fg.r),
+    bg.g < 0.5 ? 2.0*bg.g*fg.g : 1.0 - 2.0*(1.0-bg.g)*(1.0-fg.g),
+    bg.b < 0.5 ? 2.0*bg.b*fg.b : 1.0 - 2.0*(1.0-bg.b)*(1.0-fg.b)
+  );
+}
+
+void main() {
+  vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+  vec3 genColor = vec3(0.0);
+  float t = u_time * u_speed;
+
+  if (u_mode == 0) { // Interference
+    float scale = 5.0 * u_complexity;
+    vec2 p = uv * scale;
+    float wave = 0.0;
+    for (float i = 0.0; i < 4.0; i++) {
+      vec2 center = vec2(sin(t * 0.5 + i * 1.5), cos(t * 0.7 + i * 2.0)) * 0.5;
+      float d = length(uv - center);
+      float freq = 20.0 + i * 5.0;
+      wave += sin(d * freq - t * 3.0 + u_audio_bass * 2.0) * (1.0 - i * 0.2);
+    }
+    wave = wave * 0.25 + 0.5;
+    float rings = sin(length(uv) * 10.0 * scale - t * 2.0) * 0.5 + 0.5;
+    genColor = palette(u_palette, wave + rings * 0.3) * u_intensity * (0.8 + u_audio_mid * 0.4);
+  }
+  else if (u_mode == 1) { // Ripples
+    vec2 p = uv * 4.0;
+    float wave = 0.0;
+    float rt = t + u_audio_bass * 3.0;
+    for (float i = 0.0; i < 3.0; i++) {
+      vec2 center = vec2(sin(rt * 0.3 + i * 3.0) * 0.6, cos(rt * 0.4 + i * 2.0) * 0.6);
+      float d = abs(length(uv - center) - fract(rt * 0.5 + i * 0.3));
+      wave += exp(-d * d * 50.0) * (1.0 - i * 0.2);
+    }
+    float colorWave = sin(wave * 10.0 + length(uv) * 5.0) * 0.5 + 0.5;
+    genColor = palette(u_palette, colorWave + t * 0.05) * wave * u_intensity;
+  }
+  else if (u_mode == 2) { // Beam Scanlines
+    float scanline = sin(uv.x * 50.0 * u_complexity + t * 3.0) * 0.5 + 0.5;
+    scanline *= smoothstep(0.0, 1.0, sin(v_uv.y * 2.0 - t));
+    float beam = exp(-abs(uv.y) * 10.0) * (0.5 + u_audio_bass * 0.5);
+    float hue = uv.x + t * 0.1;
+    genColor = palette(u_palette, hue) * scanline * beam * u_intensity;
+    // Horizontal beam lines
+    for (float i = 0.0; i < 5.0; i++) {
+      float y = sin(t * 2.0 + i * 1.5) * 0.5;
+      float line = exp(-abs(uv.y - y) * 20.0);
+      genColor += palette(u_palette + 1, i * 0.2 + t * 0.1) * line * 0.3 * u_intensity;
+    }
+  }
+  else { // Sliding Interference
+    vec2 p = uv * 3.0;
+    float rt = t * 0.5;
+    // Transform to sliding coordinate system
+    vec2 q = rotate(p, sin(rt) * 0.5);
+    float wave = 0.0;
+    wave += sin(q.x * 20.0 + rt * 3.0) * sin(q.y * 20.0 - rt * 2.0);
+    wave += sin((q.x + q.y) * 15.0 + rt * 2.5) * 0.5;
+    wave += sin((q.x - q.y) * 15.0 - rt * 2.5) * 0.5;
+    wave = wave * 0.33 + 0.5;
+    float pattern = smoothstep(0.4, 0.6, wave);
+    genColor = palette(u_palette, pattern + length(uv) * 0.5 + t * 0.05) * pattern * u_intensity;
+    genColor *= 0.7 + u_audio_treble * 0.5;
+  }
+
+  vec4 bg = texture(u_texture, v_uv);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+}
+`);
+
+// ── SPACE_DISTORTION (Space Distortions) ──
+registerShader('SPACE_DISTORTION', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_audio_bass;
+uniform float u_audio_mid;
+uniform float u_audio_treble;
+
+// @param name="Mode" min=0 max=1 default=0 step=1 type=select options="Twist,Fold"
+uniform int u_mode;
+// @param name="Intensity" min=0.0 max=3.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Speed" min=0.1 max=3.0 default=1.0 step=0.1
+uniform float u_speed;
+
+out vec4 fragColor;
+
+float random(vec2 st) {
+  return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(random(i + vec2(0.0, 0.0)), random(i + vec2(1.0, 0.0)), u.x),
+             mix(random(i + vec2(0.0, 1.0)), random(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+void main() {
+  vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
+  float t = u_time * u_speed;
+  vec2 distortedUV = uv;
+
+  if (u_mode == 0) { // Twist
+    float r = length(uv);
+    float angle = atan(uv.y, uv.x);
+    float twistAmount = u_intensity * 3.0 * (1.0 + u_audio_bass * 0.5);
+    angle += twistAmount * (0.5 - r) * sin(t);
+    distortedUV = vec2(cos(angle), sin(angle)) * r;
+    // Add noise-based perturbation for organic feel
+    float n = noise(uv * 3.0 + t * 0.2) * 0.05 * u_intensity;
+    distortedUV += n * (1.0 + u_audio_mid);
+  }
+  else { // Fold
+    // Kaleidoscope-like folding
+    float segments = 6.0 + u_intensity * 4.0;
+    float angle = atan(uv.y, uv.x);
+    float r = length(uv);
+    float segAngle = 6.28318 / segments;
+    // Fold the angle
+    angle = mod(angle + t * 0.5, segAngle);
+    angle = abs(angle - segAngle * 0.5);
+    distortedUV = vec2(cos(angle), sin(angle)) * r;
+    // Mirror based on radius for more complex folds
+    float foldR = 0.3 + sin(t) * 0.1;
+    if (r > foldR) {
+      distortedUV += normalize(uv) * 0.1 * u_intensity * (1.0 + u_audio_treble);
+    }
+    // Additional noise distortion
+    float n1 = noise(uv * 5.0 + t * 0.3);
+    float n2 = noise(uv * 5.0 - t * 0.2 + 100.0);
+    distortedUV += vec2(n1, n2) * 0.03 * u_intensity;
+  }
+
+  distortedUV = distortedUV * 0.5 + 0.5;
+  fragColor = texture(u_texture, distortedUV);
+}
+`);
 
 export default SHADER_SOURCES

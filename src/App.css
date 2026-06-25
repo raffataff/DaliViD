@@ -117,6 +117,26 @@
   box-shadow: 0 0 8px rgba(0, 229, 255, 0.15);
 }
 
+/* ── Panel Header ── */
+.panel__header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  height: var(--panel-header-height, 28px);
+  padding: 0 var(--space-xs);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.panel__header-title {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ── Panel Header Buttons ── */
 .panel__header-btn {
   display: flex;

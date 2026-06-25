@@ -87,6 +87,8 @@ export default function NewProjectModal() {
           compileErrors: []
         },
         clipGraphs: {},
+        // Bump so the renderer recompiles (clears) for the new empty project.
+        topologyVersion: useGraphStore.getState().topologyVersion + 1,
       })
 
       // Ensure previous folder is cleanly disconnected

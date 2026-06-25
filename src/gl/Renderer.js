@@ -4,11 +4,11 @@
  * Handles the render loop, per-frame execution, and compositing.
  */
 
-import { createShaderProgram, uploadStandardUniforms, uploadUniforms } from './ShaderProgram.js'
+import { createShaderProgram, uploadStandardUniforms, uploadUniforms, clearProgramCache } from './ShaderProgram.js'
 import { TextureManager } from './TextureManager.js'
 import { FBOManager } from './FBOManager.js'
 import { BLEND_MODES_GLSL } from './BlendModes.glsl.js'
-import { compileGraph, executeChain, getActiveClip, getClipSourceTime, resolveFloatConnections } from './clipGraphManager.js'
+import { compileGraph, executeChain, getActiveClip, getClipSourceTime, resolveFloatConnections, buildNodeMap } from './clipGraphManager.js'
 import { getAudioEngine } from '../audio/AudioEngine.js'
 
 // Passthrough fragment shader — just copies input texture
@@ -236,7 +236,7 @@ export class Renderer {
    * Execute a single effect node pass.
    * Reads from inputFBO, writes to outputFBO.
    */
-  executePass(nodeProgram, inputFBOId, outputFBOId, standardState, customParams = {}, prevFrameFBOId = null) {
+  executePass(nodeProgram, inputFBOId, outputFBOId, standardState, customParams = {}, prevFrameFBOId = null, extraTextures = []) {
     const gl = this.gl
 
     // Bind output FBO
@@ -263,6 +263,14 @@ export class Renderer {
       }
     }
 
+    // Bind secondary texture inputs (e.g. u_disp_map, u_texture_b) to units 2+
+    for (const tex of extraTextures) {
+      const loc = nodeProgram.uniformLocations[tex.uniform]
+      if (loc == null) continue
+      this.fbos.bindTexture(tex.fboId, tex.unit)
+      gl.uniform1i(loc, tex.unit)
+    }
+
     // Upload standard uniforms
     uploadStandardUniforms(gl, nodeProgram.uniformLocations, standardState)
 
@@ -281,6 +289,12 @@ export class Renderer {
     this.isPaused = false
     this.startTime = performance.now() / 1000
     this.lastFrameTime = performance.now()
+    // Cancel any pending paused-poll timeout so the RAF loop is the only loop
+    // running — otherwise a stale poll frame can race a RAF frame and flash.
+    if (this.timeoutId) {
+      clearTimeout(this.timeoutId)
+      this.timeoutId = null
+    }
     if (!this.rafId) {
       this._loop()
     }
@@ -294,6 +308,12 @@ export class Renderer {
     if (this.rafId) {
       cancelAnimationFrame(this.rafId)
       this.rafId = null
+    }
+    // Clear any existing poll timeout before starting a fresh one so we never
+    // stack multiple poll loops.
+    if (this.timeoutId) {
+      clearTimeout(this.timeoutId)
+      this.timeoutId = null
     }
     this._pollLoop()
   }
@@ -502,7 +522,8 @@ export class Renderer {
     }
 
     this.frameCount++
-    this.lastFrameTime = now
+    // lastFrameTime is already set above (right after the playhead advance);
+    // assigning it again here is redundant.
 
     if (this.onFrameComplete) this.onFrameComplete(this.frameCount, time)
   }
@@ -667,13 +688,13 @@ export class Renderer {
               }
             }
 
-          const { chain } = this.compiledChains.get(clip.id)
+          const { chain, edges } = this.compiledChains.get(clip.id)
           if (chain.length > 0) {
             const outputFBOId = `clip_output_${clip.id}`
             if (!this.fbos.getTexture(outputFBOId)) {
               this.fbos.create(outputFBOId, this.width, this.height)
             }
-            executeChain(this, chain, inputFBOId, outputFBOId, standardState)
+            executeChain(this, chain, inputFBOId, outputFBOId, standardState, {}, buildNodeMap(clipGraph), edges)
             clipResultFBOId = outputFBOId
           }
         }
@@ -738,7 +759,7 @@ export class Renderer {
         )
 
         if (effectNodes.length > 0) {
-          executeChain(this, this.masterChain.chain, masterInputFBOId, null, standardState)
+          executeChain(this, this.masterChain.chain, masterInputFBOId, null, standardState, {}, buildNodeMap(masterGraph), this.masterChain.edges)
         } else {
           if (hasContent) this._blitToScreen(masterInputFBOId)
         }
@@ -749,7 +770,7 @@ export class Renderer {
 
     this._needsRecompile = false
 
-    // Cleanup inactive video elements
+    // Cleanup inactive video elements + GPU resources for removed clips
     for (const [clipId, videoEl] of this._videoElements) {
       if (!activeClipIds.has(clipId)) {
         if (!videoEl.paused) videoEl.pause()
@@ -757,9 +778,38 @@ export class Renderer {
           videoEl.removeAttribute('src')
           videoEl.load()
           this._videoElements.delete(clipId)
+          // The clip is gone from the timeline — free its GPU resources so they
+          // don't accumulate over a long editing session.
+          this.releaseClipResources(clipId, graphState)
         }
       }
     }
+  }
+
+  /**
+   * Release all GPU resources owned by a clip that has been removed from the
+   * timeline: its source texture, input/output FBOs, per-node feedback and
+   * compound ping-pong buffers, and its compiled chain.
+   */
+  releaseClipResources(clipId, graphState = null) {
+    this.textures.delete(`clip_${clipId}`)
+    this.fbos.delete(`clip_input_${clipId}`)
+    this.fbos.delete(`clip_output_${clipId}`)
+
+    // Per-node ping-pong buffers are keyed by node id, so we need the clip's
+    // graph to find them. Use the passed graph state if available.
+    const clipGraph = graphState?.clipGraphs?.[clipId]
+    if (clipGraph?.nodes) {
+      for (const n of clipGraph.nodes) {
+        this.fbos.delete(`__n_${n.id}`)            // DAG per-node output FBO
+        this.fbos.deletePingPong(`__npp_${n.id}`)  // DAG feedback ping-pong
+        this.fbos.deletePingPong(`__fb_${n.id}`)
+        this.fbos.deletePingPong(`__fb_sub_${n.id}`)
+        this.fbos.deletePingPong(`__compound_pp_${n.id}`)
+      }
+    }
+
+    this.compiledChains.delete(clipId)
   }
 
   /**
@@ -882,8 +932,8 @@ export class Renderer {
         this.compiledChains.set(clipId, result)
       }
 
-      const { chain } = this.compiledChains.get(clipId)
-      executeChain(this, chain, inputFBOId, null, standardState)
+      const { chain, edges } = this.compiledChains.get(clipId)
+      executeChain(this, chain, inputFBOId, null, standardState, {}, buildNodeMap(clipGraph), edges)
     } else {
       // No graph — passthrough
       gl.bindFramebuffer(gl.FRAMEBUFFER, null)
@@ -906,7 +956,13 @@ export class Renderer {
     document.removeEventListener('visibilitychange', this._handleVisibility)
     this.textures.dispose()
     this.fbos.dispose()
-    // Intentionally omitting loseContext() as it causes GPU process crashes 
+    // Delete cached shader programs tied to this GL context. The cache is keyed
+    // only by source, so leaving stale programs behind would risk returning
+    // programs from a dead context after a remount.
+    clearProgramCache(this.gl)
+    this.compiledChains.clear()
+    this.masterChain = null
+    // Intentionally omitting loseContext() as it causes GPU process crashes
     // on certain AMD drivers during React Strict Mode unmount/remount cycles.
     // The browser will garbage collect the context naturally when the canvas is destroyed.
   }

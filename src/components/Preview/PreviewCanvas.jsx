@@ -17,7 +17,6 @@ export default function PreviewCanvas() {
   const rendererRef = useRef(null)
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
-  const [displaySize, setDisplaySize] = useState({ width: 640, height: 360 })
   const [renderFps, setRenderFps] = useState(0)
   const isPanning = useRef(false)
   const lastPanPos = useRef({ x: 0, y: 0 })
@@ -30,38 +29,10 @@ export default function PreviewCanvas() {
   const graphLevel = useAppStore(s => s.graphLevel)
   const isPlaying = useAppStore(s => s.isPlaying)
 
-  // Auto-size canvas to fit container while maintaining aspect ratio
-  useEffect(() => {
-    const container = containerRef.current
-    if (!container) return
-
-    const update = () => {
-      const rect = container.getBoundingClientRect()
-      const w = rect.width
-      const h = rect.height
-      if (w <= 0 || h <= 0) return
-      const aspectRatio = resolution.width / resolution.height
-      let cw, ch
-      if (w / h > aspectRatio) {
-        ch = Math.floor(h)
-        cw = Math.floor(ch * aspectRatio)
-      } else {
-        cw = Math.floor(w)
-        ch = Math.floor(cw / aspectRatio)
-      }
-      const newWidth = Math.max(100, cw)
-      const newHeight = Math.max(56, ch)
-      setDisplaySize(prev => {
-        if (prev.width === newWidth && prev.height === newHeight) return prev
-        return { width: newWidth, height: newHeight }
-      })
-    }
-
-    update()
-    const observer = new ResizeObserver(update)
-    observer.observe(container)
-    return () => observer.disconnect()
-  }, [resolution])
+  // The canvas backing store renders at the full PROJECT resolution so the
+  // preview matches the export pixel-for-pixel and never changes with panel
+  // size. CSS (width/height 100% + object-fit: contain) scales the canvas down
+  // to fit the panel and letterboxes it.
 
   // Initialize Renderer and connect stores
   useEffect(() => {
@@ -96,13 +67,13 @@ export default function PreviewCanvas() {
       }
     }
 
-    // Update resolution
-    renderer.setResolution(displaySize.width, displaySize.height)
+    // Render at the project resolution (display scaling handled by CSS)
+    renderer.setResolution(resolution.width, resolution.height)
 
     return () => {
       // Don't dispose on HMR — keep the renderer alive
     }
-  }, [displaySize])
+  }, [resolution])
 
   // Respond to play/pause state changes
   useEffect(() => {
@@ -141,14 +112,14 @@ export default function PreviewCanvas() {
     }
   }, [])
 
-  // Subscribe to graph changes to mark renderer dirty
+  // Recompile only when graph structure / shader source changes, not on every
+  // param tweak. topologyVersion bumps only for structural changes; live param
+  // values are re-read by the renderer each frame without a recompile.
   useEffect(() => {
     const unsub = useGraphStore.subscribe((state, prevState) => {
-      // markDirty() whenever the graph objects change
-      if (rendererRef.current) {
-        if (!prevState || state.masterGraph !== prevState.masterGraph || state.clipGraphs !== prevState.clipGraphs) {
-          rendererRef.current.markDirty()
-        }
+      if (!rendererRef.current) return
+      if (!prevState || state.topologyVersion !== prevState.topologyVersion) {
+        rendererRef.current.markDirty()
       }
     })
     return unsub
@@ -239,11 +210,13 @@ export default function PreviewCanvas() {
             transition: isPanning.current ? 'none' : 'transform 0.15s ease-out'
           }}
         >
+        {/* NOTE: width/height (the drawing-buffer size) are owned solely by the
+            Renderer via setResolution(). Setting them here as React attributes
+            would reset & clear the canvas on every re-render (zoom/pan/resize),
+            causing the preview to flash. CSS scales the canvas for display. */}
         <canvas
           ref={canvasRef}
           className="preview__canvas"
-          width={displaySize.width}
-          height={displaySize.height}
           id="preview-canvas"
         />
         </div>

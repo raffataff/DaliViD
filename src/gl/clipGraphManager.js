@@ -6,8 +6,104 @@
  */
 
 import { createShaderProgram } from './ShaderProgram.js'
-import { getShaderSource } from '../shaders/shaderRegistry.js'
+import { getNodeSource } from '../shaders/shaderRegistry.js'
 import { getExecutionOrder } from '../utils/topSort.js'
+import { hexToVec3 } from '../utils/paramParser.js'
+
+// When true, the graph is evaluated as a true DAG (inputs resolved per-edge,
+// multi-input effects supported). Set to false to fall back to the legacy
+// linear executor if a regression is suspected.
+const USE_DAG = true
+
+// Texture input socket id → the sampler uniform it feeds. Covers every texture
+// input socket in the node set; custom nodes only use the primary 'input'.
+const TEXTURE_INPUT_SOCKETS = {
+  input: 'u_texture',
+  input_b: 'u_texture_b',
+  disp_map: 'u_disp_map',
+}
+
+// The audio "driver" uniforms. These are auto-declared into every effect shader
+// (so they can be used without a uniform line) and gated by the node's
+// "Audio Drivers" socket: each is 0.0 unless the matching Audio Splitter band is
+// wired in. Band ids match the splitter's output socket ids. (u_beat is handled
+// separately as an always-live standard uniform.)
+const AUDIO_DRIVER_BANDS = ['sub_bass', 'bass', 'low_mid', 'mid', 'high_mid', 'presence', 'treble', 'rms']
+// All audio uniforms auto-declared into every effect (the 8 gated bands plus the
+// always-live u_beat). u_beat is not gated — it's uploaded by uploadStandardUniforms.
+const AUDIO_DECLARE_UNIFORMS = [...AUDIO_DRIVER_BANDS, 'beat']
+const AUDIO_DRIVERS_SOCKET = 'audio_drivers'
+
+/**
+ * Inject `uniform float u_<name>;` declarations for any audio uniform the shader
+ * doesn't already declare. Done at compile time so users can reference the
+ * drivers in code without adding the declaration themselves. The editable source
+ * is left untouched — only the compiled string carries the injected lines.
+ */
+function injectAudioDrivers(source) {
+  if (!source) return source
+  const missing = AUDIO_DECLARE_UNIFORMS.filter(name => {
+    const re = new RegExp(`uniform\\s+(?:lowp\\s+|mediump\\s+|highp\\s+)?float\\s+u_${name}\\b`)
+    return !re.test(source)
+  })
+  if (missing.length === 0) return source
+  const decls = missing.map(name => `uniform float u_${name};`).join('\n')
+  const lines = source.split('\n')
+  // Insert after the precision line (or #version, or at the very top).
+  let idx = lines.findIndex(l => /\bprecision\b/.test(l))
+  if (idx === -1) idx = lines.findIndex(l => /#version/.test(l))
+  if (idx === -1) return `${decls}\n${source}`
+  lines.splice(idx + 1, 0, decls)
+  return lines.join('\n')
+}
+
+/**
+ * Live values for each audio driver band, read from the audio store.
+ */
+function audioDriverValues(renderer) {
+  const a = (renderer._getAudioStore && renderer._getAudioStore()) || {}
+  const b = a.smoothedBands || []
+  return {
+    sub_bass: b[0] || 0,
+    bass: a.bass || 0,
+    low_mid: b[2] || 0,
+    mid: a.mid || 0,
+    high_mid: b[4] || 0,
+    presence: b[5] || 0,
+    treble: a.treble || 0,
+    rms: a.rms || 0,
+  }
+}
+
+/**
+ * Apply gated audio drivers to a node's param set: every band defaults to 0.0,
+ * and any band wired into the node's Audio Drivers socket gets its live value.
+ * Unused uniforms are skipped at upload time, so this is safe for all nodes.
+ */
+function applyAudioDrivers(customParams, nodeId, edges, driverVals) {
+  for (const band of AUDIO_DRIVER_BANDS) customParams['u_' + band] = 0
+  if (!edges) return
+  for (const e of edges) {
+    if (e.toNode === nodeId && e.toSocket === AUDIO_DRIVERS_SOCKET && driverVals[e.fromSocket] !== undefined) {
+      customParams['u_' + e.fromSocket] = driverVals[e.fromSocket]
+    }
+  }
+}
+
+/**
+ * Normalize node params into GPU-ready values.
+ * Hex color strings ("#rrggbb") are converted to a normalized vec3 so they
+ * don't reach gl.uniform3f as a string (which produces NaN).
+ */
+function normalizeParams(params) {
+  const out = {}
+  if (!params) return out
+  for (const key in params) {
+    const value = params[key]
+    out[key] = (typeof value === 'string' && value.charAt(0) === '#') ? hexToVec3(value) : value
+  }
+  return out
+}
 
 /**
  * Compile a graph into an executable chain of { nodeId, program, uniformLocations, params, type }.
@@ -74,8 +170,9 @@ export function compileGraph(gl, graph) {
       continue
     }
 
-    // Get shader source — custom code or from registry
-    const shaderSrc = node.customShaderSource || node.shaderCode || getShaderSource(node.type)
+    // Get shader source — custom code or from registry (single source of truth),
+    // then auto-declare the audio driver uniforms so they can be used in code.
+    const shaderSrc = injectAudioDrivers(getNodeSource(node))
     if (!shaderSrc) {
       chain.push({ nodeId: node.id, type: node.type, program: null, uniformLocations: {}, params: node.params || {}, bypassed: true, name: node.name, error: `No shader source for type: ${node.type}` })
       continue
@@ -97,17 +194,197 @@ export function compileGraph(gl, graph) {
     })
   }
 
-  return { chain, errors }
+  // edges are returned so the DAG executor can resolve per-socket inputs.
+  return { chain, errors, edges }
 }
 
 /**
- * Execute a compiled chain through FBOs.
+ * Build a { nodeId → node } lookup for a graph, used to read LIVE param values
+ * at execute time so slider changes take effect without recompiling the chain.
  */
-export function executeChain(renderer, chain, inputFBOId, outputFBOId, standardState, audioBindings = {}) {
+export function buildNodeMap(graph) {
+  const map = {}
+  if (graph && graph.nodes) {
+    for (const n of graph.nodes) map[n.id] = n
+  }
+  return map
+}
+
+/**
+ * Blit/draw an FBO to a destination FBO (or the screen when dstId is null).
+ */
+function blitOrScreen(renderer, srcId, dstId) {
+  if (!srcId) return
+  const { gl, fbos } = renderer
+  if (dstId !== null) {
+    fbos.blit(srcId, dstId, renderer.width, renderer.height)
+  } else {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, renderer.width, renderer.height)
+    gl.useProgram(renderer.passthroughProgram.program)
+    fbos.bindTexture(srcId, 0)
+    const loc = renderer.passthroughProgram.uniformLocations.u_texture
+    if (loc != null) gl.uniform1i(loc, 0)
+    renderer.drawQuad()
+  }
+}
+
+/**
+ * Execute a compiled chain through FBOs. Dispatches to the DAG evaluator (which
+ * resolves each node's inputs from the actual graph edges and supports
+ * multi-input effects) or the legacy linear executor.
+ * @param {object|null} liveNodes — optional { nodeId → node } map. When provided,
+ *   each node's current params are read from it instead of the compile-time
+ *   snapshot baked into the chain.
+ * @param {Array|null} edges — graph edges; required for DAG evaluation.
+ */
+export function executeChain(renderer, chain, inputFBOId, outputFBOId, standardState, audioBindings = {}, liveNodes = null, edges = null) {
+  if (USE_DAG && edges) {
+    return executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standardState, audioBindings, liveNodes)
+  }
+  return executeChainLinear(renderer, chain, inputFBOId, outputFBOId, standardState, audioBindings, liveNodes, edges)
+}
+
+/**
+ * DAG evaluator: each effect/compound node writes to its own output FBO and
+ * reads its inputs from the FBOs produced by the nodes wired to its input
+ * sockets. Supports branching and multi-input effects (e.g. Displacement,
+ * blend). Nodes are walked in topological order (compileGraph already sorts
+ * them), so a producer's output FBO is always ready before its consumer runs.
+ */
+function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standardState, audioBindings, liveNodes) {
+  const { fbos } = renderer
+
+  if (!chain || chain.length === 0) {
+    blitOrScreen(renderer, inputFBOId, outputFBOId)
+    return
+  }
+
+  const byId = {}
+  for (const n of chain) byId[n.nodeId] = n
+
+  // Only texture-carrying edges matter for routing pixels.
+  const texEdges = (edges || []).filter(e => e.toSocket in TEXTURE_INPUT_SOCKETS)
+
+  const floatOverrides = resolveFloatConnections(renderer)
+  const driverVals = audioDriverValues(renderer)
+  const nodeOutput = {} // nodeId → FBO id holding its output this frame
+
+  const ensureFBO = (id) => {
+    if (!fbos.has(id)) fbos.create(id, renderer.width, renderer.height)
+    else fbos.resize(id, renderer.width, renderer.height)
+    return id
+  }
+
+  // The FBO produced by a node, following bypass/compile-error passthrough.
+  const resolveProducer = (nodeId, guard) => {
+    if (guard.has(nodeId)) return inputFBOId
+    guard.add(nodeId)
+    const src = byId[nodeId]
+    if (!src || src.isSource) return inputFBOId
+    if (src.bypassed || src.compileError) {
+      return resolveSocket(nodeId, 'input', guard) ?? inputFBOId
+    }
+    return nodeOutput[nodeId] ?? inputFBOId
+  }
+
+  // The FBO feeding a (nodeId, socket), or null if nothing is wired to it.
+  const resolveSocket = (nodeId, socket, guard = new Set()) => {
+    const edge = texEdges.find(e => e.toNode === nodeId && e.toSocket === socket)
+    if (!edge) return null
+    return resolveProducer(edge.fromNode, guard)
+  }
+
+  let lastProducedFBO = null
+
+  for (let i = 0; i < chain.length; i++) {
+    const node = chain[i]
+    if (node.isSource || node.isOutput || node.isAudio) continue
+    if (node.bypassed || node.compileError) continue
+    if (!node.program && !node.isCompound) continue
+
+    // Primary texture input: wired source, or the chain input (composited video)
+    // when nothing is connected to the node's 'input' socket.
+    const primaryInput = resolveSocket(node.nodeId, 'input') ?? inputFBOId
+
+    if (node.isCompound) {
+      const outId = ensureFBO(`__n_${node.nodeId}`)
+      const compoundPPId = `__compound_pp_${node.nodeId}`
+      let compoundPP = fbos.getPingPong(compoundPPId)
+      if (!compoundPP) compoundPP = fbos.createPingPong(compoundPPId, renderer.width, renderer.height)
+      else fbos.resizePingPong(compoundPPId, renderer.width, renderer.height)
+      executeSubChain(renderer, node.subChain, primaryInput, outId, standardState, compoundPPId, compoundPP)
+      nodeOutput[node.nodeId] = outId
+      lastProducedFBO = outId
+      continue
+    }
+
+    // Build the parameter set (live params + audio bindings + float modulation).
+    const liveParams = liveNodes?.[node.nodeId]?.params ?? node.params
+    const customParams = normalizeParams(liveParams)
+    for (const [key, value] of Object.entries(audioBindings)) {
+      if (key.startsWith(node.nodeId + '.')) {
+        customParams[key.substring(node.nodeId.length + 1)] = value
+      }
+    }
+    const nodeOverrides = floatOverrides[node.nodeId]
+    if (nodeOverrides) Object.assign(customParams, nodeOverrides)
+
+    // Gated audio drivers: 0 unless wired into this node's Audio Drivers socket.
+    applyAudioDrivers(customParams, node.nodeId, edges, driverVals)
+
+    // Secondary texture inputs (input_b, disp_map). Fall back to the primary
+    // input when nothing is wired, so a lone multi-input node stays well-defined.
+    const extraTextures = []
+    let unit = 2
+    for (const socket in TEXTURE_INPUT_SOCKETS) {
+      if (socket === 'input') continue
+      const uniform = TEXTURE_INPUT_SOCKETS[socket]
+      if (node.uniformLocations[uniform] == null) continue
+      const srcFBO = resolveSocket(node.nodeId, socket) ?? primaryInput
+      extraTextures.push({ uniform, fboId: srcFBO, unit: unit++ })
+    }
+
+    // Feedback nodes (u_prev_frame) need their own previous output preserved.
+    const isFeedback = node.uniformLocations.u_prev_frame !== undefined
+    let outId
+    if (isFeedback) {
+      const ppId = `__npp_${node.nodeId}`
+      let pp = fbos.getPingPong(ppId)
+      if (!pp) pp = fbos.createPingPong(ppId, renderer.width, renderer.height)
+      else fbos.resizePingPong(ppId, renderer.width, renderer.height)
+      const prevFrameFBOId = `${ppId}_${pp.current}`
+      outId = `${ppId}_${1 - pp.current}`
+      renderer.executePass(node, primaryInput, outId, standardState, customParams, prevFrameFBOId, extraTextures)
+      pp.swap() // current now points at the buffer we just wrote
+    } else {
+      outId = ensureFBO(`__n_${node.nodeId}`)
+      renderer.executePass(node, primaryInput, outId, standardState, customParams, null, extraTextures)
+    }
+
+    nodeOutput[node.nodeId] = outId
+    lastProducedFBO = outId
+  }
+
+  // Final image = whatever feeds the OUTPUT node, else the last node, else input.
+  const outputNode = chain.find(n => n.isOutput)
+  let finalFBO = outputNode ? resolveSocket(outputNode.nodeId, 'input') : null
+  if (!finalFBO) finalFBO = lastProducedFBO ?? inputFBOId
+
+  blitOrScreen(renderer, finalFBO, outputFBOId)
+}
+
+/**
+ * Legacy linear executor — walks the chain in topological order and pipes each
+ * node's output into the next. Kept as a fallback (see USE_DAG). Does not
+ * respect per-socket wiring or multi-input effects.
+ */
+function executeChainLinear(renderer, chain, inputFBOId, outputFBOId, standardState, audioBindings = {}, liveNodes = null, edges = null) {
   const gl = renderer.gl
   const fbos = renderer.fbos
 
   if (!chain || chain.length === 0) return
+  const driverVals = audioDriverValues(renderer)
 
   // Separate compound nodes from regular effect nodes
   const regularNodes = chain.filter(n =>
@@ -177,8 +454,9 @@ export function executeChain(renderer, chain, inputFBOId, outputFBOId, standardS
       // Execute sub-chain through its own ping-pong
       executeSubChain(renderer, node.subChain, currentInputId, targetFBOId, standardState, compoundPPId, compoundPP)
     } else {
-      // Regular effect node
-      const customParams = { ...node.params }
+      // Regular effect node — prefer live params over the compile-time snapshot
+      const liveParams = liveNodes?.[node.nodeId]?.params ?? node.params
+      const customParams = normalizeParams(liveParams)
       for (const [key, value] of Object.entries(audioBindings)) {
         if (key.startsWith(node.nodeId + '.')) {
           const paramName = key.substring(node.nodeId.length + 1)
@@ -189,6 +467,9 @@ export function executeChain(renderer, chain, inputFBOId, outputFBOId, standardS
       if (nodeOverrides) {
         Object.assign(customParams, nodeOverrides)
       }
+
+      // Gated audio drivers: 0 unless wired into this node's Audio Drivers socket.
+      applyAudioDrivers(customParams, node.nodeId, edges, driverVals)
 
       let prevFrameFBOId = null
       if (node.uniformLocations.u_prev_frame !== undefined) {
@@ -260,7 +541,7 @@ function executeSubChain(renderer, subChain, inputFBOId, outputFBOId, standardSt
       targetFBOId = `${ppId}_${pp.current}`
     }
 
-    const customParams = { ...node.params }
+    const customParams = normalizeParams(node.params)
 
     let prevFrameFBOId = null
     if (node.uniformLocations.u_prev_frame !== undefined) {

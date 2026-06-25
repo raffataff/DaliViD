@@ -1,63 +1,82 @@
-# Implementation Plan - Node Canvas Enhancements & Math Node Separation
+# Implementation Plan - AudioWaves Shader Integration
 
-This plan outlines the changes needed to improve node noodle interactions, implement Blender-style auto-reconnection on Shift+drag, and separate the "Math/Blend" node into two independent nodes: "Mix/Blend" (texture-based mixing) and "Math" (value/float mathematical operations).
+This plan outlines the integration of 10 new audio-reactive procedural shader generator and effect nodes from AudioWaves into DaliVid. Each new node implements multiple variations selectable via a dropdown, support for 17 standard cosine color palettes, and customizable background blending modes so they can function both as standalone visual generators (when the input is disconnected) and overlay filters.
 
 ## User Review Required
 
 > [!NOTE]
-> All changes are backward compatible: existing graphs containing `MATH_BLEND` will continue to compile and function exactly as before.
+> All new nodes are backward compatible and run on the standard single-input single-output WebGL2 FBO rendering pipeline in DaliVid.
+> When their input socket is disconnected, DaliVid automatically routes a transparent black texture, making them run as standalone procedural generator sources.
 
 ## Proposed Changes
 
 ---
 
-### 1. Canvas & Socket Interaction Fixes
+### 1. WebGL Shader Registry
 
-#### [MODIFY] [Socket.jsx](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20Copy/src/components/NodeEditor/Socket.jsx)
-- Render `data-node-id`, `data-socket-id`, and `data-socket-type` attributes on the outer `.socket` div.
-- This allows query selectors to locate the socket in the DOM to get pixel-perfect coordinates.
-
-#### [MODIFY] [NodeCard.jsx](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20Copy/src/components/NodeEditor/NodeCard.jsx)
-- Pass `onDragStart={onSocketDragStart}` to all input sockets (both fixed inputs and param inputs) so dragging from input sockets works, allowing users to unplug noodles.
-- Handle `e.shiftKey` in `handleMouseDown` to trigger a new `onDetachNode(node.id)` callback.
-- Add accent color styling for `MIX_BLEND` and `MATH` nodes.
-
-#### [MODIFY] [NodeCanvas.jsx](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20Copy/src/components/NodeEditor/NodeCanvas.jsx)
-- Update `getSocketPos` to query the DOM for `.socket[data-node-id="..."][data-socket-id="..."] .socket__circle` first. If found, calculate its exact coordinates in canvas space by dividing by `zoom` and offsetting by `pan`.
-- Improve the mathematical fallback positions for input/output and parameter sockets to prevent jumps when rendering before mount.
-- Implement `handleDetachNode` to reconnect adjacent nodes: for each incoming edge to the detached node, find a compatible unused outgoing edge from the detached node, and connect the upstream source node directly to the downstream target node (like Blender's detaching behavior). Then sever all connections to the detached node.
-- Pass `onDetachNode={handleDetachNode}` to `<NodeCard />`.
-- Manually define parameter schema for `MATH` node inside `nodeParamConfigs` since it runs purely on the CPU and has no GLSL shader source.
+#### [MODIFY] [shaderRegistry.js](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20main/src/shaders/shaderRegistry.js)
+- Register the following 10 new node shader types, complete with `@param` directives for the Inspector UI controls:
+  1. `BIOMATH`: Complex raymarched structures (Neural Field, Gyroid Lattice, Crystalline Lattice, Hypnotic Spiral, Alien Terrain, Digital Sphere, Orchard).
+  2. `PLASMA`: Flowing plasma waves (Classic, Liquid Noise, Cellular, Plasma Ball, Nebula).
+  3. `FRACTAL`: Mathematical recursive fractals (Julia, Mandelbrot Zoom, KIFS, Fractal Grid, Newton Fractal, Sierpinski Gasket, Burning Ship, Mainframe).
+  4. `TUNNEL`: 3D coordinate-warped tunnels (Cylindrical, Box, Warp Speed, Hyper Tunnel, Bio-Tunnel).
+  5. `GEOMETRIC`: Grids, tiles, and symmetries (Sacred Geometry, Hexagonal Grid, Rotating Crosses, Geode).
+  6. `LIGHTNING`: Electric discharges (Spectral Tesla, Waveform Bolt, Chaos Storm).
+  7. `CRYSTAL`: Shattered and faceted patterns (Radial Facets, Glass Shatter, Isometric Cubes, Ethereal Gem).
+  8. `COSMIC`: Galactic and celestial visuals (Spiral Arms, Nebula, Black Hole, Quasar).
+  9. `WAVES`: Wave interference and ripple physics (Interference, Ripples, Beam Scanlines, Sliding Interference).
+  10. `SPACE_DISTORTION`: Space-coordinate distortions (Twist, Fold).
+- Each generator shader will feature:
+  - `Mode` (dropdown select to pick the variation)
+  - `Palette` (dropdown select to pick from 17 standard color palettes: Rainbow, Neon, Cosmic, Fire, Ocean, Pastel, Monochrome, Sunset, Forest, Cyberpunk, Arctic, Lava, Galaxy, Toxic, Vaporwave, Ember, Aqua)
+  - Blending controls: `Blend Mode` (Replace, Add, Screen, Multiply, Overlay) and `Background Mix` (0.0 to 1.0) to mix the generator visual with the incoming background texture
+  - Common helper functions (e.g. aspect-ratio corrected UV coordinates, pseudo-random hash, 2D rotation, simplex/FBM noise, and cosine color palette generators) embedded inline for standalone compilability
 
 ---
 
-### 2. Math & Mix/Blend Node Separation
+### 2. Node Editor UI & Styling
 
-#### [MODIFY] [nodeDefinitions.js](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20Copy/src/shaders/nodeDefinitions.js)
-- Register `MIX_BLEND` with two texture inputs and one texture output.
-- Register `MATH` with zero static inputs (inputs are generated dynamically from params), one float output socket (`output`), and `hasParamInputs: true`.
-- Update `getNodeSockets` to skip `select` and `checkbox` parameter types when auto-generating float sockets, so the `Operation` select dropdown on the `MATH` node does not render a connection socket.
+#### [MODIFY] [NodeCard.jsx](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20main/src/components/NodeEditor/NodeCard.jsx)
+- Register custom card accent colors in `NODE_COLORS` for each of the new node types:
+  - `BIOMATH`: `#44aaff` (Blue-cyan)
+  - `PLASMA`: `#ff00aa` (Deep magenta)
+  - `FRACTAL`: `#cc44ff` (Bright purple)
+  - `TUNNEL`: `#ff8844` (Vibrant orange)
+  - `GEOMETRIC`: `#88aa44` (Olive green)
+  - `LIGHTNING`: `#44ffaa` (Neon green)
+  - `CRYSTAL`: `#aaccff` (Ice blue)
+  - `COSMIC`: `#aa44ff` (Indigo)
+  - `WAVES`: `#4488ff` (Ocean blue)
+  - `SPACE_DISTORTION`: `#ccaa44` (Warm gold)
 
-#### [MODIFY] [shaderRegistry.js](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20Copy/src/shaders/shaderRegistry.js)
-- Register `MIX_BLEND` alongside `MATH_BLEND` (which remains for backward compatibility) pointing to the same multi-mode texture-blending fragment shader.
+#### [MODIFY] [NodeSearchMenu.jsx](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20main/src/components/NodeEditor/NodeSearchMenu.jsx)
+- Add a new category `"Generators (Procedural)"` to `NODE_CATALOG` containing the 10 new node types so users can discover and instantiate them via the canvas right-click context menu.
 
-#### [MODIFY] [NodeSearchMenu.jsx](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20Copy/src/components/NodeEditor/NodeSearchMenu.jsx)
-- Replace `MATH_BLEND` with `MIX_BLEND` ("Mix / Blend") and `MATH` ("Math") under the `Utility` category.
+#### [MODIFY] [ShaderGenerator.jsx](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20main/src/components/NodeEditor/ShaderGenerator.jsx)
+- Update `EFFECT_CATEGORIES` to add the new effects under the appropriate lists so they can be selected, surprise-generated, and chained into compound shaders:
+  - Add `SPACE_DISTORTION` to the `distortion` category.
+  - Add `BIOMATH`, `PLASMA`, `FRACTAL`, `TUNNEL`, `GEOMETRIC`, `LIGHTNING`, `CRYSTAL`, `COSMIC`, `WAVES` to a new category or merge them into `stylize`/`effects` for selection.
 
-#### [MODIFY] [clipGraphManager.js](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20Copy/src/gl/clipGraphManager.js)
-- Add `MATH` to the list of shader-less nodes (like `AUDIO_INPUT`, `AUDIO_SPLITTER`) so that the GL engine does not attempt to compile a shader program for it.
-- Update `resolveFloatConnections` to topologically sort and evaluate `MATH` CPU-side mathematical operations (Add, Subtract, Multiply, Divide, Sine, Cosine, Absolute, Min, Max, Greater Than, Less Than).
-- Evaluate float/audio node chains dynamically and recursive-like, so `MATH` outputs can drive other `MATH` inputs, which eventually drive shader uniforms on rendering nodes.
+---
+
+### 3. Media Pool Effects Tab
+
+#### [MODIFY] [MediaPool.jsx](file:///e:/bobby/Documents/DaliViD/AG/DaliViD%20-%20main/src/components/MediaPool/MediaPool.jsx)
+- Append cards for the new node types in `EFFECT_PRESETS` so they show up as draggable icons inside the "Effects" tab of the Media Pool, aligning with the default set of nodes.
 
 ---
 
 ## Verification Plan
 
-### Automated/Compiler Checks
-- Verify Vite compilation completes successfully by running a production build (`npm run build`).
+### Automated Checks
+- Run a project build check using `npm run build` to ensure there are no TypeScript/ESLint/Vite compile issues.
 
 ### Manual Verification
-- **Unplugging**: Verify clicking and dragging a connected input socket severs the connection and lets the user drag the noodle to a new socket or drop it in empty space to delete it.
-- **Alignment**: Verify all value sockets and texture sockets align perfectly with noodle start/end endpoints at any zoom level.
-- **Shift+drag**: Connect `CLIP_SOURCE` -> `Gaussian Blur` -> `CLIP_OUTPUT`. Shift+drag `Gaussian Blur` and verify it gets detached, and the `CLIP_SOURCE` is automatically connected directly to `CLIP_OUTPUT`.
-- **Math Node**: Create an `Audio Splitter` node. Connect the `bass` socket to `Math` node's `Value A` parameter socket. Select `Multiply` operation, and set `Value B` to `2.0`. Connect the `Math` node's `Output` float socket to a blur's `Radius` parameter socket. Verify the blur radius reactively doubles with the audio bass!
+- **Creation & Styling**: Open the right-click menu or the Media Pool Effects tab, verify the new nodes appear in the search results with correct naming, and place them on the canvas. Check that they render with their assigned card colors.
+- **Standalone Mode**: Create a `PLASMA` or `FRACTAL` node, connect its output directly to the `OUTPUT` node (leaving its input disconnected). Verify it renders the procedural pattern correctly on a black background.
+- **Dropdown Modes**: Change the `Mode` parameter of the node in the Inspector panel. Verify the shader compiles instantly and changes to the selected visual style.
+- **Palettes**: Change the `Palette` parameter of the node and verify that it updates the coloring scheme of the procedurally generated patterns.
+- **Background Blending**: Place a video clip in the Media Pool. Connect `CLIP_SOURCE` -> `PLASMA` -> `CLIP_OUTPUT`.
+  - Set `Background Mix` to `0.0`. Verify the video is fully hidden, and only the plasma waves are visible.
+  - Set `Background Mix` to `0.5` and `Blend Mode` to `Screen`. Verify the plasma waves are blended over the playing video frame.
+- **Audio Reactivity**: Connect an `Audio Splitter`'s `bass` socket to the `Speed` or `Intensity` parameter of the generator node. Verify that the visual reacts dynamically to the audio!

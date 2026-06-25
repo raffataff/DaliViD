@@ -3,7 +3,7 @@ import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import { parseParams } from '../../utils/paramParser'
-import { getShaderSource } from '../../shaders/shaderRegistry'
+import { getNodeSource } from '../../shaders/shaderRegistry'
 import { parseParams as parseShaderParams } from '../../utils/paramParser'
 import './Inspector.css'
 
@@ -98,7 +98,7 @@ function NodeInspector({ nodeId, graphLevel, clipId }) {
     )
   }
 
-  const shaderSrc = node.shaderCode || getShaderSource(node.type)
+  const shaderSrc = getNodeSource(node)
   const paramConfigs = parseParams(shaderSrc)
   const isParamConnected = (paramName) => {
     return graph?.edges?.some(edge => edge.toNode === nodeId && edge.toSocket === paramName) || false
@@ -122,7 +122,7 @@ function NodeInspector({ nodeId, graphLevel, clipId }) {
         <label className="inspector__label">Position</label>
         <span className="inspector__value inspector__value--mono">{Math.round(node.position.x)}, {Math.round(node.position.y)}</span>
       </div>
-      {node.shaderCode !== null && (
+      {getNodeSource(node) != null && !node.locked && (
         <button className="inspector__btn inspector__btn--primary" onClick={() => openMonaco(nodeId)} style={{ marginTop: 8 }}>Edit Shader Code</button>
       )}
       {paramConfigs.length > 0 && (
@@ -156,7 +156,7 @@ function CompoundInspector({ node, graphLevel, clipId, onUpdateExposedParam, onE
         { name: 'Value B', uniformName: 'value_b', type: 'slider', min: -100, max: 100, step: 0.01, default: 1 },
       ]
     } else {
-      const shaderSrc = innerNode.shaderCode || getShaderSource(innerNode.type)
+      const shaderSrc = getNodeSource(innerNode)
       params = shaderSrc ? parseParams(shaderSrc) : []
     }
     if (params.length > 0) {

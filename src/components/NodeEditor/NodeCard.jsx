@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, memo } from 'react'
 import Socket from './Socket'
 import { IconChevronDown, IconSettings, IconEye, IconCode, IconClose } from '../common/Icons'
 import { getNodeSockets } from '../../shaders/nodeDefinitions'
+import { getNodeSource } from '../../shaders/shaderRegistry'
 import './NodeCard.css'
 
 const NODE_COLORS = {
@@ -15,7 +16,13 @@ const NODE_COLORS = {
   'MIRROR': '#cc44ff', 'PARTICLE': '#ff6644', 'LUT': '#ffaa44',
   'MATH_BLEND': '#aaccff', 'MIX_BLEND': '#aaccff', 'MATH': '#ffdd00',
   'CUSTOM': '#00e5ff', 'COMPOUND': '#ff00aa',
+  'AUDIO_WARP': '#ff00aa', 'SPECTRUM_GLOW': '#ff00aa',
   'EFFECT_INPUT': '#44cc88', 'EFFECT_OUTPUT': '#ff6644',
+  // New Generator Nodes
+  'BIOMATH': '#44aaff', 'PLASMA': '#ff00aa', 'FRACTAL': '#cc44ff',
+  'TUNNEL': '#ff8844', 'GEOMETRIC': '#88aa44', 'LIGHTNING': '#44ffaa',
+  'CRYSTAL': '#aaccff', 'COSMIC': '#aa44ff', 'WAVES': '#4488ff',
+  'SPACE_DISTORTION': '#ccaa44',
 }
 
 export const NODE_WIDTH = 210
@@ -168,7 +175,7 @@ const NodeCard = memo(function NodeCard({
             <>
               <button className="node-card__action-btn" onClick={(e) => { e.stopPropagation(); onToggleBypass?.(node.id) }} data-tooltip="Toggle Bypass"><IconSettings size={11} /></button>
               <button className={`node-card__action-btn ${isPreviewTap ? 'node-card__action-btn--active' : ''}`} onClick={(e) => { e.stopPropagation(); onSetPreview?.(node.id) }} data-tooltip="Preview This Node"><IconEye size={11} /></button>
-              {node.shaderCode !== null && (
+              {getNodeSource(node) != null && (
                 <button className="node-card__action-btn" onClick={(e) => { e.stopPropagation(); onOpenMonaco?.(node.id) }} data-tooltip="Edit Shader Code"><IconCode size={11} /></button>
               )}
               <button className="node-card__action-btn node-card__action-btn--delete" onClick={(e) => { e.stopPropagation(); onDelete?.(node.id) }} data-tooltip="Delete Node"><IconClose size={10} /></button>

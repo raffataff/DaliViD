@@ -6,6 +6,8 @@ import { GLSL_BOILERPLATE } from './BoilerplateTemplate'
 import { setupGLSLMonaco } from './GLSLTokenizer'
 import { IconClose } from '../common/Icons'
 import { addToast } from '../common/Toast'
+import { getNodeSource } from '../../shaders/shaderRegistry'
+import { parseParams } from '../../utils/paramParser'
 import './MonacoDrawer.css'
 
 export default function MonacoDrawer() {
@@ -15,6 +17,7 @@ export default function MonacoDrawer() {
   const graphLevel = useAppStore(s => s.graphLevel)
   const graphClipId = useAppStore(s => s.graphClipId)
   const updateNodeCustomShader = useGraphStore(s => s.updateNodeCustomShader)
+  const setNodeParam = useGraphStore(s => s.setNodeParam)
   const getNode = useGraphStore(s => s.getNode)
 
   const [code, setCode] = useState(GLSL_BOILERPLATE)
@@ -34,9 +37,10 @@ export default function MonacoDrawer() {
     if (monacoOpen && monacoNodeId) {
       const node = getNode(graphLevel, graphClipId, monacoNodeId)
       if (node) {
-        setNodeName(node.label || 'CUSTOM SHADER')
-        // Load custom shader source if it exists, otherwise use boilerplate
-        setCode(node.customShaderSource || GLSL_BOILERPLATE)
+        setNodeName(node.name || node.label || 'CUSTOM SHADER')
+        // Load the node's actual shader (custom edit → attached code → registry),
+        // falling back to boilerplate only when the node has no source at all.
+        setCode(getNodeSource(node) || GLSL_BOILERPLATE)
       }
     }
   }, [monacoOpen, monacoNodeId, graphLevel, graphClipId, getNode])
@@ -53,10 +57,21 @@ export default function MonacoDrawer() {
   const handleSave = () => {
     if (!monacoNodeId) return
     const currentCode = editorRef.current.getValue()
-    
-    // Save to node in graph store
+
+    // Save the edited source to the node
     updateNodeCustomShader(graphLevel, graphClipId, monacoNodeId, currentCode)
-    
+
+    // Seed default values for any params introduced by the edit so their
+    // uniforms aren't left unset (which would render as 0 / "no effect")
+    // until the user first touches the slider.
+    const node = getNode(graphLevel, graphClipId, monacoNodeId)
+    const existing = node?.params || {}
+    for (const cfg of parseParams(currentCode)) {
+      if (existing[cfg.uniformName] === undefined) {
+        setNodeParam(graphLevel, graphClipId, monacoNodeId, cfg.uniformName, cfg.default)
+      }
+    }
+
     addToast({ message: 'Shader compiled & saved', type: 'success' })
   }
 

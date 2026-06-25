@@ -20,6 +20,13 @@ const NODE_CATALOG = [
     ],
   },
   {
+    category: 'Audio-Reactive (Examples)',
+    items: [
+      { type: 'AUDIO_WARP', name: 'Audio Warp (bass/treble)' },
+      { type: 'SPECTRUM_GLOW', name: 'Spectrum Glow (bass/mid/treble)' },
+    ],
+  },
+  {
     category: 'Color / Correction',
     items: [
       { type: 'COLOR_INVERSION', name: 'Color / HSV' },
@@ -66,6 +73,21 @@ const NODE_CATALOG = [
       { type: 'MIX_BLEND', name: 'Mix / Blend' },
       { type: 'MATH', name: 'Math' },
       { type: 'CUSTOM', name: 'Custom Shader' },
+    ],
+  },
+  {
+    category: 'Generators (Procedural)',
+    items: [
+      { type: 'BIOMATH', name: 'Bio-Digital (Xor)' },
+      { type: 'PLASMA', name: 'Plasma Waves' },
+      { type: 'FRACTAL', name: 'Fractal Patterns' },
+      { type: 'TUNNEL', name: 'Tunnel Effect' },
+      { type: 'GEOMETRIC', name: 'Geometric Shapes' },
+      { type: 'LIGHTNING', name: 'Lightning & Electric' },
+      { type: 'CRYSTAL', name: 'Crystal Structures' },
+      { type: 'COSMIC', name: 'Cosmic Space' },
+      { type: 'WAVES', name: 'Wave Patterns' },
+      { type: 'SPACE_DISTORTION', name: 'Space Distortion' },
     ],
   },
 ]

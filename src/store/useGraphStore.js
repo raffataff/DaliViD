@@ -16,6 +16,11 @@ function newEdgeId() {
   return `edge_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`
 }
 
+// updateNode() updates that require a shader recompile (change topology, baked
+// flags, or source). Plain param/position/name edits are intentionally excluded
+// so dragging a slider doesn't recompile the graph every frame.
+const RECOMPILE_KEYS = ['bypassed', 'customShaderSource', 'shaderCode', 'type', 'subGraph']
+
 function createDefaultMasterGraph() {
   const outputId = `node_master_output`
   const audioInId = `node_audio_in`
@@ -52,6 +57,11 @@ const useGraphStore = create((set, get) => ({
   undoStack: [],
   redoStack: [],
 
+  // Bumped only when graph structure / shader source / baked flags change.
+  // The renderer watches this to decide when to recompile (vs. just re-reading
+  // live param values each frame).
+  topologyVersion: 0,
+
   getActiveGraph: (graphLevel, clipId) => {
     const state = get()
     if (graphLevel === 'master') return state.masterGraph
@@ -69,10 +79,10 @@ const useGraphStore = create((set, get) => ({
     }
     set((state) => {
       if (graphLevel === 'master') {
-        return { masterGraph: { ...state.masterGraph, nodes: [...state.masterGraph.nodes, node] } }
+        return { masterGraph: { ...state.masterGraph, nodes: [...state.masterGraph.nodes, node] }, topologyVersion: state.topologyVersion + 1 }
       }
       const graph = state.clipGraphs[clipId] || { nodes: [], edges: [], tapPointNodeId: null, compiledChain: [], compileErrors: [] }
-      return { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes: [...graph.nodes, node] } } }
+      return { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes: [...graph.nodes, node] } }, topologyVersion: state.topologyVersion + 1 }
     })
     return id
   },
@@ -82,8 +92,8 @@ const useGraphStore = create((set, get) => ({
       const graph = graphLevel === 'master' ? state.masterGraph : state.clipGraphs[clipId]
       if (!graph) return state
       return graphLevel === 'master'
-        ? { masterGraph: { ...graph, nodes: graph.nodes.filter(n => n.id !== nodeId), edges: graph.edges.filter(e => e.fromNode !== nodeId && e.toNode !== nodeId) } }
-        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes: graph.nodes.filter(n => n.id !== nodeId), edges: graph.edges.filter(e => e.fromNode !== nodeId && e.toNode !== nodeId) } } }
+        ? { masterGraph: { ...graph, nodes: graph.nodes.filter(n => n.id !== nodeId), edges: graph.edges.filter(e => e.fromNode !== nodeId && e.toNode !== nodeId) }, topologyVersion: state.topologyVersion + 1 }
+        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes: graph.nodes.filter(n => n.id !== nodeId), edges: graph.edges.filter(e => e.fromNode !== nodeId && e.toNode !== nodeId) } }, topologyVersion: state.topologyVersion + 1 }
     })
   },
 
@@ -92,9 +102,11 @@ const useGraphStore = create((set, get) => ({
       const graph = graphLevel === 'master' ? state.masterGraph : state.clipGraphs[clipId]
       if (!graph) return state
       const nodes = graph.nodes.map(n => n.id === nodeId ? { ...n, ...updates } : n)
+      // Only force a recompile when the change affects topology/source/baked flags.
+      const bump = RECOMPILE_KEYS.some(k => k in updates) ? { topologyVersion: state.topologyVersion + 1 } : {}
       return graphLevel === 'master'
-        ? { masterGraph: { ...graph, nodes } }
-        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes } } }
+        ? { masterGraph: { ...graph, nodes }, ...bump }
+        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes } }, ...bump }
     })
   },
 
@@ -124,11 +136,18 @@ const useGraphStore = create((set, get) => ({
     set((state) => {
       const graph = graphLevel === 'master' ? state.masterGraph : state.clipGraphs[clipId]
       if (!graph) return state
-      const edges = graph.edges.filter(e => !(e.toNode === toNode && e.toSocket === toSocket))
+      // Most input sockets accept a single connection (new one replaces old).
+      // The Audio Drivers socket is multi-accept: keep every distinct band, only
+      // replacing an edge coming from the exact same source socket.
+      const isMulti = toSocket === 'audio_drivers'
+      const edges = graph.edges.filter(e => {
+        if (e.toNode !== toNode || e.toSocket !== toSocket) return true
+        return isMulti && !(e.fromNode === fromNode && e.fromSocket === fromSocket)
+      })
       edges.push(edge)
       return graphLevel === 'master'
-        ? { masterGraph: { ...graph, edges } }
-        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, edges } } }
+        ? { masterGraph: { ...graph, edges }, topologyVersion: state.topologyVersion + 1 }
+        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, edges } }, topologyVersion: state.topologyVersion + 1 }
     })
     return id
   },
@@ -138,8 +157,8 @@ const useGraphStore = create((set, get) => ({
       const graph = graphLevel === 'master' ? state.masterGraph : state.clipGraphs[clipId]
       if (!graph) return state
       return graphLevel === 'master'
-        ? { masterGraph: { ...graph, edges: graph.edges.filter(e => e.id !== edgeId) } }
-        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, edges: graph.edges.filter(e => e.id !== edgeId) } } }
+        ? { masterGraph: { ...graph, edges: graph.edges.filter(e => e.id !== edgeId) }, topologyVersion: state.topologyVersion + 1 }
+        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, edges: graph.edges.filter(e => e.id !== edgeId) } }, topologyVersion: state.topologyVersion + 1 }
     })
   },
 
@@ -156,6 +175,7 @@ const useGraphStore = create((set, get) => ({
   initClipGraph: (clipId, clipName, clipType = 'video') => {
     set((state) => ({
       clipGraphs: { ...state.clipGraphs, [clipId]: createClipGraph(clipName, clipType) },
+      topologyVersion: state.topologyVersion + 1,
     }))
   },
 
@@ -202,9 +222,9 @@ const useGraphStore = create((set, get) => ({
     }
 
     if (graphLevel === 'master') {
-      set({ masterGraph: newGraph, compoundLibrary: [...state.compoundLibrary, libraryEntry] })
+      set({ masterGraph: newGraph, compoundLibrary: [...state.compoundLibrary, libraryEntry], topologyVersion: state.topologyVersion + 1 })
     } else {
-      set({ clipGraphs: { ...state.clipGraphs, [clipId]: newGraph }, compoundLibrary: [...state.compoundLibrary, libraryEntry] })
+      set({ clipGraphs: { ...state.clipGraphs, [clipId]: newGraph }, compoundLibrary: [...state.compoundLibrary, libraryEntry], topologyVersion: state.topologyVersion + 1 })
     }
     return compoundNode.id
   },
@@ -217,9 +237,11 @@ const useGraphStore = create((set, get) => ({
         if (n.id !== compoundNodeId || n.type !== 'COMPOUND') return n
         return updateExposedParam(n, exposedParamIndex, value)
       })
+      // Compound params are baked into the sub-chain at compile time, so changing
+      // one needs a recompile to take effect.
       return graphLevel === 'master'
-        ? { masterGraph: { ...graph, nodes } }
-        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes } } }
+        ? { masterGraph: { ...graph, nodes }, topologyVersion: state.topologyVersion + 1 }
+        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes } }, topologyVersion: state.topologyVersion + 1 }
     })
   },
 
@@ -241,8 +263,8 @@ const useGraphStore = create((set, get) => ({
       const newGraph = { ...graph, nodes: newNodes, edges: newEdges }
 
       return graphLevel === 'master'
-        ? { masterGraph: newGraph }
-        : { clipGraphs: { ...state.clipGraphs, [clipId]: newGraph } }
+        ? { masterGraph: newGraph, topologyVersion: state.topologyVersion + 1 }
+        : { clipGraphs: { ...state.clipGraphs, [clipId]: newGraph }, topologyVersion: state.topologyVersion + 1 }
     })
   },
 }))

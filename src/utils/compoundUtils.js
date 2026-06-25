@@ -5,7 +5,7 @@
  */
 
 import { parseParams } from './paramParser'
-import { getShaderSource } from '../shaders/shaderRegistry'
+import { getNodeSource } from '../shaders/shaderRegistry'
 
 const EXCLUDED_FROM_SELECTION = new Set([
   'OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT',
@@ -31,7 +31,7 @@ function getSubNodeParamConfigs(node) {
       { name: 'Value B', uniformName: 'value_b', type: 'slider', min: -100, max: 100, step: 0.01, default: 1 },
     ]
   }
-  const shaderSrc = node.shaderCode || getShaderSource(node.type)
+  const shaderSrc = getNodeSource(node)
   if (!shaderSrc) return []
   return parseParams(shaderSrc)
 }

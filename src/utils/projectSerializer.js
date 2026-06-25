@@ -192,6 +192,8 @@ export function deserializeProject(data, getAppStore) {
         ])
       ),
       compoundLibrary: data.graph.compoundLibrary || [],
+      // Bump so the renderer recompiles the freshly-loaded graph.
+      topologyVersion: useGraphStore.getState().topologyVersion + 1,
     })
   }
 
@@ -341,17 +343,47 @@ export async function copyFileToProjectFolder(projectDirHandle, file, folderName
  */
 export async function saveProjectToFolder(projectDirHandle, getAppStore, getGraphStore, getTimelineStore) {
   const data = serializeProject(getAppStore, getGraphStore, getTimelineStore)
-  
+
   // Also ensure folder structure is initialized
   await projectDirHandle.getDirectoryHandle('media', { create: true })
   await projectDirHandle.getDirectoryHandle('audio', { create: true })
   await projectDirHandle.getDirectoryHandle('renders', { create: true })
 
+  // Persist the actual media files into the folder so the project is
+  // self-contained and can be restored later. Blob URLs are only valid for the
+  // current session, so we fetch each clip's bytes now and write them to disk.
+  // Dead URLs (e.g. clips from a project loaded without its media) simply fail
+  // the fetch and are skipped.
+  const timeline = getTimelineStore()
+  const persisted = new Set()
+  for (const clip of (timeline.clips || [])) {
+    if (!clip.fileUrl || !clip.filename || persisted.has(clip.filename)) continue
+    persisted.add(clip.filename)
+    const folderName = clip.fileType === 'audio' ? 'audio' : 'media'
+    try {
+      const resp = await fetch(clip.fileUrl)
+      const blob = await resp.blob()
+
+      // Skip the (potentially large) write if an identically-sized copy already
+      // exists in the folder. Keeps the 2-second autosave cheap.
+      try {
+        const sub = await projectDirHandle.getDirectoryHandle(folderName)
+        const existing = await (await sub.getFileHandle(clip.filename)).getFile()
+        if (existing.size === blob.size) continue
+      } catch { /* not present yet — fall through and write it */ }
+
+      const file = new File([blob], clip.filename, { type: blob.type || 'application/octet-stream' })
+      await copyFileToProjectFolder(projectDirHandle, file, folderName)
+    } catch (err) {
+      console.warn(`[ProjectSerializer] Could not persist media "${clip.filename}" to folder (source unavailable):`, err)
+    }
+  }
+
   const fileHandle = await projectDirHandle.getFileHandle('project.json', { create: true })
   const writable = await fileHandle.createWritable()
   await writable.write(JSON.stringify(data, null, 2))
   await writable.close()
-  
+
   console.log('[ProjectSerializer] Saved project to folder:', data.project.name)
   return data
 }
@@ -377,7 +409,9 @@ export async function loadProjectFromFolder(projectDirHandle) {
  */
 export async function restoreMediaFilesFromFolder(projectDirHandle, clips, updateClipAction) {
   let restoredCount = 0
+  const missing = []
   for (const clip of clips) {
+    if (!clip.filename) continue
     // If the fileUrl is missing (or is a stale blob URL from a previous session), restore it!
     const folderName = clip.fileType === 'audio' ? 'audio' : 'media'
     try {
@@ -385,16 +419,18 @@ export async function restoreMediaFilesFromFolder(projectDirHandle, clips, updat
       const fileHandle = await subDirHandle.getFileHandle(clip.filename)
       const file = await fileHandle.getFile()
       const url = URL.createObjectURL(file)
-      
+
       // Update clip url in store
       updateClipAction(clip.id, { fileUrl: url })
-      
+
       restoredCount++
     } catch (err) {
+      if (!missing.includes(clip.filename)) missing.push(clip.filename)
       console.warn(`[ProjectSerializer] Could not restore file ${clip.filename} from ${folderName} folder:`, err)
     }
   }
   console.log(`[ProjectSerializer] Restored ${restoredCount} media files from folder.`)
+  return { restoredCount, missing }
 }
 
 /**

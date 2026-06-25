@@ -19,7 +19,13 @@ void main() {
 `
 
 // Internal cache: hash → { program, uniformLocations, vertexShader, fragmentShader }
+// Insertion order is used for LRU eviction (least-recently-used is evicted first).
 const programCache = new Map()
+
+// Upper bound on cached programs. Generous so active chains are never evicted
+// under normal use; primarily a safety valve against unbounded growth from
+// repeated live-editing of custom shaders.
+const MAX_CACHED_PROGRAMS = 512
 
 /**
  * Compile a shader (vertex or fragment).
@@ -79,9 +85,12 @@ function parseShaderErrors(log) {
 export function createShaderProgram(gl, fragmentSource, vertexSource = FULLSCREEN_QUAD_VS) {
   const hash = md5(vertexSource + '||' + fragmentSource)
 
-  // Check cache
+  // Check cache. On a hit, refresh recency (delete + re-insert moves it to the
+  // most-recently-used end) so frequently used programs survive eviction.
   if (programCache.has(hash)) {
     const cached = programCache.get(hash)
+    programCache.delete(hash)
+    programCache.set(hash, cached)
     return { ...cached, errors: [], cached: true }
   }
 
@@ -127,6 +136,15 @@ export function createShaderProgram(gl, fragmentSource, vertexSource = FULLSCREE
   const entry = { program, uniformLocations, uniformTypes, hash }
 
   programCache.set(hash, entry)
+
+  // Evict the least-recently-used program(s) if over budget.
+  while (programCache.size > MAX_CACHED_PROGRAMS) {
+    const oldestKey = programCache.keys().next().value
+    if (oldestKey === hash) break // never evict the entry we just created
+    const oldest = programCache.get(oldestKey)
+    if (oldest && oldest.program) gl.deleteProgram(oldest.program)
+    programCache.delete(oldestKey)
+  }
 
   return { program, uniformLocations, uniformTypes, errors: [], cached: false }
 }
@@ -251,6 +269,11 @@ export function uploadStandardUniforms(gl, locations, state) {
   if (locations.u_beat) gl.uniform1f(locations.u_beat, beat)
   // int u_beat_count
   if (locations.u_beat_count) gl.uniform1i(locations.u_beat_count, beatCount)
+
+  // NOTE: the short-name band drivers (u_bass, u_mid, u_treble, u_rms,
+  // u_sub_bass, u_low_mid, u_high_mid, u_presence) are NOT uploaded here — they
+  // are gated per-node by the executor based on the node's Audio Drivers socket
+  // (0 when unconnected). u_beat above is intentionally always-live.
 }
 
 /**
@@ -265,9 +288,16 @@ export function deleteShaderProgram(gl, hash) {
 }
 
 /**
- * Clear the entire program cache (e.g. on context loss).
+ * Clear the entire program cache (e.g. on context loss or renderer disposal).
+ * Pass the GL context to also delete the underlying programs; without it the
+ * map is simply emptied (e.g. when the context is already gone).
  */
-export function clearProgramCache() {
+export function clearProgramCache(gl) {
+  if (gl) {
+    for (const entry of programCache.values()) {
+      if (entry && entry.program) gl.deleteProgram(entry.program)
+    }
+  }
   programCache.clear()
 }
 

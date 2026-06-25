@@ -24,6 +24,13 @@ const EXCLUDED_FROM_MARQUEE = new Set([
   'AUDIO_INPUT', 'AUDIO_SPLITTER',
 ])
 
+// Example effect types that ship pre-wired: when added, these splitter bands are
+// auto-connected to the new node's Audio Drivers socket so they react immediately.
+const AUDIO_EXAMPLE_WIRING = {
+  AUDIO_WARP: ['bass', 'treble'],
+  SPECTRUM_GLOW: ['bass', 'mid', 'treble'],
+}
+
 export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   const containerRef = useRef(null)
   const graphLevel = useAppStore(s => s.graphLevel)
@@ -264,6 +271,19 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     setShowSearchMenu(true)
   }, [showActionMenu])
 
+  // Auto-wire the Audio Splitter's bands into a freshly-added example node's
+  // Audio Drivers socket, so the pre-wired examples react out of the box.
+  const autoWireAudioDrivers = useCallback((type, newId) => {
+    const bands = AUDIO_EXAMPLE_WIRING[type]
+    if (!bands || !newId) return
+    const g = useGraphStore.getState().getActiveGraph(graphLevel, graphClipId)
+    const splitter = g?.nodes?.find(n => n.type === 'AUDIO_SPLITTER')
+    if (!splitter) return
+    for (const band of bands) {
+      addEdge(graphLevel, graphClipId, splitter.id, band, newId, 'audio_drivers')
+    }
+  }, [addEdge, graphLevel, graphClipId])
+
   // ── Add Node ──
   const handleAddNode = useCallback((nodeType) => {
     setShowSearchMenu(false)
@@ -287,12 +307,13 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     const paramConfigs = shaderCode ? parseParams(shaderCode) : []
     const defaultParams = getDefaultParams(paramConfigs)
 
-    addNode(graphLevel, graphClipId, {
+    const newId = addNode(graphLevel, graphClipId, {
       type: nodeType.type, name: nodeType.name,
       position: { x, y }, params: defaultParams,
       shaderCode: nodeType.type === 'CUSTOM' ? shaderCode : null,
     })
-  }, [addNode, addEdge, graphLevel, graphClipId, searchMenuPos, pan, zoom, compoundLibrary, nodeParamConfigs])
+    autoWireAudioDrivers(nodeType.type, newId)
+  }, [addNode, addEdge, autoWireAudioDrivers, graphLevel, graphClipId, searchMenuPos, pan, zoom, compoundLibrary, nodeParamConfigs])
 
   // ── Drag and Drop ──
   const handleDragOver = useCallback((e) => {
@@ -334,12 +355,13 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       const shaderCode = getShaderSource(payload.nodeType)
       const paramConfigs = shaderCode ? parseParams(shaderCode) : []
       const defaultParams = getDefaultParams(paramConfigs)
-      addNode(graphLevel, graphClipId, {
+      const newId = addNode(graphLevel, graphClipId, {
         type: payload.nodeType, name: payload.name, position: basePos,
         params: defaultParams, shaderCode: payload.nodeType === 'CUSTOM' ? shaderCode : null,
       })
+      autoWireAudioDrivers(payload.nodeType, newId)
     }
-  }, [addNode, addEdge, graphLevel, graphClipId, pan, zoom])
+  }, [addNode, addEdge, autoWireAudioDrivers, graphLevel, graphClipId, pan, zoom])
 
   // ── Shader Generator ──
   const handleShaderGenerate = useCallback((effectNodes, customName) => {

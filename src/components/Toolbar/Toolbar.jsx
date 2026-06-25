@@ -113,12 +113,22 @@ export default function Toolbar() {
       }
       deserializeProject(data, useAppStore.getState)
       const timeline = useTimelineStore.getState()
+      let missing = []
       if (timeline.clips?.length > 0) {
-        await restoreMediaFilesFromFolder(dirHandle, timeline.clips, useTimelineStore.getState().updateClip)
+        const result = await restoreMediaFilesFromFolder(dirHandle, timeline.clips, useTimelineStore.getState().updateClip)
+        missing = result?.missing || []
       }
       useAppStore.getState().setProjectFolder(dirHandle, dirHandle.name)
       await saveProjectFolderHandle(useAppStore.getState().projectId, dirHandle)
-      addToast({ message: `Project loaded from "${dirHandle.name}"`, type: 'success' })
+      if (missing.length > 0) {
+        addToast({
+          message: `Loaded, but ${missing.length} media file${missing.length > 1 ? 's' : ''} weren't found in the folder. Re-import ${missing.length > 1 ? 'them' : 'it'} to relink, then save.`,
+          type: 'warning',
+          duration: 9000,
+        })
+      } else {
+        addToast({ message: `Project loaded from "${dirHandle.name}"`, type: 'success' })
+      }
     } catch (err) {
       if (err.name !== 'AbortError') {
         console.error(err)

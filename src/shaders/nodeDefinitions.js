@@ -126,6 +126,7 @@ const NODE_DEFS = {
     inputs: [
       { id: 'input', type: 'texture', name: 'Input A' },
       { id: 'input_b', type: 'texture', name: 'Input B' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
     ],
     outputs: [
       { id: 'output', type: 'texture', name: 'Output' },
@@ -137,6 +138,7 @@ const NODE_DEFS = {
     inputs: [
       { id: 'input', type: 'texture', name: 'Input A' },
       { id: 'input_b', type: 'texture', name: 'Input B' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
     ],
     outputs: [
       { id: 'output', type: 'texture', name: 'Output' },
@@ -156,6 +158,7 @@ const NODE_DEFS = {
     inputs: [
       { id: 'input', type: 'texture', name: 'Input' },
       { id: 'disp_map', type: 'texture', name: 'Disp Map' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
     ],
     outputs: [
       { id: 'output', type: 'texture', name: 'Output' },
@@ -170,6 +173,7 @@ const NODE_DEFS = {
 const DEFAULT_EFFECT_DEF = {
   inputs: [
     { id: 'input', type: 'texture', name: 'Input' },
+    { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
   ],
   outputs: [
     { id: 'output', type: 'texture', name: 'Output' },

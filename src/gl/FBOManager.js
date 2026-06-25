@@ -267,6 +267,13 @@ export class FBOManager {
   }
 
   /**
+   * Whether an FBO with this id exists.
+   */
+  has(id) {
+    return this.fbos.has(id)
+  }
+
+  /**
    * Delete an FBO.
    */
   delete(id) {
@@ -277,6 +284,15 @@ export class FBOManager {
       gl.deleteTexture(entry.texture)
       this.fbos.delete(id)
     }
+  }
+
+  /**
+   * Delete a ping-pong pair (its two FBOs and the pair record).
+   */
+  deletePingPong(id) {
+    this.delete(`${id}_0`)
+    this.delete(`${id}_1`)
+    this.pingPongPairs.delete(id)
   }
 
   /**

@@ -18,7 +18,7 @@ const EFFECT_CATEGORIES = [
   {
     id: 'distortion',
     name: 'Distortion',
-    effects: ['GLITCH', 'PIXEL_SORT', 'CHROMATIC_ABERRATION', 'LENS_DISTORTION', 'FLUID_WARP', 'VORONOI'],
+    effects: ['GLITCH', 'PIXEL_SORT', 'CHROMATIC_ABERRATION', 'LENS_DISTORTION', 'FLUID_WARP', 'VORONOI', 'SPACE_DISTORTION'],
   },
   {
     id: 'stylize',
@@ -29,6 +29,11 @@ const EFFECT_CATEGORIES = [
     id: 'effects',
     name: 'Effects',
     effects: ['NOISE'],
+  },
+  {
+    id: 'generators',
+    name: 'Generators (Procedural)',
+    effects: ['BIOMATH', 'PLASMA', 'FRACTAL', 'TUNNEL', 'GEOMETRIC', 'LIGHTNING', 'CRYSTAL', 'COSMIC', 'WAVES'],
   },
 ]
 
