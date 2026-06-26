@@ -9,6 +9,7 @@ import { createShaderProgram } from './ShaderProgram.js'
 import { getNodeSource } from '../shaders/shaderRegistry.js'
 import { getExecutionOrder } from '../utils/topSort.js'
 import { hexToVec3 } from '../utils/paramParser.js'
+import { AUDIO_DRIVER_BANDS, injectAudioDrivers } from '../utils/audioDrivers.js'
 
 // When true, the graph is evaluated as a true DAG (inputs resolved per-edge,
 // multi-input effects supported). Set to false to fall back to the legacy
@@ -28,34 +29,7 @@ const TEXTURE_INPUT_SOCKETS = {
 // "Audio Drivers" socket: each is 0.0 unless the matching Audio Splitter band is
 // wired in. Band ids match the splitter's output socket ids. (u_beat is handled
 // separately as an always-live standard uniform.)
-const AUDIO_DRIVER_BANDS = ['sub_bass', 'bass', 'low_mid', 'mid', 'high_mid', 'presence', 'treble', 'rms']
-// All audio uniforms auto-declared into every effect (the 8 gated bands plus the
-// always-live u_beat). u_beat is not gated — it's uploaded by uploadStandardUniforms.
-const AUDIO_DECLARE_UNIFORMS = [...AUDIO_DRIVER_BANDS, 'beat']
 const AUDIO_DRIVERS_SOCKET = 'audio_drivers'
-
-/**
- * Inject `uniform float u_<name>;` declarations for any audio uniform the shader
- * doesn't already declare. Done at compile time so users can reference the
- * drivers in code without adding the declaration themselves. The editable source
- * is left untouched — only the compiled string carries the injected lines.
- */
-function injectAudioDrivers(source) {
-  if (!source) return source
-  const missing = AUDIO_DECLARE_UNIFORMS.filter(name => {
-    const re = new RegExp(`uniform\\s+(?:lowp\\s+|mediump\\s+|highp\\s+)?float\\s+u_${name}\\b`)
-    return !re.test(source)
-  })
-  if (missing.length === 0) return source
-  const decls = missing.map(name => `uniform float u_${name};`).join('\n')
-  const lines = source.split('\n')
-  // Insert after the precision line (or #version, or at the very top).
-  let idx = lines.findIndex(l => /\bprecision\b/.test(l))
-  if (idx === -1) idx = lines.findIndex(l => /#version/.test(l))
-  if (idx === -1) return `${decls}\n${source}`
-  lines.splice(idx + 1, 0, decls)
-  return lines.join('\n')
-}
 
 /**
  * Live values for each audio driver band, read from the audio store.
@@ -87,6 +61,24 @@ function applyAudioDrivers(customParams, nodeId, edges, driverVals) {
     if (e.toNode === nodeId && e.toSocket === AUDIO_DRIVERS_SOCKET && driverVals[e.fromSocket] !== undefined) {
       customParams['u_' + e.fromSocket] = driverVals[e.fromSocket]
     }
+  }
+}
+
+/**
+ * Same as applyAudioDrivers but for a node INSIDE a compound. The audio_drivers
+ * edges there come from EFFECT_INPUT terminals (not the splitter directly), so
+ * the band is read from the terminal's recorded audioBand tag.
+ */
+function applyCompoundDrivers(customParams, nodeId, subGraph, driverVals) {
+  for (const band of AUDIO_DRIVER_BANDS) customParams['u_' + band] = 0
+  if (!subGraph || !subGraph.edges || !driverVals) return
+  for (const e of subGraph.edges) {
+    if (e.toNode !== nodeId || e.toSocket !== AUDIO_DRIVERS_SOCKET) continue
+    const src = subGraph.nodes.find(n => n.id === e.fromNode)
+    // band from a tagged EFFECT_INPUT terminal, or directly if a splitter is
+    // inside the compound (fromSocket is the band name).
+    const band = src?.audioBand || e.fromSocket
+    if (driverVals[band] !== undefined) customParams['u_' + band] = driverVals[band]
   }
 }
 
@@ -313,7 +305,7 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
       let compoundPP = fbos.getPingPong(compoundPPId)
       if (!compoundPP) compoundPP = fbos.createPingPong(compoundPPId, renderer.width, renderer.height)
       else fbos.resizePingPong(compoundPPId, renderer.width, renderer.height)
-      executeSubChain(renderer, node.subChain, primaryInput, outId, standardState, compoundPPId, compoundPP)
+      executeSubChain(renderer, node.subChain, primaryInput, outId, standardState, compoundPPId, compoundPP, node.compoundNode?.subGraph, driverVals)
       nodeOutput[node.nodeId] = outId
       lastProducedFBO = outId
       continue
@@ -452,7 +444,7 @@ function executeChainLinear(renderer, chain, inputFBOId, outputFBOId, standardSt
       }
 
       // Execute sub-chain through its own ping-pong
-      executeSubChain(renderer, node.subChain, currentInputId, targetFBOId, standardState, compoundPPId, compoundPP)
+      executeSubChain(renderer, node.subChain, currentInputId, targetFBOId, standardState, compoundPPId, compoundPP, node.compoundNode?.subGraph, driverVals)
     } else {
       // Regular effect node — prefer live params over the compile-time snapshot
       const liveParams = liveNodes?.[node.nodeId]?.params ?? node.params
@@ -512,7 +504,7 @@ function executeChainLinear(renderer, chain, inputFBOId, outputFBOId, standardSt
 /**
  * Execute a compound sub-chain through its own ping-pong FBO context.
  */
-function executeSubChain(renderer, subChain, inputFBOId, outputFBOId, standardState, ppId, pp) {
+function executeSubChain(renderer, subChain, inputFBOId, outputFBOId, standardState, ppId, pp, subGraph = null, driverVals = null) {
   const fbos = renderer.fbos
   const gl = renderer.gl
   const effectNodes = subChain.filter(n =>
@@ -542,6 +534,8 @@ function executeSubChain(renderer, subChain, inputFBOId, outputFBOId, standardSt
     }
 
     const customParams = normalizeParams(node.params)
+    // Audio drivers for compounded effects (gated by the inner audio_drivers wiring).
+    applyCompoundDrivers(customParams, node.nodeId, subGraph, driverVals)
 
     let prevFrameFBOId = null
     if (node.uniformLocations.u_prev_frame !== undefined) {

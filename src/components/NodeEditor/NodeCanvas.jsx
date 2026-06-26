@@ -24,11 +24,28 @@ const EXCLUDED_FROM_MARQUEE = new Set([
   'AUDIO_INPUT', 'AUDIO_SPLITTER',
 ])
 
-// Example effect types that ship pre-wired: when added, these splitter bands are
-// auto-connected to the new node's Audio Drivers socket so they react immediately.
-const AUDIO_EXAMPLE_WIRING = {
+// Node types that ship pre-wired: when added, these Audio Splitter bands are
+// auto-connected to the new node's Audio Drivers socket so they react out of the
+// box. (The generators used to react via always-live uniforms; now they follow
+// the single wire-up model and just get wired automatically on add — visibly, so
+// you can unplug them.)
+const AUDIO_AUTOWIRE = {
+  // Example effects
   AUDIO_WARP: ['bass', 'treble'],
   SPECTRUM_GLOW: ['bass', 'mid', 'treble'],
+  // Procedural generators
+  BIOMATH: ['bass', 'mid', 'treble'],
+  PLASMA: ['bass', 'mid', 'treble'],
+  FRACTAL: ['bass', 'mid', 'treble'],
+  TUNNEL: ['bass', 'mid', 'treble'],
+  GEOMETRIC: ['bass', 'mid', 'treble'],
+  LIGHTNING: ['bass', 'mid', 'treble'],
+  CRYSTAL: ['bass', 'mid', 'treble'],
+  COSMIC: ['bass', 'mid', 'treble'],
+  WAVES: ['bass', 'mid', 'treble'],
+  SPACE_DISTORTION: ['bass', 'mid', 'treble'],
+  // Audio-reactive post effect
+  PARTICLE_DISPLACE: ['rms'],
 }
 
 export default function NodeCanvas({ collapsed, onToggleCollapse }) {
@@ -274,7 +291,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   // Auto-wire the Audio Splitter's bands into a freshly-added example node's
   // Audio Drivers socket, so the pre-wired examples react out of the box.
   const autoWireAudioDrivers = useCallback((type, newId) => {
-    const bands = AUDIO_EXAMPLE_WIRING[type]
+    const bands = AUDIO_AUTOWIRE[type]
     if (!bands || !newId) return
     const g = useGraphStore.getState().getActiveGraph(graphLevel, graphClipId)
     const splitter = g?.nodes?.find(n => n.type === 'AUDIO_SPLITTER')

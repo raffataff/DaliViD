@@ -84,15 +84,21 @@ export function createCompound(selectedNodeIds, allNodes, allEdges, name = 'New 
   // Build sub-graph nodes
   const subNodes = allNodes.filter(n => selected.has(n.id))
 
-  // Create one EFFECT_INPUT per external input edge
-  const inputNodes = inputEdges.map((edge, i) => ({
-    id: `compound_input_${Date.now()}_${i}`,
-    type: 'EFFECT_INPUT',
-    name: 'INPUT',
-    position: { x: -220, y: 200 + i * 60 },
-    locked: true,
-    params: {},
-  }))
+  // Create one EFFECT_INPUT per external input edge. For audio-driver inputs we
+  // record which Audio Splitter band fed it, so the inner effect can still be
+  // driven by that band after it's wrapped in the compound.
+  const inputNodes = inputEdges.map((edge, i) => {
+    const audioBand = edge.toSocket === 'audio_drivers' ? edge.fromSocket : null
+    return {
+      id: `compound_input_${Date.now()}_${i}`,
+      type: 'EFFECT_INPUT',
+      name: audioBand ? `BAND: ${audioBand}` : 'INPUT',
+      position: { x: -220, y: 200 + i * 60 },
+      locked: true,
+      params: {},
+      audioBand,
+    }
+  })
 
   // Create one EFFECT_OUTPUT per external output edge
   const outputNodes = outputEdges.map((edge, i) => ({
@@ -255,40 +261,44 @@ export function expandCompound(compoundNode, parentEdges) {
     e => e.fromNode !== compoundNode.id && e.toNode !== compoundNode.id
   )
 
-  // For each incoming parent edge (connected to compound input_N),
-  // bridge to the corresponding inner node
+  // Terminals are stored in input_N / output_N order, so map each parent edge
+  // to its terminal by the socket index (input_2 → 3rd EFFECT_INPUT). This keeps
+  // multi-input compounds (e.g. several audio bands) wired to the right effects.
+  const inputTerminals = subGraph.nodes.filter(n => n.type === 'EFFECT_INPUT')
+  const outputTerminals = subGraph.nodes.filter(n => n.type === 'EFFECT_OUTPUT')
+  const socketIndex = (socket) => {
+    const m = /_(\d+)$/.exec(socket || '')
+    return m ? parseInt(m[1], 10) : 0
+  }
+
+  // For each incoming parent edge (compound input_N), bridge to the inner
+  // node(s) that the N-th EFFECT_INPUT terminal feeds.
   for (const inEdge of incomingEdges) {
-    // Find which input terminal this maps to
-    const inputTerminals = subGraph.nodes.filter(n => n.type === 'EFFECT_INPUT')
-    for (const term of inputTerminals) {
-      const innerEdge = subGraph.edges.find(e => e.fromNode === term.id)
-      if (innerEdge) {
-        newParentEdges.push({
-          ...inEdge,
-          id: `edge_expanded_in_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-          toNode: innerEdge.toNode,
-          toSocket: innerEdge.toSocket,
-        })
-        break
-      }
+    const term = inputTerminals[socketIndex(inEdge.toSocket)]
+    if (!term) continue
+    for (const innerEdge of subGraph.edges.filter(e => e.fromNode === term.id)) {
+      newParentEdges.push({
+        ...inEdge,
+        id: `edge_expanded_in_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+        toNode: innerEdge.toNode,
+        toSocket: innerEdge.toSocket,
+      })
     }
   }
 
-  // For each outgoing parent edge (from compound output_N),
-  // bridge from the corresponding inner node
+  // For each outgoing parent edge (compound output_N), bridge from the inner
+  // node that feeds the N-th EFFECT_OUTPUT terminal.
   for (const outEdge of outgoingEdges) {
-    const outputTerminals = subGraph.nodes.filter(n => n.type === 'EFFECT_OUTPUT')
-    for (const term of outputTerminals) {
-      const innerEdge = subGraph.edges.find(e => e.toNode === term.id)
-      if (innerEdge) {
-        newParentEdges.push({
-          ...outEdge,
-          id: `edge_expanded_out_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-          fromNode: innerEdge.fromNode,
-          fromSocket: innerEdge.fromSocket,
-        })
-        break
-      }
+    const term = outputTerminals[socketIndex(outEdge.fromSocket)]
+    if (!term) continue
+    const innerEdge = subGraph.edges.find(e => e.toNode === term.id)
+    if (innerEdge) {
+      newParentEdges.push({
+        ...outEdge,
+        id: `edge_expanded_out_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+        fromNode: innerEdge.fromNode,
+        fromSocket: innerEdge.fromSocket,
+      })
     }
   }
 

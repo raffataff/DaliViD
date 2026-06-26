@@ -390,7 +390,7 @@ uniform int u_frame;
 // Each is 0.0 until you wire the matching Audio Splitter band into this node's
 // "Audio Drivers" socket — then it's live. 0 is neutral for additive code
 // (x + u_bass) and for multiplicative code written as x * (1.0 + u_bass).
-// Also available: u_beat (always live), u_audio_bands[8] (full spectrum).
+// u_beat is the one exception — always live, no wiring needed.
 
 // @param name="Intensity" min=0.0 max=1.0 default=0.5 step=0.01
 uniform float u_intensity;
@@ -494,9 +494,11 @@ out vec4 fragColor;
 
 void main() {
   vec2 uv = v_uv - 0.5;
-  float c = cos(u_fb_rotate), s = sin(u_fb_rotate);
+  // Audio drivers (0 until wired): mid rotates the feedback, sub-bass zooms it.
+  float ang = u_fb_rotate + u_mid * 0.03;
+  float c = cos(ang), s = sin(ang);
   uv = mat2(c, -s, s, c) * uv;
-  uv /= u_fb_zoom;
+  uv /= (u_fb_zoom + u_sub_bass * 0.01);
   uv += 0.5;
   vec4 prev = texture(u_prev_frame, uv);
   vec4 curr = texture(u_texture, v_uv);
@@ -519,7 +521,8 @@ void main() {
   vec4 color = vec4(0.0);
   float totalSpace = 0.0;
   // Clamp the radius so a modulated / out-of-range value can't blow up the loop.
-  float r = clamp(u_radius, 0.0, 16.0);
+  // Audio driver (0 until wired): loudness (rms) increases the blur.
+  float r = clamp(u_radius + u_rms * 8.0, 0.0, 16.0);
   int rad = int(r);
   // Constant loop bounds for portability; taps beyond the active radius are skipped.
   const int MAX_RAD = 16;
@@ -1221,7 +1224,8 @@ void main() {
 
   if (lum > u_threshold_lo && lum < u_threshold_hi) {
     vec2 offset = u_direction == 0 ? vec2(1.0/u_resolution.x, 0.0) : vec2(0.0, 1.0/u_resolution.y);
-    float shift = sin(lum * 50.0 + u_time) * u_intensity * 0.05;
+    // Audio driver (0 until wired): high-mid drives the sort displacement.
+    float shift = sin(lum * 50.0 + u_time) * (u_intensity + u_high_mid * 0.5) * 0.05;
     vec2 sortedUV = uv + offset * shift * u_resolution;
     col = texture(u_texture, sortedUV);
   }
@@ -1263,7 +1267,8 @@ void main() {
     for (int x = -1; x <= 1; x++) {
       vec2 neighbor = vec2(float(x), float(y));
       vec2 point = hash2(iuv + neighbor);
-      if (u_animate) point = 0.5 + 0.5 * sin(u_time * 0.5 + 6.2831 * point);
+      // Audio driver (0 until wired): presence jitters the cells.
+      if (u_animate) point = 0.5 + 0.5 * sin(u_time * 0.5 + u_presence * 3.0 + 6.2831 * point);
       float d = length(neighbor + point - fuv);
       if (d < minDist) {
         minDist = d;
@@ -1329,7 +1334,8 @@ void main() {
     fbm(uv * u_warp_scale + t * 0.3),
     fbm(uv * u_warp_scale + t * 0.4 + 100.0)
   );
-  uv += (warp - 0.5) * u_strength;
+  // Audio driver (0 until wired): low-mid intensifies the warp.
+  uv += (warp - 0.5) * (u_strength + u_low_mid * 0.08);
   fragColor = texture(u_texture, uv);
 }
 `)
@@ -1356,7 +1362,8 @@ void main() {
     ? dot(center.rgb, vec3(0.299, 0.587, 0.114))
     : length(v_uv - vec2(0.5)) * 1.414;
 
-  float blur = clamp(abs(depth - u_focus) / u_range, 0.0, 1.0) * u_max_blur;
+  // Audio driver (0 until wired): loudness (rms) deepens the blur (clamped).
+  float blur = clamp(abs(depth - u_focus) / u_range, 0.0, 1.0) * min(u_max_blur + u_rms * 6.0, 18.0);
   int rad = int(blur);
 
   if (rad <= 0) {
@@ -1385,7 +1392,6 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform float u_time;
 uniform vec2 u_resolution;
-uniform float u_audio_rms;
 // @param name="Density" min=0.001 max=0.1 default=0.02 step=0.001
 uniform float u_density;
 // @param name="Displace Amount" min=0.0 max=0.1 default=0.02 step=0.002
@@ -1403,7 +1409,7 @@ float hash(vec2 p) {
 void main() {
   vec2 uv = v_uv;
   vec4 col = texture(u_texture, uv);
-  float audioMult = u_audio_react ? (1.0 + u_audio_rms * 3.0) : 1.0;
+  float audioMult = u_audio_react ? (1.0 + u_rms * 3.0) : 1.0;
 
   vec2 grid = floor(uv * u_resolution / u_particle_size);
   float r = hash(grid);
@@ -1447,8 +1453,8 @@ void main() {
   // Lift
   col.rgb += u_lift;
 
-  // Contrast (around mid-gray)
-  col.rgb = (col.rgb - 0.5) * u_contrast + 0.5;
+  // Contrast (around mid-gray). Audio driver (0 until wired): presence adds punch.
+  col.rgb = (col.rgb - 0.5) * (u_contrast + u_presence * 0.6) + 0.5;
 
   // Gamma
   col.rgb = pow(max(col.rgb, 0.0), vec3(1.0 / u_gamma));
@@ -1488,7 +1494,8 @@ void main() {
     result = mix(a.rgb, overlay, u_mix);
   }
 
-  fragColor = vec4(clamp(result, 0.0, 1.0), max(a.a, b.a));
+  // Audio driver (0 until wired): bass pulses the blended result.
+  fragColor = vec4(clamp(result * (1.0 + u_bass * 0.5), 0.0, 1.0), max(a.a, b.a));
 }
 `)
 
@@ -1523,7 +1530,8 @@ void main() {
     result = mix(a.rgb, overlay, u_mix);
   }
 
-  fragColor = vec4(clamp(result, 0.0, 1.0), max(a.a, b.a));
+  // Audio driver (0 until wired): bass pulses the blended result.
+  fragColor = vec4(clamp(result * (1.0 + u_bass * 0.5), 0.0, 1.0), max(a.a, b.a));
 }
 `)
 
@@ -1534,9 +1542,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=6 default=0 step=1 type=select options="Xor Neural,Gyroid Lattice,Crystalline Lattice,Hypnotic Spiral,Alien Terrain,Digital Sphere,Orchard"
 uniform int u_mode;
@@ -1616,7 +1624,7 @@ void main() {
     float z = 0.0;
     for(int i=0; i<25; i++) {
       p = z * rd;
-      p.z -= t * (2.0 + u_audio_bass * 4.0);
+      p.z -= t * (2.0 + u_bass * 4.0);
       float shape = cos(dot(cos(p), sin(p.yzx / 0.6 + 0.1 * sin(p.zxy * 10.0)) * 10.0));
       float d = 0.01 + 0.3 * abs(shape);
       vec3 glow = vec3(0.2, 0.2, 0.3) * u_intensity + palette(u_palette, z * 0.05 + t) * 0.1;
@@ -1632,11 +1640,11 @@ void main() {
     vec3 acc = vec3(0.0);
     for(int i=0; i<25; i++) {
       p = rd * z;
-      p.z += t + u_audio_bass;
+      p.z += t + u_bass;
       p.xy = rotate(p.xy, t * 0.2);
       float d = dot(sin(p), cos(p.yzx)) / 1.5;
       d = abs(d) - 0.1;
-      if (d < 0.01) acc += palette(u_palette, z * 0.1 + u_audio_mid) * 0.1;
+      if (d < 0.01) acc += palette(u_palette, z * 0.1 + u_mid) * 0.1;
       z += max(0.05, d * 0.5);
     }
     genColor = acc * u_intensity;
@@ -1644,7 +1652,7 @@ void main() {
   else if (u_mode == 2) { // Crystalline Lattice
     vec2 p = uv * 3.3333;
     vec3 col = vec3(0.0);
-    float rt = t * 1.2 + u_audio_bass * 1.5;
+    float rt = t * 1.2 + u_bass * 1.5;
     float iters = 8.0 * u_complexity;
     for(float i=1.0; i<=10.0; i++) {
       if (i > iters) break;
@@ -1655,13 +1663,13 @@ void main() {
       vec3 pal = cos(i + vec3(0.0, 1.0, 2.0)) + 1.0;
       col += pal / (6.0 * max(0.001, length(v)));
     }
-    genColor = tanh((col * col) * u_intensity * (1.0 + u_audio_mid * 0.3));
+    genColor = tanh((col * col) * u_intensity * (1.0 + u_mid * 0.3));
   }
   else if (u_mode == 3) { // Hypnotic Spiral
     vec2 p = uv * 2.0;
     vec2 v = vec2(atan(p.y, p.x), log(length(p) + 1e-6)) / 0.2 + 4.0;
     vec4 col = vec4(0.0);
-    float rt = t + u_audio_bass;
+    float rt = t + u_bass;
     float iters = 8.0 * u_complexity;
     for(float i=1.0; i<9.0; i++) {
       if (i > iters) break;
@@ -1676,7 +1684,7 @@ void main() {
     vec3 v = vec3(0.0);
     vec3 col = vec3(0.0);
     float z = 0.0;
-    float rt = t * 2.0 + u_audio_bass * 4.0;
+    float rt = t * 2.0 + u_bass * 4.0;
     for(int i=0; i<35; i++) {
       p = z * rd;
       p.xz -= rt;
@@ -1684,10 +1692,10 @@ void main() {
       float d = 0.4 * max(dot(cos(v.xz), sin(v.zx / 0.6)) + 0.6, v.y + 3.0);
       vec3 fog = -rd * d * d / (z * z + 1.0);
       vec3 pal = cos(p.y + vec3(6.0, 1.0, 2.0)) + 1.1;
-      vec2 trig = tan(p.y / 0.3) / (cos(p.xz / 0.1) + 0.1 + (2.0 * u_audio_mid));
+      vec2 trig = tan(p.y / 0.3) / (cos(p.xz / 0.1) + 0.1 + (2.0 * u_mid));
       float lightStruct = length(trig) + d * d / 0.01;
-      vec3 light = pal / (lightStruct + 0.01) / (z + 0.1 / (u_audio_bass + 0.01));
-      col += (fog * u_audio_treble) + (light * u_audio_mid);
+      vec3 light = pal / (lightStruct + 0.01) / (z + 0.1 / (u_bass + 0.01));
+      col += (fog * u_treble) + (light * u_mid);
       z += max(0.02, d);
     }
     genColor = tanh(col * 0.1) * u_intensity;
@@ -1706,11 +1714,11 @@ void main() {
       l = length(p);
       p = vec3(atan(p.z, p.x) - t * 0.2, log(l) - t * 0.2, asin(clamp(p.y / l, -1.0, 1.0))) / 0.1;
       v = cos(p + sin(p / 0.24 + t));
-      float d = l / 60.0 * length(max(v, v.yzx * 0.1 + u_audio_treble * 0.01));
+      float d = l / 60.0 * length(max(v, v.yzx * 0.1 + u_treble * 0.01));
       z += d;
-      o += (sin(vec4(p.y) + vec4(6.0, 1.0, 3.0, 3.0)) + 0.1 + u_audio_bass).xyz / d;
+      o += (sin(vec4(p.y) + vec4(6.0, 1.0, 3.0, 3.0)) + 0.1 + u_bass).xyz / d;
     }
-    genColor = tanh(o / 20000.0) * u_intensity * (1.0 + u_audio_bass * 0.5 + u_audio_mid * 0.3);
+    genColor = tanh(o / 20000.0) * u_intensity * (1.0 + u_bass * 0.5 + u_mid * 0.3);
   }
   else { // Orchard
     vec3 o = vec3(0.0);
@@ -1734,7 +1742,7 @@ void main() {
       p.y += 1.0;
       m = abs(p.y);
     }
-    genColor = tanh(o / 500.0) * u_intensity * (1.0 + u_audio_bass * 0.5 + u_audio_mid * 0.3);
+    genColor = tanh(o / 500.0) * u_intensity * (1.0 + u_bass * 0.5 + u_mid * 0.3);
   }
 
   vec4 bg = texture(u_texture, v_uv);
@@ -1749,9 +1757,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=4 default=0 step=1 type=select options="Classic,Liquid Noise,Cellular,Plasma Ball,Nebula"
 uniform int u_mode;
@@ -1832,15 +1840,15 @@ void main() {
   vec2 p = uv * u_scale_val;
 
   if (u_mode == 0) { // Classic
-    float rt = t + u_audio_bass;
+    float rt = t + u_bass;
     float val = sin(p.x + rt) + sin(p.y + rt) + sin(p.x + p.y + rt);
     val = (val + 3.0) / 6.0;
-    genColor = palette(u_palette, val + u_audio_mid) * u_intensity;
+    genColor = palette(u_palette, val + u_mid) * u_intensity;
   }
   else if (u_mode == 1) { // Liquid Noise
     float n = noise(p + t * 0.5) + noise(p * 2.0 - t) * 0.5;
     float ring = sin(n * 10.0 + t);
-    genColor = palette(u_palette, n + u_audio_bass * 0.5) * (0.5 + 0.5 * ring) * u_intensity;
+    genColor = palette(u_palette, n + u_bass * 0.5) * (0.5 + 0.5 * ring) * u_intensity;
   }
   else if (u_mode == 2) { // Cellular
     vec2 i_st = floor(p);
@@ -1855,7 +1863,7 @@ void main() {
         m_dist = min(m_dist, length(diff));
       }
     }
-    genColor = palette(u_palette, m_dist + u_audio_treble) * u_intensity;
+    genColor = palette(u_palette, m_dist + u_treble) * u_intensity;
     genColor += (1.0 - step(0.02, m_dist)) * u_intensity;
   }
   else if (u_mode == 3) { // Plasma Ball
@@ -1864,17 +1872,17 @@ void main() {
     v = p * (1.0 - l) / 0.2;
     vec3 c = vec3(0.0);
     for(float i=0.0; i<8.0; i++) {
-      c += (sin(vec3(v.x, v.y, v.y) * 2.0) + 1.0) * abs(v.x - v.y) * 0.2 + (u_audio_treble * 1.5);
+      c += (sin(vec3(v.x, v.y, v.y) * 2.0) + 1.0) * abs(v.x - v.y) * 0.2 + (u_treble * 1.5);
       v += cos(v.yx * i + vec2(0.0, i) + t) / (i + 1.0) + 0.7;
     }
     vec3 glow = exp(p.y * vec3(1.0, -1.0, -2.0)) * exp(-4.0 * l);
-    genColor = tanh(glow / max(c, 0.1)) * (1.0 + u_audio_bass) * u_intensity;
+    genColor = tanh(glow / max(c, 0.1)) * (1.0 + u_bass) * u_intensity;
   }
   else { // Nebula
     float n = fbm(p + t * 0.1);
     float dist = length(uv) + 0.1;
     float core = 1.0 / dist;
-    genColor = palette(u_palette, n * 2.0) * n * core * 0.5 * (0.8 + u_audio_mid * 0.5) * u_intensity;
+    genColor = palette(u_palette, n * 2.0) * n * core * 0.5 * (0.8 + u_mid * 0.5) * u_intensity;
   }
 
   vec4 bg = texture(u_texture, v_uv);
@@ -1889,9 +1897,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=7 default=0 step=1 type=select options="Julia,Mandelbrot Zoom,KIFS,Fractal Grid,Newton Fractal,Sierpinski Gasket,Burning Ship,Mainframe"
 uniform int u_mode;
@@ -1984,7 +1992,7 @@ void main() {
       if (length(z) > 2.0) break;
       iter += 1.0;
     }
-    genColor = palette(u_palette, iter / 8.0 + t * 0.2) * u_audio_bass * u_intensity;
+    genColor = palette(u_palette, iter / 8.0 + t * 0.2) * u_bass * u_intensity;
   }
   else if (u_mode == 2) { // KIFS
     vec2 p = uv * 2.0;
@@ -1996,19 +2004,19 @@ void main() {
       p = rotate(p, t * 0.2);
       a += length(p);
     }
-    genColor = palette(u_palette, a * 0.2 + u_audio_mid) * ((1.5 * u_audio_bass) + 0.5 * sin(a)) * u_intensity;
+    genColor = palette(u_palette, a * 0.2 + u_mid) * ((1.5 * u_bass) + 0.5 * sin(a)) * u_intensity;
   }
   else if (u_mode == 3) { // Fractal Grid
     vec2 p = uv * 20.0;
     vec3 col = vec3(0.0);
-    float rt = t + u_audio_bass * 2.0;
+    float rt = t + u_bass * 2.0;
     int maxIters = int(10.0 * u_complexity);
     for(int i=0; i<12; i++) {
       if (i >= maxIters) break;
       vec3 pal = cos(p.x + vec3(2.0, 1.0, 0.0)) + 1.0;
       vec2 distortion = sin(p + rt).yx;
-      float d = length(sin(p + distortion + u_audio_mid * 0.3));
-      col += pal / max(0.001, d - u_audio_bass * 0.15) / 0.2;
+      float d = length(sin(p + distortion + u_mid * 0.3));
+      col += pal / max(0.001, d - u_bass * 0.15) / 0.2;
       p *= mat2(0.8, -0.6, 0.6, 0.8);
     }
     genColor = tanh(col * col / 20000.0) * u_intensity;
@@ -2032,7 +2040,7 @@ void main() {
     float b_d = length(z - vec2(-0.5, -0.866));
     vec3 col = vec3(1.0 / (r_d + 0.1), 1.0 / (g_d + 0.1), 1.0 / (b_d + 0.1));
     col = tanh(col * 0.3);
-    genColor = col * (0.8 + u_audio_bass * 0.5) * u_intensity;
+    genColor = col * (0.8 + u_bass * 0.5) * u_intensity;
   }
   else if (u_mode == 5) { // Sierpinski Gasket
     vec2 p = uv * 2.0;
@@ -2050,7 +2058,7 @@ void main() {
       col += pal * scale * 0.1;
       scale *= 0.5;
     }
-    genColor = col * (0.8 + u_audio_bass * 0.5) * u_intensity;
+    genColor = col * (0.8 + u_bass * 0.5) * u_intensity;
   }
   else if (u_mode == 6) { // Burning Ship
     vec2 c = vec2(-0.4 + sin(t * 0.2) * 0.1, -0.5 + cos(t * 0.15) * 0.1);
@@ -2068,12 +2076,12 @@ void main() {
     float smoothIter = iter - log2(log2(dot(z, z) + 1e-6)) + 4.0;
     vec3 col = palette(u_palette, smoothIter * 0.1 + t * 0.1);
     col *= smoothstep(0.0, 1.0, iter / 16.0);
-    genColor = col * (0.7 + u_audio_bass * 0.8) * u_intensity;
+    genColor = col * (0.7 + u_bass * 0.8) * u_intensity;
   }
   else { // Mainframe
     vec2 p = abs(uv) * 2.5;
     vec3 col = vec3(0.0);
-    float rt = t * 1.5 + u_audio_bass * 2.0;
+    float rt = t * 1.5 + u_bass * 2.0;
     int maxIters = int(9.0 * u_complexity);
     for(float i = 1.0; i <= 9.0; i++) {
       if (i > float(maxIters)) break;
@@ -2087,7 +2095,7 @@ void main() {
       vec3 pal = cos(i * 0.3 + l - vec3(4.0, 5.0, 6.0)) + 1.0;
       col += 0.02 * pal / max(0.0001, l * l);
     }
-    genColor = max(tanh(col * u_intensity * (1.2 + u_audio_mid * 0.8)), 0.0);
+    genColor = max(tanh(col * u_intensity * (1.2 + u_mid * 0.8)), 0.0);
   }
 
   vec4 bg = texture(u_texture, v_uv);
@@ -2102,9 +2110,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=4 default=0 step=1 type=select options="Cylindrical,Box,Warp Speed,Hyper Tunnel,Bio-Tunnel"
 uniform int u_mode;
@@ -2173,7 +2181,7 @@ void main() {
   if (u_mode == 0) { // Cylindrical
     float r = 1.0 / length(uv) + t;
     float a = atan(uv.y, uv.x);
-    float v = sin(r * 10.0 + u_audio_bass) * cos(a * 8.0);
+    float v = sin(r * 10.0 + u_bass) * cos(a * 8.0);
     genColor = palette(u_palette, v * 0.5 + 0.5) * u_intensity;
   }
   else if (u_mode == 1) { // Box
@@ -2199,7 +2207,7 @@ void main() {
         stars += 1.0 / (abs(fract(depth * 10.0) - 0.5) * 20.0);
       }
     }
-    genColor = vec3(stars) * (0.5 + 0.5 * u_audio_bass) * u_intensity;
+    genColor = vec3(stars) * (0.5 + 0.5 * u_bass) * u_intensity;
   }
   else if (u_mode == 3) { // Hyper Tunnel
     vec3 rd = normalize(vec3(uv, -1.0));
@@ -2229,7 +2237,7 @@ void main() {
     vec3 p = vec3(0.0);
     vec4 col = vec4(0.0);
     float z = 0.0;
-    float rt = t + u_audio_bass * 4.0;
+    float rt = t + u_bass * 4.0;
     for(int i=0; i<15; i++) {
       p = z * rd;
       float angle = atan(p.y / 0.2, p.x) * 2.0;
@@ -2241,8 +2249,8 @@ void main() {
       }
       float d = length(vec4(0.4 * cos(p) - 0.4, p.z));
       z += d;
-      vec4 pal = cos(p.x + float(i) * 0.4 + z + vec4(6.0, 1.0, 2.0, 0.0)) + (1.0 + u_audio_treble);
-      col += pal / max(0.001, (d + u_audio_bass * 0.5));
+      vec4 pal = cos(p.x + float(i) * 0.4 + z + vec4(6.0, 1.0, 2.0, 0.0)) + (1.0 + u_treble);
+      col += pal / max(0.001, (d + u_bass * 0.5));
     }
     genColor = tanh(col.rgb * col.rgb / 400.0) * u_intensity;
   }
@@ -2259,9 +2267,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Sacred Geometry,Hexagonal Grid,Rotating Crosses,Geode"
 uniform int u_mode;
@@ -2326,7 +2334,7 @@ void main() {
   if (u_mode == 0) { // Sacred Geometry
     vec2 p = abs(uv) - 0.5;
     float d = length(p);
-    float s = sin(d * 20.0 * u_complexity - t * 4.0 + u_audio_bass);
+    float s = sin(d * 20.0 * u_complexity - t * 4.0 + u_bass);
     s = smoothstep(0.4, 0.5, s);
     genColor = palette(u_palette, d) * s * u_intensity;
   }
@@ -2340,7 +2348,7 @@ void main() {
   }
   else if (u_mode == 2) { // Rotating Crosses
     vec2 p = fract(uv * 4.0 * u_complexity) - 0.5;
-    p = rotate(p, t + u_audio_bass);
+    p = rotate(p, t + u_bass);
     float crossShape = min(abs(p.x), abs(p.y));
     float mask = smoothstep(0.1, 0.09, crossShape);
     genColor = mask * palette(u_palette, uv.x + uv.y + t) * u_intensity;
@@ -2364,7 +2372,7 @@ void main() {
       o += colShift / max(0.001, d);
       z += d;
     }
-    genColor = tanh(o.rgb / 2000.0) * (1.0 + u_audio_treble) * u_intensity;
+    genColor = tanh(o.rgb / 2000.0) * (1.0 + u_treble) * u_intensity;
   }
 
   vec4 bg = texture(u_texture, v_uv);
@@ -2379,9 +2387,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=2 default=0 step=1 type=select options="Spectral Tesla,Waveform Bolt,Chaos Storm"
 uniform int u_mode;
@@ -2464,24 +2472,24 @@ void main() {
     for (float i = 0.0; i < 3.0; i++) {
       bolt += lightning(uv, i * 100.0 + floor(t * 2.0 + i * 10.0), t);
     }
-    bolt *= 0.3 + u_audio_bass * 0.5;
+    bolt *= 0.3 + u_bass * 0.5;
     vec3 glow = palette(u_palette, bolt * 2.0 + t * 0.1);
     genColor = glow * bolt * u_intensity;
     genColor += palette(u_palette, 0.5 + t * 0.05) * exp(-abs(uv.y - 0.5) * 10.0) * bolt * 0.3 * u_intensity;
   }
   else if (u_mode == 1) { // Waveform Bolt
     float wave = sin(uv.x * 20.0 + t * 5.0) * 0.1;
-    wave += sin(uv.x * 40.0 - t * 3.0) * 0.05 * u_audio_mid;
-    float lightningY = 0.5 + wave * (0.5 + u_audio_bass);
+    wave += sin(uv.x * 40.0 - t * 3.0) * 0.05 * u_mid;
+    float lightningY = 0.5 + wave * (0.5 + u_bass);
     float d = abs(uv.y - lightningY);
-    float bolt = exp(-d * d * 200.0) * (0.5 + u_audio_treble);
+    float bolt = exp(-d * d * 200.0) * (0.5 + u_treble);
     bolt += exp(-d * d * 50.0) * 0.2;
     genColor = palette(u_palette, uv.x + t * 0.2) * bolt * u_intensity;
   }
   else { // Chaos Storm
     vec3 col = vec3(0.0);
     vec2 p = (uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
-    float rt = t + u_audio_bass * 3.0;
+    float rt = t + u_bass * 3.0;
     for (float i = 0.0; i < 5.0; i++) {
       vec2 origin = vec2(sin(rt * 0.7 + i * 2.0) * 0.8, cos(rt * 0.5 + i * 3.0) * 0.8);
       vec2 dir = normalize(p - origin);
@@ -2498,7 +2506,7 @@ void main() {
       }
       col += palette(u_palette, i * 0.2 + rt * 0.1) * boltLen;
     }
-    genColor = col * u_intensity * (0.7 + u_audio_treble * 0.3);
+    genColor = col * u_intensity * (0.7 + u_treble * 0.3);
   }
 
   vec4 bg = texture(u_texture, uv);
@@ -2513,9 +2521,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Radial Facets,Glass Shatter,Isometric Cubes,Ethereal Gem"
 uniform int u_mode;
@@ -2592,12 +2600,12 @@ void main() {
     sparkle = smoothstep(0.0, 0.1, sparkle);
     float edge = smoothstep(abs(angle - sectorAngle), 0.02, 0.0);
     genColor = palette(u_palette, sector / facets + radius + t * 0.1) * (sparkle + edge * 0.5) * u_intensity;
-    genColor *= 1.0 + u_audio_bass * 0.5;
+    genColor *= 1.0 + u_bass * 0.5;
   }
   else if (u_mode == 1) { // Glass Shatter
     vec2 p = uv * 3.0;
     vec3 col = vec3(0.0);
-    float rt = t + u_audio_bass * 2.0;
+    float rt = t + u_bass * 2.0;
     for (float i = 0.0; i < 8.0; i++) {
       vec2 cell = floor(p + i * 0.1);
       vec2 shard = fract(p + i * 0.1) - 0.5;
@@ -2624,7 +2632,7 @@ void main() {
     float front = smoothstep(0.05, 0.0, abs(f.x + f.y - 1.0));
     float side = smoothstep(0.05, 0.0, abs(f.x - f.y));
     float cube = max(max(top, front), side) * step(f.y, 1.0 - cubeHeight);
-    genColor = palette(u_palette, cell.x * 0.1 + cell.y * 0.1 + t * 0.05) * cube * u_intensity * (0.8 + u_audio_mid * 0.5);
+    genColor = palette(u_palette, cell.x * 0.1 + cell.y * 0.1 + t * 0.05) * cube * u_intensity * (0.8 + u_mid * 0.5);
   }
   else { // Ethereal Gem
     vec3 rd = normalize(vec3(uv, -1.5));
@@ -2647,7 +2655,7 @@ void main() {
       z += max(0.1, d);
     }
     // Inner glow
-    float glow = exp(-length(uv) * 3.0) * (0.5 + u_audio_treble * 0.5);
+    float glow = exp(-length(uv) * 3.0) * (0.5 + u_treble * 0.5);
     col += palette(u_palette, rt * 0.2) * glow * 0.5;
     genColor = col * u_intensity;
   }
@@ -2664,9 +2672,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Spiral Arms,Nebula,Black Hole,Quasar"
 uniform int u_mode;
@@ -2764,7 +2772,7 @@ void main() {
       vec2 starPos = rotate(vec2(0.1 + i * 0.15, 0.0), t + i * 1.5) * 2.0;
       float d = length(uv - starPos);
       float starR = 0.002 + random(vec2(i, 0.0)) * 0.005;
-      stars += exp(-d * d / (starR * starR)) * (0.5 + u_audio_treble * 0.5);
+      stars += exp(-d * d / (starR * starR)) * (0.5 + u_treble * 0.5);
     }
     vec3 armColor = palette(u_palette, r + t * 0.05);
     genColor = armColor * armMask * wave * 0.5 * u_intensity;
@@ -2783,7 +2791,7 @@ void main() {
     float dust = smoothstep(0.3, 0.0, abs(n - 0.5));
     vec3 nebulaCol = palette(u_palette, n + t * 0.02) * n * falloff;
     vec3 dustCol = palette(u_palette + 1, n + t * 0.02) * dust * falloff * 0.5;
-    genColor = (nebulaCol + dustCol) * u_intensity * (0.7 + u_audio_mid * 0.3);
+    genColor = (nebulaCol + dustCol) * u_intensity * (0.7 + u_mid * 0.3);
   }
   else if (u_mode == 2) { // Black Hole
     float r = length(uv);
@@ -2794,13 +2802,13 @@ void main() {
     // Accretion disk
     float diskAngle = angle + t * 0.5 + r * 3.0;
     float diskWave = sin(diskAngle * 8.0) * 0.5 + 0.5;
-    float diskWidth = 0.1 + u_audio_bass * 0.05;
+    float diskWidth = 0.1 + u_bass * 0.05;
     float diskDisk = smoothstep(diskWidth, 0.0, abs(r - 0.5));
     vec3 diskCol = palette(u_palette, r + t * 0.2) * diskWave * diskDisk;
     // Event horizon
     float horizon = smoothstep(0.15, 0.1, r);
     // Photon ring
-    float ring = exp(-abs(r - 0.2) * 50.0) * (1.0 + u_audio_treble);
+    float ring = exp(-abs(r - 0.2) * 50.0) * (1.0 + u_treble);
     genColor = diskCol * u_intensity * horizon + ring * palette(u_palette, t * 0.3) * 0.5 * u_intensity;
   }
   else { // Quasar
@@ -2811,10 +2819,10 @@ void main() {
     float jetLower = smoothstep(0.1, 0.0, abs(angle + 1.5708));
     float jetDecay = exp(-r * 3.0);
     float jetPulse = sin(r * 50.0 - t * 5.0) * 0.5 + 0.5;
-    jetPulse *= (0.5 + u_audio_bass * 0.5);
+    jetPulse *= (0.5 + u_bass * 0.5);
     vec3 jetCol = palette(u_palette, r + t * 0.5) * (jetUpper + jetLower) * jetDecay * jetPulse;
     // Core flash
-    float core = exp(-r * 10.0) * (1.0 + u_audio_treble * 2.0);
+    float core = exp(-r * 10.0) * (1.0 + u_treble * 2.0);
     float flash = step(0.9, sin(t * 10.0 + r * 20.0)) * core;
     // Radial rays
     float rays = sin(angle * 12.0 + t * 2.0) * 0.5 + 0.5;
@@ -2835,9 +2843,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Interference,Ripples,Beam Scanlines,Sliding Interference"
 uniform int u_mode;
@@ -2907,16 +2915,16 @@ void main() {
       vec2 center = vec2(sin(t * 0.5 + i * 1.5), cos(t * 0.7 + i * 2.0)) * 0.5;
       float d = length(uv - center);
       float freq = 20.0 + i * 5.0;
-      wave += sin(d * freq - t * 3.0 + u_audio_bass * 2.0) * (1.0 - i * 0.2);
+      wave += sin(d * freq - t * 3.0 + u_bass * 2.0) * (1.0 - i * 0.2);
     }
     wave = wave * 0.25 + 0.5;
     float rings = sin(length(uv) * 10.0 * scale - t * 2.0) * 0.5 + 0.5;
-    genColor = palette(u_palette, wave + rings * 0.3) * u_intensity * (0.8 + u_audio_mid * 0.4);
+    genColor = palette(u_palette, wave + rings * 0.3) * u_intensity * (0.8 + u_mid * 0.4);
   }
   else if (u_mode == 1) { // Ripples
     vec2 p = uv * 4.0;
     float wave = 0.0;
-    float rt = t + u_audio_bass * 3.0;
+    float rt = t + u_bass * 3.0;
     for (float i = 0.0; i < 3.0; i++) {
       vec2 center = vec2(sin(rt * 0.3 + i * 3.0) * 0.6, cos(rt * 0.4 + i * 2.0) * 0.6);
       float d = abs(length(uv - center) - fract(rt * 0.5 + i * 0.3));
@@ -2928,7 +2936,7 @@ void main() {
   else if (u_mode == 2) { // Beam Scanlines
     float scanline = sin(uv.x * 50.0 * u_complexity + t * 3.0) * 0.5 + 0.5;
     scanline *= smoothstep(0.0, 1.0, sin(v_uv.y * 2.0 - t));
-    float beam = exp(-abs(uv.y) * 10.0) * (0.5 + u_audio_bass * 0.5);
+    float beam = exp(-abs(uv.y) * 10.0) * (0.5 + u_bass * 0.5);
     float hue = uv.x + t * 0.1;
     genColor = palette(u_palette, hue) * scanline * beam * u_intensity;
     // Horizontal beam lines
@@ -2950,7 +2958,7 @@ void main() {
     wave = wave * 0.33 + 0.5;
     float pattern = smoothstep(0.4, 0.6, wave);
     genColor = palette(u_palette, pattern + length(uv) * 0.5 + t * 0.05) * pattern * u_intensity;
-    genColor *= 0.7 + u_audio_treble * 0.5;
+    genColor *= 0.7 + u_treble * 0.5;
   }
 
   vec4 bg = texture(u_texture, v_uv);
@@ -2965,9 +2973,9 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bass;
-uniform float u_audio_mid;
-uniform float u_audio_treble;
+uniform float u_bass;
+uniform float u_mid;
+uniform float u_treble;
 
 // @param name="Mode" min=0 max=1 default=0 step=1 type=select options="Twist,Fold"
 uniform int u_mode;
@@ -2998,12 +3006,12 @@ void main() {
   if (u_mode == 0) { // Twist
     float r = length(uv);
     float angle = atan(uv.y, uv.x);
-    float twistAmount = u_intensity * 3.0 * (1.0 + u_audio_bass * 0.5);
+    float twistAmount = u_intensity * 3.0 * (1.0 + u_bass * 0.5);
     angle += twistAmount * (0.5 - r) * sin(t);
     distortedUV = vec2(cos(angle), sin(angle)) * r;
     // Add noise-based perturbation for organic feel
     float n = noise(uv * 3.0 + t * 0.2) * 0.05 * u_intensity;
-    distortedUV += n * (1.0 + u_audio_mid);
+    distortedUV += n * (1.0 + u_mid);
   }
   else { // Fold
     // Kaleidoscope-like folding
@@ -3018,7 +3026,7 @@ void main() {
     // Mirror based on radius for more complex folds
     float foldR = 0.3 + sin(t) * 0.1;
     if (r > foldR) {
-      distortedUV += normalize(uv) * 0.1 * u_intensity * (1.0 + u_audio_treble);
+      distortedUV += normalize(uv) * 0.1 * u_intensity * (1.0 + u_treble);
     }
     // Additional noise distortion
     float n1 = noise(uv * 5.0 + t * 0.3);

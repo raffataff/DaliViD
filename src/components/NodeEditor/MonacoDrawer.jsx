@@ -8,6 +8,7 @@ import { IconClose } from '../common/Icons'
 import { addToast } from '../common/Toast'
 import { getNodeSource } from '../../shaders/shaderRegistry'
 import { parseParams } from '../../utils/paramParser'
+import { audioDriverHeader } from '../../utils/audioDrivers'
 import './MonacoDrawer.css'
 
 export default function MonacoDrawer() {
@@ -40,7 +41,10 @@ export default function MonacoDrawer() {
         setNodeName(node.name || node.label || 'CUSTOM SHADER')
         // Load the node's actual shader (custom edit → attached code → registry),
         // falling back to boilerplate only when the node has no source at all.
-        setCode(getNodeSource(node) || GLSL_BOILERPLATE)
+        // audioDriverHeader makes the full set of audio uniforms visible at the
+        // top so all bands (sub-bass … rms, beat) are discoverable, not just the
+        // few the example code happens to use.
+        setCode(audioDriverHeader(getNodeSource(node) || GLSL_BOILERPLATE))
       }
     }
   }, [monacoOpen, monacoNodeId, graphLevel, graphClipId, getNode])

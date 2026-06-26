@@ -238,9 +238,6 @@ export function uploadStandardUniforms(gl, locations, state) {
     playhead = 0,
     audioBands = [0,0,0,0,0,0,0,0],
     audioRms = 0,
-    audioBass = 0,
-    audioMid = 0,
-    audioTreble = 0,
     beat = 0,
     beatCount = 0,
   } = state
@@ -253,18 +250,18 @@ export function uploadStandardUniforms(gl, locations, state) {
   if (locations.u_frame) gl.uniform1i(locations.u_frame, frame)
   // float u_playhead
   if (locations.u_playhead) gl.uniform1f(locations.u_playhead, playhead)
+  // Always-live audio uniforms. There is ONE audio model now — the wire-up
+  // drivers (u_bass … u_rms), gated per-node by the Audio Drivers socket. The
+  // only always-live audio inputs are:
+  //   • u_audio_bands[8] / u_audio_rms — reserved for the Audio Visualizer node,
+  //     whose whole purpose is to react to sound (the one deliberate exception),
+  //   • u_beat — a convenient always-on beat trigger available to any shader.
   // float u_audio_bands[8]
   if (locations['u_audio_bands']) {
     gl.uniform1fv(locations['u_audio_bands'], new Float32Array(audioBands))
   }
   // float u_audio_rms
   if (locations.u_audio_rms) gl.uniform1f(locations.u_audio_rms, audioRms)
-  // float u_audio_bass
-  if (locations.u_audio_bass) gl.uniform1f(locations.u_audio_bass, audioBass)
-  // float u_audio_mid
-  if (locations.u_audio_mid) gl.uniform1f(locations.u_audio_mid, audioMid)
-  // float u_audio_treble
-  if (locations.u_audio_treble) gl.uniform1f(locations.u_audio_treble, audioTreble)
   // float u_beat
   if (locations.u_beat) gl.uniform1f(locations.u_beat, beat)
   // int u_beat_count
