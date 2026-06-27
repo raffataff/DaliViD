@@ -694,6 +694,7 @@ export class Renderer {
             if (!this.fbos.getTexture(outputFBOId)) {
               this.fbos.create(outputFBOId, this.width, this.height)
             }
+            standardState.hasSource = 1 // real video frame feeds this clip graph
             executeChain(this, chain, inputFBOId, outputFBOId, standardState, {}, buildNodeMap(clipGraph), edges)
             clipResultFBOId = outputFBOId
           }
@@ -759,6 +760,8 @@ export class Renderer {
         )
 
         if (effectNodes.length > 0) {
+          // No video composited this frame → generative effects should self-display.
+          standardState.hasSource = hasContent ? 1 : 0
           executeChain(this, this.masterChain.chain, masterInputFBOId, null, standardState, {}, buildNodeMap(masterGraph), this.masterChain.edges)
         } else {
           if (hasContent) this._blitToScreen(masterInputFBOId)
@@ -933,6 +936,8 @@ export class Renderer {
       }
 
       const { chain, edges } = this.compiledChains.get(clipId)
+      // Audio-only clips have no real source texture → let generative effects show.
+      standardState.hasSource = clip.fileType === 'audio' ? 0 : 1
       executeChain(this, chain, inputFBOId, null, standardState, {}, buildNodeMap(clipGraph), edges)
     } else {
       // No graph — passthrough

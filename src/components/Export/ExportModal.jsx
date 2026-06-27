@@ -7,6 +7,122 @@ import { IconClose } from '../common/Icons'
 import './ExportModal.css'
 
 /**
+ * Render the full timeline audio to a single AudioBuffer using an
+ * OfflineAudioContext. Every audio- and video-clip's audio is decoded, placed at
+ * its timeline position, trimmed to its in/out, and speed-adjusted — respecting
+ * track mute and solo. Returns null when there is nothing audible to render.
+ */
+async function renderTimelineAudio(durationSec, clips, tracks) {
+  if (!durationSec || durationSec <= 0) return null
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext
+  if (!OfflineCtx) return null
+
+  const sampleRate = 44100
+  const channels = 2
+  const length = Math.ceil(durationSec * sampleRate)
+  const offline = new OfflineCtx(channels, length, sampleRate)
+
+  const trackById = {}
+  for (const t of tracks) trackById[t.id] = t
+  const soloActive = tracks.some(t => t.solo)
+
+  // Decode each unique source once; the decoded buffer can feed many sources.
+  const bufferCache = new Map()
+  const decode = (url) => {
+    if (!bufferCache.has(url)) {
+      bufferCache.set(url, fetch(url)
+        .then(res => res.arrayBuffer())
+        .then(arr => offline.decodeAudioData(arr)))
+    }
+    return bufferCache.get(url)
+  }
+
+  let scheduled = 0
+  for (const clip of clips) {
+    if (!clip.fileUrl) continue
+    if (clip.fileType !== 'audio' && clip.fileType !== 'video') continue
+
+    const track = trackById[clip.trackId]
+    if (track && track.muted) continue
+    if (soloActive && (!track || !track.solo)) continue
+
+    let audioBuf
+    try {
+      audioBuf = await decode(clip.fileUrl)
+    } catch (e) {
+      // A video with no audio track throws here — that's fine, just skip it.
+      console.warn('[Export] Could not decode audio for clip', clip.filename, e?.message)
+      continue
+    }
+    if (!audioBuf || audioBuf.duration <= 0) continue
+
+    const timelineDur = Math.max(0, clip.timelineEnd - clip.timelineStart)
+    if (timelineDur <= 0) continue
+
+    const src = offline.createBufferSource()
+    src.buffer = audioBuf
+    src.playbackRate.value = clip.speed || 1
+    src.connect(offline.destination)
+
+    const when = Math.max(0, clip.timelineStart)
+    const offset = Math.min(Math.max(0, clip.sourceStart || 0), audioBuf.duration)
+    src.start(when, offset)
+    src.stop(when + timelineDur)
+    scheduled++
+  }
+
+  if (scheduled === 0) return null
+  return offline.startRendering()
+}
+
+/**
+ * Encode a rendered AudioBuffer into the muxer's AAC audio track. Feeds the PCM
+ * to a WebCodecs AudioEncoder in planar-float chunks with sequential timestamps.
+ */
+async function encodeAudioTrack(muxer, audioBuffer) {
+  const sampleRate = audioBuffer.sampleRate
+  const numberOfChannels = audioBuffer.numberOfChannels
+  const totalFrames = audioBuffer.length
+
+  const audioEncoder = new AudioEncoder({
+    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    error: (e) => console.error('AudioEncoder error:', e),
+  })
+  audioEncoder.configure({
+    codec: 'mp4a.40.2', // AAC-LC
+    sampleRate,
+    numberOfChannels,
+    bitrate: 192000,
+  })
+
+  const chans = []
+  for (let c = 0; c < numberOfChannels; c++) chans.push(audioBuffer.getChannelData(c))
+
+  const chunkFrames = 4800
+  for (let start = 0; start < totalFrames; start += chunkFrames) {
+    const frames = Math.min(chunkFrames, totalFrames - start)
+    // f32-planar layout: all of channel 0, then all of channel 1, …
+    const planar = new Float32Array(frames * numberOfChannels)
+    for (let c = 0; c < numberOfChannels; c++) {
+      planar.set(chans[c].subarray(start, start + frames), c * frames)
+    }
+    const audioData = new AudioData({
+      format: 'f32-planar',
+      sampleRate,
+      numberOfFrames: frames,
+      numberOfChannels,
+      timestamp: Math.round((start / sampleRate) * 1e6),
+      data: planar,
+    })
+    audioEncoder.encode(audioData)
+    audioData.close()
+  }
+
+  await audioEncoder.flush()
+  audioEncoder.close()
+}
+
+/**
  * Export Modal — frame/video export with codec, resolution, quality settings.
  */
 export default function ExportModal() {
@@ -165,7 +281,20 @@ export default function ExportModal() {
           return
         }
 
-        // Initialize Muxer
+        // Render the timeline audio offline so it can be muxed alongside the video.
+        const { clips: allClips, tracks: allTracks } = useTimelineStore.getState()
+        const exportDuration = useTimelineStore.getState().calculateDuration() || 10
+        let audioBuffer = null
+        if (typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined') {
+          try {
+            audioBuffer = await renderTimelineAudio(exportDuration, allClips, allTracks)
+          } catch (e) {
+            console.warn('[Export] Audio mixdown failed, exporting video only:', e?.message)
+          }
+        }
+        const hasAudio = !!audioBuffer
+
+        // Initialize Muxer — declare the audio track up front when present.
         let muxer = new Muxer({
           target: new ArrayBufferTarget(),
           video: {
@@ -173,6 +302,13 @@ export default function ExportModal() {
             width: exportWidth,
             height: exportHeight,
           },
+          ...(hasAudio ? {
+            audio: {
+              codec: 'aac',
+              numberOfChannels: audioBuffer.numberOfChannels,
+              sampleRate: audioBuffer.sampleRate,
+            },
+          } : {}),
           fastStart: 'in-memory',
         })
 
@@ -233,6 +369,16 @@ export default function ExportModal() {
 
         if (exportActiveRef.current) {
           await encoder.flush()
+
+          // Encode the mixed audio into the muxer's AAC track before finalizing.
+          if (hasAudio) {
+            try {
+              await encodeAudioTrack(muxer, audioBuffer)
+            } catch (e) {
+              console.error('[Export] Audio encode failed, finalizing video only:', e)
+            }
+          }
+
           muxer.finalize()
 
           const { buffer } = muxer.target

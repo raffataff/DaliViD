@@ -31,6 +31,8 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const outPointStore = useTimelineStore(s => s.outPoint)
   const setInPoint = useTimelineStore(s => s.setInPoint)
   const setOutPoint = useTimelineStore(s => s.setOutPoint)
+  const clearInOutPoints = useTimelineStore(s => s.clearInOutPoints)
+  const addMarker = useTimelineStore(s => s.addMarker)
   const calculateDuration = useTimelineStore(s => s.calculateDuration)
 
   const inPoint = inPointStore ?? 0
@@ -69,6 +71,20 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     }
   }, [timelineZoom, timelineScrollLeft, setTimelineZoom, setTimelineScrollLeft])
 
+  // Zoom to fit — scale so the whole project fills the visible ruler width and
+  // reset the scroll. This is the standard "fit sequence to window" control found
+  // in professional NLEs/DAWs (Premiere/Resolve's `\`, etc.).
+  const handleZoomFit = useCallback(() => {
+    const el = rulerRef.current
+    if (!el) return
+    const width = el.clientWidth
+    const dur = calculateDuration() || 30
+    if (width <= 0 || dur <= 0) return
+    const targetZoom = (width - 24) / (dur * 80) // 80 = base px/sec
+    setTimelineZoom(targetZoom)
+    setTimelineScrollLeft(0)
+  }, [calculateDuration, setTimelineZoom, setTimelineScrollLeft])
+
   // Attach native wheel listeners because React 18 makes onWheel passive,
   // which silently prevents e.preventDefault() from working.
   useEffect(() => {
@@ -95,7 +111,10 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     else if (pxPerSec < 80) interval = 2
     else if (pxPerSec > 300) interval = 0.5
 
-    const totalSeconds = 300 // 5 minutes
+    // Span the whole project (plus headroom), not a fixed 5 minutes, so long
+    // songs get ruler marks across their full length. Off-screen marks are
+    // skipped below, so this stays cheap regardless of duration.
+    const totalSeconds = Math.max(300, Math.ceil(projectDuration * 1.1))
     for (let s = 0; s <= totalSeconds; s += interval) {
       const x = s * pxPerSec
       if (x < timelineScrollLeft - 100 || x > timelineScrollLeft + 2500) continue
@@ -255,26 +274,76 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   // Keyboard shortcuts for timeline
   useEffect(() => {
     const handleKey = (e) => {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
-      if (e.code === 'KeyS' && !e.ctrlKey && !e.metaKey && selectedClipId) {
-        e.preventDefault()
-        handleSplitAtPlayhead()
-      }
-      if (e.code === 'Delete' && selectedClipId) {
-        handleDeleteClip()
-      }
-      if (e.code === 'Numpad1' || e.code === 'Digit1') {
-        e.preventDefault()
-        setPlayheadTime(inPoint)
-      }
-      if (e.code === 'Numpad2' || e.code === 'Digit2') {
-        e.preventDefault()
-        setPlayheadTime(outPoint)
+      const tag = e.target.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target.isContentEditable) return
+      // Don't steal Ctrl/Cmd combos (Save, Export, etc.) handled globally.
+      if (e.ctrlKey || e.metaKey) return
+
+      const playhead = useAppStore.getState().playheadTime
+
+      switch (e.code) {
+        // S — split selected clip at playhead
+        case 'KeyS':
+          if (selectedClipId) { e.preventDefault(); handleSplitAtPlayhead() }
+          break
+
+        // Delete / Backspace — remove selected clip
+        case 'Delete':
+        case 'Backspace':
+          if (selectedClipId) { e.preventDefault(); handleDeleteClip() }
+          break
+
+        // \ — zoom timeline to fit the whole project (NLE standard)
+        case 'Backslash':
+          e.preventDefault(); handleZoomFit()
+          break
+
+        // = / + — zoom in,  - / _ — zoom out
+        case 'Equal':
+        case 'NumpadAdd':
+          e.preventDefault(); setTimelineZoom(timelineZoom * 1.25)
+          break
+        case 'Minus':
+        case 'NumpadSubtract':
+          e.preventDefault(); setTimelineZoom(timelineZoom * 0.8)
+          break
+
+        // I / O — set In / Out points at the playhead
+        case 'KeyI':
+          e.preventDefault(); setInPoint(playhead)
+          break
+        case 'KeyO':
+          e.preventDefault(); setOutPoint(playhead)
+          break
+        // X — clear In/Out points
+        case 'KeyX':
+          e.preventDefault(); clearInOutPoints()
+          break
+
+        // M — drop a marker at the playhead
+        case 'KeyM':
+          e.preventDefault(); addMarker(playhead)
+          break
+
+        // 1 / 2 — jump playhead to In / Out points
+        case 'Numpad1':
+        case 'Digit1':
+          e.preventDefault(); setPlayheadTime(inPoint)
+          break
+        case 'Numpad2':
+        case 'Digit2':
+          e.preventDefault(); setPlayheadTime(outPoint)
+          break
+
+        default:
+          break
       }
     }
     window.addEventListener('keydown', handleKey)
     return () => window.removeEventListener('keydown', handleKey)
-  }, [selectedClipId, handleSplitAtPlayhead, handleDeleteClip, inPoint, outPoint, setPlayheadTime])
+  }, [selectedClipId, handleSplitAtPlayhead, handleDeleteClip, handleZoomFit,
+      timelineZoom, setTimelineZoom, setInPoint, setOutPoint, clearInOutPoints,
+      addMarker, inPoint, outPoint, setPlayheadTime])
 
 
 
@@ -295,6 +364,9 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
           data-tooltip={editMode === 'overwrite' ? 'Switch to Insert Mode' : 'Switch to Overwrite Mode'}
         >
           {editMode === 'overwrite' ? 'OVERWRITE' : 'INSERT'}
+        </button>
+        <button className="timeline__mode-btn" onClick={handleZoomFit} data-tooltip="Zoom to fit project">
+          FIT
         </button>
         <button className="panel__header-btn" onClick={handleSplitAtPlayhead} data-tooltip="Split at Playhead (S)">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4"><path d="M6 1v10M2 3l4 3-4 3" /></svg>

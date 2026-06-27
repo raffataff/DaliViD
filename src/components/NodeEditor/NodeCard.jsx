@@ -113,6 +113,7 @@ const NodeCard = memo(function NodeCard({
   const handleMouseDown = useCallback((e) => {
     if (e.target.closest('.socket') || e.target.closest('.node-card__slider') || e.target.closest('button') || e.target.closest('input') || e.target.closest('select')) return
     e.stopPropagation()
+    if (e.altKey) e.preventDefault() // keep Alt from triggering the browser menu
     let dragNodeId = node.id
     if (e.shiftKey && onDetachNode) onDetachNode(node.id)
     if (e.altKey && onDuplicate) {

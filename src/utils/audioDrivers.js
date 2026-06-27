@@ -44,9 +44,14 @@ function insertAfterPrecision(source, block) {
  */
 export function injectAudioDrivers(source) {
   if (!source) return source
-  const missing = missingAudioDrivers(source)
-  if (missing.length === 0) return source
-  return insertAfterPrecision(source, missing.map(n => `uniform float u_${n};`).join('\n'))
+  const decls = missingAudioDrivers(source).map(n => `uniform float u_${n};`)
+  // u_has_source: 1.0 when a real video frame feeds the chain, 0.0 when the input
+  // is the blank/default FBO (audio-only). Lets generative effects force their
+  // output on when there is no background to overlay. Always available; declared
+  // here so shaders can reference it without a uniform line.
+  if (!isDeclared(source, 'has_source')) decls.push('uniform float u_has_source;')
+  if (decls.length === 0) return source
+  return insertAfterPrecision(source, decls.join('\n'))
 }
 
 /**

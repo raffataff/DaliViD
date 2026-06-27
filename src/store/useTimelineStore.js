@@ -354,7 +354,10 @@ const useTimelineStore = create((set, get) => ({
   },
 
   // ── Timeline Zoom ──
-  setTimelineZoom: (zoom) => set({ timelineZoom: Math.max(0.1, Math.min(10, zoom)) }),
+  // Very wide bounds so the timeline can zoom out to fit hour-long songs (the
+  // lower the zoom, the more time fits on screen) and in for frame-level work.
+  // Clamp stays finite/positive to avoid divide-by-zero and runaway scroll math.
+  setTimelineZoom: (zoom) => set({ timelineZoom: Math.max(0.002, Math.min(50, zoom)) }),
   setTimelineScrollLeft: (scrollLeft) => set({ timelineScrollLeft: Math.max(0, scrollLeft) }),
 
   /**

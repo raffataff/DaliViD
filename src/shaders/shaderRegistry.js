@@ -1746,7 +1746,8 @@ void main() {
   }
 
   vec4 bg = texture(u_texture, v_uv);
-  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+  float _mixAmt = max(u_bg_mix, 1.0 - u_has_source);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), _mixAmt), bg.a);
 }
 `);
 
@@ -1886,7 +1887,8 @@ void main() {
   }
 
   vec4 bg = texture(u_texture, v_uv);
-  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+  float _mixAmt = max(u_bg_mix, 1.0 - u_has_source);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), _mixAmt), bg.a);
 }
 `);
 
@@ -2099,7 +2101,8 @@ void main() {
   }
 
   vec4 bg = texture(u_texture, v_uv);
-  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+  float _mixAmt = max(u_bg_mix, 1.0 - u_has_source);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), _mixAmt), bg.a);
 }
 `);
 
@@ -2256,7 +2259,8 @@ void main() {
   }
 
   vec4 bg = texture(u_texture, v_uv);
-  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+  float _mixAmt = max(u_bg_mix, 1.0 - u_has_source);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), _mixAmt), bg.a);
 }
 `);
 
@@ -2376,7 +2380,8 @@ void main() {
   }
 
   vec4 bg = texture(u_texture, v_uv);
-  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+  float _mixAmt = max(u_bg_mix, 1.0 - u_has_source);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), _mixAmt), bg.a);
 }
 `);
 
@@ -2510,7 +2515,8 @@ void main() {
   }
 
   vec4 bg = texture(u_texture, uv);
-  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+  float _mixAmt = max(u_bg_mix, 1.0 - u_has_source);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), _mixAmt), bg.a);
 }
 `);
 
@@ -2661,7 +2667,8 @@ void main() {
   }
 
   vec4 bg = texture(u_texture, v_uv);
-  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+  float _mixAmt = max(u_bg_mix, 1.0 - u_has_source);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), _mixAmt), bg.a);
 }
 `);
 
@@ -2832,7 +2839,8 @@ void main() {
   }
 
   vec4 bg = texture(u_texture, v_uv);
-  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+  float _mixAmt = max(u_bg_mix, 1.0 - u_has_source);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), _mixAmt), bg.a);
 }
 `);
 
@@ -2962,7 +2970,8 @@ void main() {
   }
 
   vec4 bg = texture(u_texture, v_uv);
-  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), u_bg_mix), bg.a);
+  float _mixAmt = max(u_bg_mix, 1.0 - u_has_source);
+  fragColor = vec4(mix(bg.rgb, blend(u_blend_mode, bg.rgb, genColor), _mixAmt), bg.a);
 }
 `);
 

@@ -242,6 +242,27 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     }
   }, [marquee, dragNoodle, graph.nodes, nodeParamConfigs, setSelectedNodeIds, clearNodeSelection])
 
+  // Finalize pan/marquee/noodle on release ANYWHERE — not just over the canvas.
+  // Node cards stopPropagation on mouseup, so a release over a node never reached
+  // the container handler; the marquee menu only appeared when the cursor left
+  // the canvas. Listening on window fixes that, and a keyup on Ctrl/Meta lets the
+  // box-select finish (and open the action menu) the moment EITHER the mouse OR
+  // the modifier key is released.
+  const handleMouseUpRef = useRef(handleMouseUp)
+  useEffect(() => { handleMouseUpRef.current = handleMouseUp }, [handleMouseUp])
+  useEffect(() => {
+    const onUp = () => handleMouseUpRef.current()
+    const onKeyUp = (e) => {
+      if (e.key === 'Control' || e.key === 'Meta') handleMouseUpRef.current()
+    }
+    window.addEventListener('mouseup', onUp)
+    window.addEventListener('keyup', onKeyUp)
+    return () => {
+      window.removeEventListener('mouseup', onUp)
+      window.removeEventListener('keyup', onKeyUp)
+    }
+  }, [])
+
   // ── Actions from context menu ──
   const handleCopySelectedNodes = useCallback(() => {
     const selected = new Set(selectedNodeIds)
@@ -581,6 +602,15 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target.isContentEditable
       if (isInput) return
 
+      // Alt is our duplicate modifier (Alt+drag a node). On its own, the browser
+      // gives Alt to the Windows menu bar, stealing focus. Suppress that default
+      // so Alt stays available as a node-editor modifier. (AltGr typing happens
+      // in inputs, which already returned above.)
+      if (e.key === 'Alt' || e.code === 'AltLeft' || e.code === 'AltRight') {
+        e.preventDefault()
+        return
+      }
+
       if ((e.ctrlKey || e.metaKey) && e.code === 'KeyD' && selectedNodeId) {
         e.preventDefault()
         const node = graph.nodes.find(n => n.id === selectedNodeId)
@@ -662,8 +692,6 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
           ref={containerRef}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onMouseLeave={handleMouseUp}
           onContextMenu={handleContextMenu}
           onClick={handleCanvasClick}
           onDragOver={handleDragOver}

@@ -2,14 +2,33 @@ import './ShortcutsOverlay.css'
 
 const SHORTCUTS = [
   {
-    category: 'Playback & Timeline',
+    category: 'Playback & Transport',
     items: [
       { keys: ['Space'], desc: 'Play / Pause' },
       { keys: ['L'], desc: 'Toggle Loop' },
       { keys: ['←', '→'], desc: 'Step Frame Back / Forward' },
       { keys: ['Home', 'End'], desc: 'Skip to Start / End' },
+      { keys: ['1', '2'], desc: 'Jump to In / Out Point' },
+    ]
+  },
+  {
+    category: 'Timeline Editing',
+    items: [
       { keys: ['S'], desc: 'Split Clip at Playhead' },
       { keys: ['Delete'], desc: 'Delete Selected Clip' },
+      { keys: ['I', 'O'], desc: 'Set In / Out Point' },
+      { keys: ['X'], desc: 'Clear In / Out Points' },
+      { keys: ['M'], desc: 'Add Marker at Playhead' },
+    ]
+  },
+  {
+    category: 'Timeline Zoom',
+    items: [
+      { keys: ['\\'], desc: 'Zoom to Fit Project' },
+      { keys: ['+'], desc: 'Zoom In' },
+      { keys: ['−'], desc: 'Zoom Out' },
+      { keys: ['Wheel'], desc: 'Zoom at Cursor' },
+      { keys: ['Shift', 'Wheel'], desc: 'Pan Horizontally' },
     ]
   },
   {

@@ -240,6 +240,7 @@ export function uploadStandardUniforms(gl, locations, state) {
     audioRms = 0,
     beat = 0,
     beatCount = 0,
+    hasSource = 1,
   } = state
 
   // vec2 u_resolution
@@ -266,6 +267,9 @@ export function uploadStandardUniforms(gl, locations, state) {
   if (locations.u_beat) gl.uniform1f(locations.u_beat, beat)
   // int u_beat_count
   if (locations.u_beat_count) gl.uniform1i(locations.u_beat_count, beatCount)
+  // float u_has_source — 1.0 with a real video source, 0.0 in audio-only mode so
+  // generative effects can force their output on when there's no background.
+  if (locations.u_has_source) gl.uniform1f(locations.u_has_source, hasSource)
 
   // NOTE: the short-name band drivers (u_bass, u_mid, u_treble, u_rms,
   // u_sub_bass, u_low_mid, u_high_mid, u_presence) are NOT uploaded here — they
