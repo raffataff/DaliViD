@@ -23,7 +23,8 @@ export const SOCKET_COLORS = {
 
 /**
  * Can a connection be made between these socket types?
- * Same types always connect. Float can also connect to texture (modulation).
+ * Only same-type sockets connect (float→param modulation happens via the
+ * dedicated float param sockets, which are type 'float' themselves).
  */
 export function canConnect(fromType, toType) {
   return fromType === toType
@@ -48,6 +49,17 @@ const NODE_DEFS = {
     outputs: [
       { id: 'output', type: 'texture', name: 'Video' },
       { id: 'audio_out', type: 'audio', name: 'Audio' },
+    ],
+    hasParamInputs: true,
+  },
+  // IMAGE_INPUT — a still image as a first-class texture source. Outputs a
+  // texture peer to video/camera, so it can feed every downstream effect.
+  // hasParamInputs exposes float sockets so transform params (scale, rotation,
+  // zoom) can be audio/MATH modulated for reactive visuals.
+  IMAGE_INPUT: {
+    inputs: [],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Image' },
     ],
     hasParamInputs: true,
   },
@@ -153,6 +165,31 @@ const NODE_DEFS = {
     ],
     hasParamInputs: true,
   },
+  // ENVELOPE — CPU-side envelope follower (no GLSL shader): smooths any float
+  // signal with separate attack/release times, gates it below a threshold and
+  // applies gain. Sit it between an Audio Splitter band and a param socket to
+  // turn jittery FFT flicker into visuals that pump and breathe.
+  ENVELOPE: {
+    inputs: [
+      { id: 'input', type: 'float', name: 'Signal' },
+    ],
+    outputs: [
+      { id: 'output', type: 'float', name: 'Envelope' },
+    ],
+    hasParamInputs: false,
+  },
+  // TRANSITION_PROGRESS — CPU-side float source that sweeps 0 → 1 while a clip
+  // transition plays (no GLSL shader). Wire it into any float param socket
+  // (e.g. Mix/Blend's "Mix") to drive that param with the transition; outside a
+  // running transition its Preview params drive the value so a transition
+  // compound can be authored and watched live in the editor.
+  TRANSITION_PROGRESS: {
+    inputs: [],
+    outputs: [
+      { id: 'progress', type: 'float', name: 'Progress' },
+    ],
+    hasParamInputs: false,
+  },
   // DISPLACEMENT has texture + displacement map inputs
   DISPLACEMENT: {
     inputs: [
@@ -192,9 +229,35 @@ export function getNodeDef(nodeType) {
  * Get all sockets for a node, including dynamically generated param inputs.
  * @param {string} nodeType
  * @param {Array} paramConfigs — parsed @param configs from the shader
+ * @param {object} [node] — the node instance; required for COMPOUND nodes, whose
+ *   sockets are derived from their sub-graph EFFECT_INPUT/EFFECT_OUTPUT terminals.
  * @returns {{ inputs: Array, outputs: Array }}
  */
-export function getNodeSockets(nodeType, paramConfigs = []) {
+export function getNodeSockets(nodeType, paramConfigs = [], node = null) {
+  // Compound nodes expose one socket per EFFECT_INPUT / EFFECT_OUTPUT terminal in
+  // their sub-graph. The ids (input_<i> / output_<i>) match the edges that
+  // createCompound / expandCompound write and that executeGraphDAG routes, so the
+  // card, the noodles and the executor all agree. Audio-band input terminals
+  // (tagged audioBand) surface as float sockets.
+  if (nodeType === 'COMPOUND' && node?.subGraph?.nodes) {
+    const terms = node.subGraph.nodes
+    const inTerms = terms.filter(n => n.type === 'EFFECT_INPUT')
+    const outTerms = terms.filter(n => n.type === 'EFFECT_OUTPUT')
+    const inputs = inTerms.map((t, i) => ({
+      id: `input_${i}`,
+      type: t.audioBand ? 'float' : 'texture',
+      name: t.audioBand ? `Band: ${t.audioBand}` : (inTerms.length > 1 ? `Input ${i + 1}` : 'Input'),
+    }))
+    const outputs = outTerms.map((t, i) => ({
+      id: `output_${i}`,
+      type: 'texture',
+      name: outTerms.length > 1 ? `Output ${i + 1}` : 'Output',
+    }))
+    // Always expose at least one output so the compound stays wireable.
+    if (outputs.length === 0) outputs.push({ id: 'output_0', type: 'texture', name: 'Output' })
+    return { inputs, outputs }
+  }
+
   const def = getNodeDef(nodeType)
 
   const inputs = [...def.inputs]

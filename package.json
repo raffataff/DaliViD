@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "lint": "eslint .",
+    "lint": "eslint . && node scripts/smoke-shaders.mjs",
+    "smoke:shaders": "node scripts/smoke-shaders.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -19,6 +19,11 @@ import {
   saveProject, saveProjectToFolder,
   verifyDirectoryPermission
 } from './utils/projectSerializer'
+import { initHistory, undo, redo } from './utils/history'
+
+// Start recording undo history as soon as the module loads, so even the very
+// first edit after startup is undoable.
+initHistory()
 
 // Persist panel sizes to localStorage
 const STORAGE_KEY = 'dalivid_panel_sizes'
@@ -187,6 +192,20 @@ const clearSelection = useAppStore(s => s.clearSelection)
        // Delete / Backspace — delete selected node
        if ((e.code === 'Delete' || e.code === 'Backspace') && !isInput) {
          // Node deletion handled by NodeCanvas listening to selectedNodeId
+         return
+       }
+
+       // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y — Undo / Redo (global, both stores).
+       // Skipped inside inputs so text fields and Monaco keep native undo.
+       if ((e.ctrlKey || e.metaKey) && e.code === 'KeyZ' && !isInput) {
+         e.preventDefault()
+         if (e.shiftKey) redo()
+         else undo()
+         return
+       }
+       if ((e.ctrlKey || e.metaKey) && e.code === 'KeyY' && !isInput) {
+         e.preventDefault()
+         redo()
          return
        }
 

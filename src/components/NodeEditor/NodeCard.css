@@ -208,7 +208,7 @@
 /* ── Slider Row ── */
 .node-card__slider-row {
   display: grid;
-  grid-template-columns: 60px 1fr 40px;
+  grid-template-columns: 60px 1fr 46px;
   align-items: center;
   gap: 8px;
   padding: 1px 6px;
@@ -239,7 +239,11 @@
   font-size: 12px;
   color: rgba(255, 255, 255, 0.4);
   text-align: right;
-  cursor: text;
+  cursor: ew-resize; /* drag to scrub, click to type */
+}
+
+.node-card__slider-value:hover {
+  color: rgba(255, 255, 255, 0.75);
 }
 
 .node-card__slider-row--disabled {
@@ -282,12 +286,12 @@
   font-size: 12px;
   color: rgba(255, 255, 255, 0.4);
   min-width: 28px;
-  text-align: flex-end;
-  cursor: text;
+  text-align: right;
+  cursor: ew-resize; /* drag to scrub, click to type */
 }
 
 .node-card__slider-value-input {
-  width: 36px;
+  width: 46px;
   font-size: 12px;
   background: rgba(0, 0, 0, 0.4);
   border: 1px solid var(--accent-cyan, #00e5ff);

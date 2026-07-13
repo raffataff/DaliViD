@@ -35,9 +35,7 @@ export default function Toolbar() {
   const projectFolderHandle = useAppStore(s => s.projectFolderHandle)
   const projectFolderName = useAppStore(s => s.projectFolderName)
   const projectFolderPermission = useAppStore(s => s.projectFolderPermission)
-  const setProjectFolder = useAppStore(s => s.setProjectFolder)
   const disconnectProjectFolder = useAppStore(s => s.disconnectProjectFolder)
-  const projectId = useAppStore(s => s.projectId)
   const projectName = useAppStore(s => s.projectName)
 
   const [renderFps, setRenderFps] = useState(0)

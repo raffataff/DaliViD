@@ -4,6 +4,7 @@
  */
 
 import { create } from 'zustand'
+import { getAudioEngine } from '../audio/AudioEngine.js'
 
 const useAudioStore = create((set, get) => ({
   // ── FFT Band Values (0.0 – 1.0) ──
@@ -33,6 +34,12 @@ const useAudioStore = create((set, get) => ({
   micEnabled: false,
   latencyOffset: 0, // ms, -500 to +500
 
+  // ── Per-Source Analysis (stems) ──
+  // name (clip filename) → { smoothedBands, bass, mid, treble, rms, beat }.
+  // Fed by AudioEngine's per-source analysers; consumed by splitters whose
+  // upstream AUDIO_INPUT selects that file as its Audio Source.
+  sources: {},
+
   // ── Audio Bindings (for shader params) ──
   bindings: [], // { graphContext, nodeId, paramName, bandIndex, multiplier, offset, invert }
 
@@ -60,6 +67,39 @@ const useAudioStore = create((set, get) => ({
       bass: smoothed[1],
       mid: smoothed[3],
       treble: smoothed[6],
+    })
+  },
+
+  /**
+   * Update all per-source (stem) analyses in one set() per frame.
+   * `results` = { name: { bands: Float32Array(8), isBeat: bool } }.
+   * Applies the same attack/release smoothing and beat decay as the master mix
+   * so stem-driven and mix-driven reactivity feel identical.
+   */
+  updateSources: (results) => {
+    if (!results) return
+    set((state) => {
+      const next = { ...state.sources }
+      for (const name in results) {
+        const { bands, isBeat } = results[name]
+        const prev = next[name]
+        const smoothed = new Float32Array(8)
+        for (let i = 0; i < 8; i++) {
+          const cur = bands[i] || 0
+          const p = prev?.smoothedBands?.[i] || 0
+          const alpha = cur > p ? 0.3 : 0.1
+          smoothed[i] = cur * alpha + p * (1 - alpha)
+        }
+        next[name] = {
+          smoothedBands: smoothed,
+          bass: smoothed[1],
+          mid: smoothed[3],
+          treble: smoothed[6],
+          rms: smoothed[7],
+          beat: isBeat ? 1.0 : (prev?.beat || 0) * 0.85,
+        }
+      }
+      return { sources: next }
     })
   },
 
@@ -100,9 +140,27 @@ const useAudioStore = create((set, get) => ({
   setEngineReady: (ready) => set({ engineReady: ready }),
 
   /**
-   * Toggle microphone.
+   * Toggle microphone. Actually drives the AudioEngine: requests (or releases)
+   * mic access via getUserMedia and connects the stream into the analysis path.
+   * Only flips `micEnabled` if the engine call succeeds. Returns the resulting
+   * enabled state.
    */
-  toggleMic: () => set((state) => ({ micEnabled: !state.micEnabled })),
+  toggleMic: async () => {
+    const next = !get().micEnabled
+    const engine = getAudioEngine()
+    const ok = await engine.enableMic(next)
+    if (!ok) {
+      // Permission denied or engine error — leave state unchanged.
+      return get().micEnabled
+    }
+    set({ micEnabled: next })
+    if (next) {
+      set({ activeSource: 'mic', activeSourceName: 'Microphone' })
+    } else if (get().activeSource === 'mic') {
+      set({ activeSource: 'silence', activeSourceName: 'None' })
+    }
+    return next
+  },
 
   /**
    * Set latency offset.
@@ -167,6 +225,7 @@ const useAudioStore = create((set, get) => ({
       beatCount: 0,
       isBeat: false,
       peakHold: new Float32Array(8),
+      sources: {},
       activeSource: 'silence',
       activeSourceName: 'None',
     })

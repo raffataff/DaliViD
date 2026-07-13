@@ -48,6 +48,25 @@ const AUDIO_AUTOWIRE = {
   PARTICLE_DISPLACE: ['rms'],
 }
 
+// Sample points along a noodle's cubic bezier (same control-point math as
+// Noodle.jsx) — used to hit-test "is this wire under the dragged node?".
+function sampleBezierPoints(from, to, samples = 24) {
+  const dx = Math.abs(to.x - from.x)
+  const cp = Math.max(50, dx * 0.4)
+  const p1 = { x: from.x + cp, y: from.y }
+  const p2 = { x: to.x - cp, y: to.y }
+  const pts = []
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples
+    const mt = 1 - t
+    pts.push({
+      x: mt * mt * mt * from.x + 3 * mt * mt * t * p1.x + 3 * mt * t * t * p2.x + t * t * t * to.x,
+      y: mt * mt * mt * from.y + 3 * mt * mt * t * p1.y + 3 * mt * t * t * p2.y + t * t * t * to.y,
+    })
+  }
+  return pts
+}
+
 export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   const containerRef = useRef(null)
   const graphLevel = useAppStore(s => s.graphLevel)
@@ -61,6 +80,8 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   const exitClipGraph = useAppStore(s => s.exitClipGraph)
   const openMonaco = useAppStore(s => s.openMonaco)
   const enterCompound = useAppStore(s => s.enterCompound)
+  const previewThroughMaster = useAppStore(s => s.previewThroughMaster)
+  const togglePreviewThroughMaster = useAppStore(s => s.togglePreviewThroughMaster)
 
   const masterGraph = useGraphStore(s => s.masterGraph)
   const clipGraphs = useGraphStore(s => s.clipGraphs)
@@ -83,6 +104,11 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   const [searchMenuPos, setSearchMenuPos] = useState({ x: 0, y: 0 })
   const [dragNoodle, setDragNoodle] = useState(null)
   const [dropTarget, setDropTarget] = useState(null)
+  // Ctrl+drag-a-node-over-a-wire auto-insert (Blender-style): the candidate edge
+  // is highlighted live and spliced on release. Ref mirrors state so the mouseup
+  // handler (registered once per drag) always sees the latest target.
+  const [insertTarget, setInsertTarget] = useState(null)
+  const insertTargetRef = useRef(null)
   const [marquee, setMarquee] = useState(null)
   const [showActionMenu, setShowActionMenu] = useState(false)
   const [actionMenuPos, setActionMenuPos] = useState({ x: 0, y: 0 })
@@ -93,6 +119,13 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   const lastPanPos = useRef({ x: 0, y: 0 })
 
   const outputNode = graph.nodes.find(n => n.type === 'OUTPUT' || n.type === 'CLIP_OUTPUT' || n.type === 'EFFECT_OUTPUT')
+  // Active preview tap, but only when it points at a real upstream node. The tap
+  // defaults to the OUTPUT node (= "no override"), which should never read as a
+  // special preview state in the UI.
+  const previewTapId = (graph.tapPointNodeId && graph.tapPointNodeId !== outputNode?.id)
+    ? graph.tapPointNodeId
+    : null
+  const previewTapNode = previewTapId ? graph.nodes.find(n => n.id === previewTapId) : null
   const { sorted } = useMemo(() => topologicalSort(graph.nodes, graph.edges), [graph.nodes, graph.edges])
   const orphanedNodes = useMemo(
     () => outputNode ? findOrphaned(graph.nodes, graph.edges, outputNode.id) : new Set(),
@@ -121,6 +154,26 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
           { name: 'Value B', uniformName: 'value_b', type: 'slider', min: -100, max: 100, step: 0.01, default: 1 },
         ]
       }
+      // ENVELOPE is shaderless (CPU float processor, like MATH): attack/release
+      // smoothing + gate + gain over any float signal wired into it.
+      if (node.type === 'ENVELOPE' && !map[node.id]?.length) {
+        map[node.id] = [
+          { name: 'Attack', uniformName: 'attack', type: 'slider', min: 0.001, max: 1, step: 0.001, default: 0.05 },
+          { name: 'Release', uniformName: 'release', type: 'slider', min: 0.01, max: 2, step: 0.01, default: 0.35 },
+          { name: 'Threshold', uniformName: 'threshold', type: 'slider', min: 0, max: 0.95, step: 0.01, default: 0 },
+          { name: 'Gain', uniformName: 'gain', type: 'slider', min: 0, max: 4, step: 0.05, default: 1 },
+        ]
+      }
+      // TRANSITION_PROGRESS is shaderless (CPU float source). The preview
+      // controls only drive its output while no clip transition is running, so
+      // a transition compound can be authored and watched live in the editor.
+      if (node.type === 'TRANSITION_PROGRESS' && !map[node.id]?.length) {
+        map[node.id] = [
+          { name: 'Auto Preview', uniformName: 'auto_preview', type: 'checkbox', default: true },
+          { name: 'Preview', uniformName: 'preview', type: 'slider', min: 0, max: 1, step: 0.01, default: 0.5 },
+          { name: 'Preview Speed', uniformName: 'preview_speed', type: 'slider', min: 0.05, max: 2, step: 0.05, default: 0.25 },
+        ]
+      }
     }
     return map
   }, [graph.nodes, timelineClips])
@@ -141,9 +194,21 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
 
   const handleWheel = useCallback((e) => {
     e.preventDefault()
-    const delta = e.deltaY > 0 ? 0.92 : 1.08
-    setZoom(prev => Math.min(4, Math.max(0.1, prev * delta)))
-  }, [])
+    const factor = e.deltaY > 0 ? 0.92 : 1.08
+    const next = Math.min(4, Math.max(0.1, zoom * factor))
+    if (next === zoom) return
+    // Zoom around the cursor: keep the graph point under the mouse stationary.
+    const rect = containerRef.current?.getBoundingClientRect()
+    if (rect) {
+      const mx = e.clientX - rect.left
+      const my = e.clientY - rect.top
+      setPan({
+        x: mx - ((mx - pan.x) / zoom) * next,
+        y: my - ((my - pan.y) / zoom) * next,
+      })
+    }
+    setZoom(next)
+  }, [zoom, pan])
 
   useEffect(() => {
     const el = containerRef.current
@@ -215,8 +280,8 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
         // Estimate card height: header(30) + sockets + params
         const paramCount = nodeParamConfigs[node.id]?.length || 0
         const socketCount = Math.max(
-          getNodeSockets(node.type, nodeParamConfigs[node.id] || []).inputs.filter(s => !s.isParam).length,
-          getNodeSockets(node.type, nodeParamConfigs[node.id] || []).outputs.length
+          getNodeSockets(node.type, nodeParamConfigs[node.id] || [], node).inputs.filter(s => !s.isParam).length,
+          getNodeSockets(node.type, nodeParamConfigs[node.id] || [], node).outputs.length
         )
         const nodeBottom = node.position.y + 30 + socketCount * 22 + paramCount * 26 + 40
 
@@ -341,6 +406,15 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       return
     }
 
+    // Preset chain from the menu — instantiate at the cursor and auto-wire its
+    // audio-driven nodes to the active graph's Audio Splitter.
+    if (nodeType.isPreset || nodeType.type === 'PRESET') {
+      const activeGraph = useGraphStore.getState().getActiveGraph(graphLevel, graphClipId)
+      const splitterId = activeGraph?.nodes?.find(n => n.type === 'AUDIO_SPLITTER')?.id || null
+      instantiatePreset(nodeType.presetId, addNode, addEdge, graphLevel, graphClipId, { x, y }, splitterId)
+      return
+    }
+
     const shaderCode = getShaderSource(nodeType.type)
     const paramConfigs = shaderCode ? parseParams(shaderCode) : []
     const defaultParams = getDefaultParams(paramConfigs)
@@ -388,11 +462,21 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     const basePos = { x, y }
 
     if (payload.kind === 'preset') {
-      instantiatePreset(payload.presetId, addNode, addEdge, graphLevel, graphClipId, basePos)
+      // Hand the active graph's Audio Splitter to the preset so its `audioWire`
+      // nodes are auto-connected and reactive on drop.
+      const activeGraph = useGraphStore.getState().getActiveGraph(graphLevel, graphClipId)
+      const splitterId = activeGraph?.nodes?.find(n => n.type === 'AUDIO_SPLITTER')?.id || null
+      instantiatePreset(payload.presetId, addNode, addEdge, graphLevel, graphClipId, basePos, splitterId)
     } else if (payload.kind === 'node') {
       const shaderCode = getShaderSource(payload.nodeType)
       const paramConfigs = shaderCode ? parseParams(shaderCode) : []
       const defaultParams = getDefaultParams(paramConfigs)
+      // An image card dropped from the Media Pool carries its data URL — preload
+      // it onto the new IMAGE_INPUT node so it renders immediately.
+      if (payload.imageSrc) {
+        defaultParams.imageSrc = payload.imageSrc
+        defaultParams.imageName = payload.imageName || payload.name || ''
+      }
       const newId = addNode(graphLevel, graphClipId, {
         type: payload.nodeType, name: payload.name, position: basePos,
         params: defaultParams, shaderCode: payload.nodeType === 'CUSTOM' ? shaderCode : null,
@@ -426,9 +510,8 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   }, [addNode, graphLevel, graphClipId, searchMenuPos, pan, zoom])
 
   // ── Node interactions ──
-  const handleNodeMove = useCallback((nodeId, position) => {
-    updateNode(graphLevel, graphClipId, nodeId, { position })
-  }, [updateNode, graphLevel, graphClipId])
+  // (handleNodeMove / handleNodeMoveEnd are defined after getSocketPos below —
+  // they hit-test wires for the Ctrl+drag auto-insert.)
 
   const handleNodeDelete = useCallback((nodeId) => {
     removeNode(graphLevel, graphClipId, nodeId)
@@ -460,8 +543,14 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   }, [graph.nodes, addNode, graphLevel, graphClipId, selectNode])
 
   const handleSetPreview = useCallback((nodeId) => {
-    setTapPoint(graphLevel, graphClipId, nodeId)
-  }, [setTapPoint, graphLevel, graphClipId])
+    // Toggle semantics (standard "viewer tap"): tapping a node previews its
+    // output; tapping the already-active node — or any OUTPUT node — reverts the
+    // view to the graph's OUTPUT node.
+    const outputId = outputNode?.id ?? null
+    const isOutput = nodeId === outputId
+    const next = (isOutput || graph.tapPointNodeId === nodeId) ? outputId : nodeId
+    setTapPoint(graphLevel, graphClipId, next)
+  }, [outputNode, graph.tapPointNodeId, setTapPoint, graphLevel, graphClipId])
 
   const handleDetachNode = useCallback((nodeId) => {
     const currentGraph = graph
@@ -473,14 +562,14 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       const upstreamNode = currentGraph.nodes.find(n => n.id === upstreamNodeId)
       if (!upstreamNode) continue
       const upParams = nodeParamConfigs[upstreamNodeId] || []
-      const upSockets = getNodeSockets(upstreamNode.type, upParams)
+      const upSockets = getNodeSockets(upstreamNode.type, upParams, upstreamNode)
       const upstreamSocket = upSockets.outputs.find(s => s.id === upstreamSocketId)
       const upstreamType = upstreamSocket?.type || 'texture'
       const compatibleOut = outgoingEdges.find(outE => {
         const downNode = currentGraph.nodes.find(n => n.id === outE.toNode)
         if (!downNode) return false
         const downParams = nodeParamConfigs[outE.toNode] || []
-        const downSockets = getNodeSockets(downNode.type, downParams)
+        const downSockets = getNodeSockets(downNode.type, downParams, downNode)
         const downSocket = downSockets.inputs.find(s => s.id === outE.toSocket)
         const downType = downSocket?.type || 'texture'
         return downType === upstreamType
@@ -509,7 +598,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       return { x, y }
     }
     const params = nodeParamConfigs[nodeId] || []
-    const { inputs, outputs } = getNodeSockets(node.type, params)
+    const { inputs, outputs } = getNodeSockets(node.type, params, node)
     const sockets = socketSide === 'output' ? outputs : inputs
     const fixedSockets = inputs.filter(s => !s.isParam)
     const paramSockets = inputs.filter(s => s.isParam)
@@ -536,6 +625,103 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     const x = socketSide === 'output' ? node.position.x + NODE_WIDTH : node.position.x
     return { x, y }
   }, [graph.nodes, nodeParamConfigs, pan, zoom])
+
+  // ── Ctrl+drag auto-insert (Blender-style) ──
+  // While Ctrl is held during a node drag, find a wire passing under the node
+  // whose data type the node can splice into (a matching input AND output).
+  // Prefers a free input; falls back to the first matching one (addEdge replaces
+  // the old connection on single-accept sockets).
+  const findInsertCandidate = useCallback((nodeId, position) => {
+    const node = graph.nodes.find(n => n.id === nodeId)
+    if (!node || node.locked) return null
+    const params = nodeParamConfigs[nodeId] || []
+    const { inputs, outputs } = getNodeSockets(node.type, params, node)
+    if (inputs.length === 0 || outputs.length === 0) return null
+
+    // Approximate the card's bounding box (same estimate as the marquee).
+    const socketCount = Math.max(inputs.filter(s => !s.isParam).length, outputs.length)
+    const height = 30 + socketCount * 22 + params.length * 26 + 40
+    const box = { left: position.x, right: position.x + NODE_WIDTH, top: position.y, bottom: position.y + height }
+    const cx = position.x + NODE_WIDTH / 2
+    const cy = position.y + height / 2
+
+    // Reject splices that would create a cycle: never target a wire whose
+    // source is downstream of the dragged node (fromNode→node would close a
+    // loop), nor one whose destination is upstream of it (node→toNode would).
+    const downstream = new Set()
+    const upstream = new Set()
+    const downStack = [nodeId]
+    while (downStack.length) {
+      const id = downStack.pop()
+      for (const e of graph.edges) {
+        if (e.fromNode === id && !downstream.has(e.toNode)) { downstream.add(e.toNode); downStack.push(e.toNode) }
+      }
+    }
+    const upStack = [nodeId]
+    while (upStack.length) {
+      const id = upStack.pop()
+      for (const e of graph.edges) {
+        if (e.toNode === id && !upstream.has(e.fromNode)) { upstream.add(e.fromNode); upStack.push(e.fromNode) }
+      }
+    }
+
+    let best = null
+    for (const edge of graph.edges) {
+      if (edge.fromNode === nodeId || edge.toNode === nodeId) continue
+      if (downstream.has(edge.fromNode) || upstream.has(edge.toNode)) continue
+      const fromNode = graph.nodes.find(n => n.id === edge.fromNode)
+      if (!fromNode) continue
+      const fromSockets = getNodeSockets(fromNode.type, nodeParamConfigs[edge.fromNode] || [], fromNode)
+      const dataType = fromSockets.outputs.find(s => s.id === edge.fromSocket)?.type || 'texture'
+
+      const outSocket = outputs.find(s => s.type === dataType)
+      if (!outSocket) continue
+      const inCandidates = inputs.filter(s => s.type === dataType)
+      if (inCandidates.length === 0) continue
+      const inSocket = inCandidates.find(s => !connectedInputsMap[nodeId]?.has(s.id)) || inCandidates[0]
+
+      const from = getSocketPos(edge.fromNode, edge.fromSocket, 'output')
+      const to = getSocketPos(edge.toNode, edge.toSocket, 'input')
+      let minDist = Infinity
+      for (const pt of sampleBezierPoints(from, to)) {
+        if (pt.x >= box.left && pt.x <= box.right && pt.y >= box.top && pt.y <= box.bottom) {
+          minDist = Math.min(minDist, Math.hypot(pt.x - cx, pt.y - cy))
+        }
+      }
+      if (minDist < Infinity && (!best || minDist < best.dist)) {
+        best = { edgeId: edge.id, inputSocketId: inSocket.id, outputSocketId: outSocket.id, dist: minDist }
+      }
+    }
+    return best
+  }, [graph.nodes, graph.edges, nodeParamConfigs, connectedInputsMap, getSocketPos])
+
+  // Only re-render when the highlighted edge changes; keep the ref fresh always.
+  const applyInsertTarget = useCallback((target) => {
+    const prevEdgeId = insertTargetRef.current?.edgeId || null
+    insertTargetRef.current = target
+    if ((target?.edgeId || null) !== prevEdgeId) setInsertTarget(target)
+  }, [])
+
+  const handleNodeMove = useCallback((nodeId, position, e) => {
+    updateNode(graphLevel, graphClipId, nodeId, { position })
+    if (e && (e.ctrlKey || e.metaKey)) {
+      applyInsertTarget(findInsertCandidate(nodeId, position))
+    } else if (insertTargetRef.current) {
+      applyInsertTarget(null)
+    }
+  }, [updateNode, graphLevel, graphClipId, findInsertCandidate, applyInsertTarget])
+
+  const handleNodeMoveEnd = useCallback((nodeId) => {
+    const target = insertTargetRef.current
+    if (!target) return
+    applyInsertTarget(null)
+    const edge = graph.edges.find(e => e.id === target.edgeId)
+    if (!edge) return
+    // Splice: upstream → node input, node output → downstream.
+    removeEdge(graphLevel, graphClipId, edge.id)
+    addEdge(graphLevel, graphClipId, edge.fromNode, edge.fromSocket, nodeId, target.inputSocketId)
+    addEdge(graphLevel, graphClipId, nodeId, target.outputSocketId, edge.toNode, edge.toSocket)
+  }, [graph.edges, removeEdge, addEdge, graphLevel, graphClipId, applyInsertTarget])
 
   const handleSocketDragStart = useCallback((socketInfo) => {
     if (socketInfo.type === 'output') {
@@ -576,9 +762,34 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   }, [dragNoodle, addEdge, graphLevel, graphClipId])
 
   const fitToWindow = useCallback(() => {
-    setZoom(1)
-    setPan({ x: 0, y: 0 })
-  }, [])
+    const rect = containerRef.current?.getBoundingClientRect()
+    if (!rect || graph.nodes.length === 0) {
+      setZoom(1)
+      setPan({ x: 0, y: 0 })
+      return
+    }
+    // Frame every node (with padding) instead of just resetting the view.
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    for (const node of graph.nodes) {
+      const params = nodeParamConfigs[node.id] || []
+      const { inputs, outputs } = getNodeSockets(node.type, params, node)
+      const socketCount = Math.max(inputs.filter(s => !s.isParam).length, outputs.length)
+      const height = 30 + socketCount * 22 + params.length * 26 + 40
+      minX = Math.min(minX, node.position.x)
+      minY = Math.min(minY, node.position.y)
+      maxX = Math.max(maxX, node.position.x + NODE_WIDTH)
+      maxY = Math.max(maxY, node.position.y + height)
+    }
+    const PAD = 60
+    const w = maxX - minX + PAD * 2
+    const h = maxY - minY + PAD * 2
+    const z = Math.min(1.5, Math.max(0.1, Math.min(rect.width / w, rect.height / h)))
+    setZoom(z)
+    setPan({
+      x: rect.width / 2 - ((minX + maxX) / 2) * z,
+      y: rect.height / 2 - ((minY + maxY) / 2) * z,
+    })
+  }, [graph.nodes, nodeParamConfigs])
 
   const handleCanvasClick = useCallback((e) => {
     if (e.target === containerRef.current?.querySelector('.node-canvas__grid')) {
@@ -667,6 +878,30 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
           </button>
         )}
         <div style={{ flex: 1 }} />
+        {graphLevel === 'clip' && (
+          <button
+            className={`node-canvas__masterfx-toggle ${previewThroughMaster ? 'node-canvas__masterfx-toggle--on' : ''}`}
+            onClick={togglePreviewThroughMaster}
+            data-tooltip={previewThroughMaster
+              ? 'Preview is routed through the Master FX chain — click to show the raw, isolated clip'
+              : 'Preview shows the clip in isolation — click to apply the Master FX chain'}
+          >
+            Master FX: {previewThroughMaster ? 'On' : 'Off'}
+          </button>
+        )}
+        {previewTapId && (
+          <button
+            className="node-canvas__preview-reset"
+            onClick={() => setTapPoint(graphLevel, graphClipId, outputNode?.id ?? null)}
+            data-tooltip="Stop previewing this node — show the Output again"
+          >
+            <span className="node-canvas__preview-reset-eye">👁</span>
+            <span className="node-canvas__preview-reset-label">
+              Previewing: {previewTapNode?.name || previewTapNode?.type || 'node'}
+            </span>
+            <span className="node-canvas__preview-reset-x">✕</span>
+          </button>
+        )}
         <button
           className={`panel__header-btn ${showShaderGenerator ? 'panel__header-btn--active' : ''}`}
           onClick={() => setShowShaderGenerator(!showShaderGenerator)}
@@ -715,10 +950,10 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
                 const to = getSocketPos(edge.toNode, edge.toSocket, 'input')
                 const fromNode = graph.nodes.find(n => n.id === edge.fromNode)
                 const fromParams = nodeParamConfigs[edge.fromNode] || []
-                const fromSockets = fromNode ? getNodeSockets(fromNode.type, fromParams) : { outputs: [] }
+                const fromSockets = fromNode ? getNodeSockets(fromNode.type, fromParams, fromNode) : { outputs: [] }
                 const fromSocket = fromSockets.outputs.find(s => s.id === edge.fromSocket)
                 const dataType = fromSocket?.type || 'texture'
-                return <Noodle key={edge.id} id={edge.id} fromX={from.x} fromY={from.y} toX={to.x} toY={to.y} dataType={dataType} onDelete={handleEdgeDelete} />
+                return <Noodle key={edge.id} id={edge.id} fromX={from.x} fromY={from.y} toX={to.x} toY={to.y} dataType={dataType} onDelete={handleEdgeDelete} insertHighlight={insertTarget?.edgeId === edge.id} />
               })}
               {dragNoodle && <NoodleDrag fromX={dragNoodle.fromX} fromY={dragNoodle.fromY} toX={dragNoodle.toX} toY={dragNoodle.toY} dataType={dragNoodle.dataType} />}
             </svg>
@@ -741,7 +976,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
                   node={node}
                   selected={selectedNodeId === node.id}
                   isMultiSelected={isMultiSelected}
-                  isPreviewTap={graph.tapPointNodeId === node.id}
+                  isPreviewTap={previewTapId === node.id}
                   isOrphaned={orphanedNodes.has(node.id)}
                   executionOrder={execIdx >= 0 ? execIdx : null}
                   paramConfigs={nodeParamConfigs[node.id] || []}
@@ -751,6 +986,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
                   onSelect={selectNode}
                   onDelete={handleNodeDelete}
                   onMove={handleNodeMove}
+                  onMoveEnd={handleNodeMoveEnd}
                   onOpenMonaco={openMonaco}
                   onSetPreview={handleSetPreview}
                   onToggleBypass={(id) => {
@@ -774,6 +1010,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
             <div className="node-canvas__empty-hint">
               <p>Right-click to add nodes</p>
               <p className="text-muted">Drag effects from the Media Pool</p>
+              <p className="text-muted">Ctrl-drag a node onto a wire to insert it</p>
             </div>
           )}
 

@@ -53,33 +53,64 @@ function audioDriverValues(renderer) {
  * Apply gated audio drivers to a node's param set: every band defaults to 0.0,
  * and any band wired into the node's Audio Drivers socket gets its live value.
  * Unused uniforms are skipped at upload time, so this is safe for all nodes.
+ *
+ * Two wiring shapes are supported, so the same resolver works at the top level
+ * and inside a compound:
+ *   • Direct from an AUDIO_SPLITTER — the edge's fromSocket IS the band name.
+ *   • From a compound EFFECT_INPUT terminal — the terminal node carries an
+ *     `audioBand` tag; `nodeLookup` (id → node) is used to read it.
  */
-function applyAudioDrivers(customParams, nodeId, edges, driverVals) {
+function applyAudioDrivers(customParams, nodeId, edges, driverValsFor, nodeLookup = null) {
   for (const band of AUDIO_DRIVER_BANDS) customParams['u_' + band] = 0
-  if (!edges) return
+  if (!edges || !driverValsFor) return
   for (const e of edges) {
-    if (e.toNode === nodeId && e.toSocket === AUDIO_DRIVERS_SOCKET && driverVals[e.fromSocket] !== undefined) {
-      customParams['u_' + e.fromSocket] = driverVals[e.fromSocket]
-    }
+    if (e.toNode !== nodeId || e.toSocket !== AUDIO_DRIVERS_SOCKET) continue
+    // Per-edge value set: resolved from the producing splitter, so a splitter
+    // fed by a stem AUDIO_INPUT drives with that stem's bands (see
+    // executeGraphDAG's driverValsFor); a flat map still works via wrapping.
+    const driverVals = typeof driverValsFor === 'function' ? driverValsFor(e.fromNode) : driverValsFor
+    const band = (driverVals[e.fromSocket] !== undefined)
+      ? e.fromSocket
+      : nodeLookup?.[e.fromNode]?.audioBand
+    if (band && driverVals[band] !== undefined) customParams['u_' + band] = driverVals[band]
   }
 }
 
 /**
- * Same as applyAudioDrivers but for a node INSIDE a compound. The audio_drivers
- * edges there come from EFFECT_INPUT terminals (not the splitter directly), so
- * the band is read from the terminal's recorded audioBand tag.
+ * Resolve an AUDIO_INPUT node's `audioSource` param to a stem filename, or
+ * null for the timeline mix. Select controls store the OPTION INDEX (0 =
+ * 'Timeline', 1+ = nth audio file in the same ordered list the dropdown
+ * builds — unique audio-clip filenames in timeline order), but older values
+ * may be the string itself; both shapes are accepted.
  */
-function applyCompoundDrivers(customParams, nodeId, subGraph, driverVals) {
-  for (const band of AUDIO_DRIVER_BANDS) customParams['u_' + band] = 0
-  if (!subGraph || !subGraph.edges || !driverVals) return
-  for (const e of subGraph.edges) {
-    if (e.toNode !== nodeId || e.toSocket !== AUDIO_DRIVERS_SOCKET) continue
-    const src = subGraph.nodes.find(n => n.id === e.fromNode)
-    // band from a tagged EFFECT_INPUT terminal, or directly if a splitter is
-    // inside the compound (fromSocket is the band name).
-    const band = src?.audioBand || e.fromSocket
-    if (driverVals[band] !== undefined) customParams['u_' + band] = driverVals[band]
+export function resolveAudioSourceName(value, renderer) {
+  if (value == null || value === 0 || value === 'Timeline') return null
+  if (typeof value === 'string') return value
+  const clips = renderer._getTimelineStore?.()?.clips || []
+  const names = [...new Set(clips.filter(c => c.fileType === 'audio').map(c => c.filename))]
+  return names[value - 1] ?? null
+}
+
+/**
+ * The value a TRANSITION_PROGRESS node yields this frame.
+ * A live transition (renderer sets standardState.transitionProgress during the
+ * overlap composite) always wins. Otherwise the node's Preview params apply:
+ * auto_preview loops a triangle wave (0→1→0) at preview_speed cycles/sec so the
+ * transition can be watched in the editor; unchecked, the static Preview slider
+ * value is used. `src` may be a compiled chain entry or a raw graph node.
+ */
+function resolveTransitionProgress(src, standardState, liveNodes = null, nodeLookup = null) {
+  if (standardState && standardState.transitionProgress != null) {
+    return Math.max(0, Math.min(1, standardState.transitionProgress))
   }
+  const id = src.nodeId ?? src.id
+  const p = liveNodes?.[id]?.params ?? nodeLookup?.[id]?.params ?? src.params ?? {}
+  if (p.auto_preview ?? true) {
+    const speed = p.preview_speed ?? 0.25
+    const t = (standardState?.time || 0) * speed
+    return 1.0 - Math.abs(2.0 * (t - Math.floor(t)) - 1.0) // triangle 0→1→0
+  }
+  return Math.max(0, Math.min(1, p.preview ?? 0.5))
 }
 
 /**
@@ -130,14 +161,18 @@ export function compileGraph(gl, graph) {
     const node = nodes.find(n => n.id === nodeId)
     if (!node) continue
 
-    // Source/input nodes — no shader, just mark as passthrough
-    if (['CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'EFFECT_INPUT'].includes(node.type)) {
-      chain.push({ nodeId: node.id, type: node.type, program: null, uniformLocations: {}, params: node.params || {}, bypassed: node.bypassed || false, name: node.name, isSource: true })
+    // Source/input nodes — no shader here, just mark as passthrough. IMAGE_INPUT
+    // is a source too, but unlike the others it produces its OWN texture (drawn
+    // into a per-node FBO by the renderer's image pass), not the chain input.
+    if (['CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'EFFECT_INPUT', 'IMAGE_INPUT'].includes(node.type)) {
+      chain.push({ nodeId: node.id, type: node.type, program: null, uniformLocations: {}, params: node.params || {}, bypassed: node.bypassed || false, name: node.name, isSource: true, isImage: node.type === 'IMAGE_INPUT' })
       continue
     }
 
-    // Audio nodes — no shader, data-routing only
-    if (['AUDIO_INPUT', 'AUDIO_SPLITTER', 'MATH'].includes(node.type)) {
+    // Audio / data nodes — no shader, data-routing only (TRANSITION_PROGRESS is
+    // a CPU float source consumed by the executor's progress injection;
+    // ENVELOPE is evaluated CPU-side in resolveFloatConnections).
+    if (['AUDIO_INPUT', 'AUDIO_SPLITTER', 'MATH', 'TRANSITION_PROGRESS', 'ENVELOPE'].includes(node.type)) {
       chain.push({ nodeId: node.id, type: node.type, program: null, uniformLocations: {}, params: node.params || {}, bypassed: node.bypassed || false, name: node.name, isAudio: true })
       continue
     }
@@ -230,11 +265,53 @@ function blitOrScreen(renderer, srcId, dstId) {
  *   snapshot baked into the chain.
  * @param {Array|null} edges — graph edges; required for DAG evaluation.
  */
-export function executeChain(renderer, chain, inputFBOId, outputFBOId, standardState, audioBindings = {}, liveNodes = null, edges = null) {
+export function executeChain(renderer, chain, inputFBOId, outputFBOId, standardState, audioBindings = {}, liveNodes = null, edges = null, tapPointNodeId = null) {
   if (USE_DAG && edges) {
-    return executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standardState, audioBindings, liveNodes)
+    return executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standardState, audioBindings, liveNodes, tapPointNodeId)
   }
   return executeChainLinear(renderer, chain, inputFBOId, outputFBOId, standardState, audioBindings, liveNodes, edges)
+}
+
+/**
+ * Execute a compound library entry's sub-graph as a CLIP TRANSITION.
+ * The sub-graph's first two non-audio EFFECT_INPUT terminals are bound to the
+ * outgoing (from) and incoming (to) frames, and standardState carries
+ * transitionProgress so any TRANSITION_PROGRESS node inside yields the live
+ * 0 → 1 overlap progress. Runs through the same DAG evaluator as everything
+ * else, so inner compounds, image sources and multi-input effects all work.
+ *
+ * @param {object} renderer
+ * @param {Array}  subChain  — compileGraph(entry.subGraph).chain
+ * @param {object} subGraph  — the library entry's subGraph ({ nodes, edges })
+ * @param {string} fromFBOId — outgoing side (accumulator incl. previous clip)
+ * @param {string} toFBOId   — incoming clip's finished frame
+ * @param {object} standardState
+ * @param {number} progress  — 0..1 across the overlap window
+ * @param {string} scopeId   — FBO namespace (per clip, e.g. `tr~<clipId>~`)
+ * @param {object|null} liveNodes — optional { nodeId → { params } } overrides
+ *   (used to apply the clip's exposed-param values without mutating the entry)
+ * @returns {string|null} the FBO holding the transition result (by reference),
+ *   or null when the graph is empty / has no resolvable output.
+ */
+export function executeTransitionCompound(renderer, subChain, subGraph, fromFBOId, toFBOId, standardState, progress, scopeId, liveNodes = null) {
+  if (!subChain || subChain.length === 0 || !subGraph) return null
+
+  // Bind FROM → 1st image terminal, TO → 2nd (same input_<i> ordering the
+  // compound's sockets use). Audio-band terminals keep their tagged routing.
+  const inTerms = (subGraph.nodes || []).filter(t => t.type === 'EFFECT_INPUT' && !t.audioBand)
+  const terminalMap = {}
+  if (inTerms[0]) terminalMap[inTerms[0].id] = fromFBOId
+  if (inTerms[1]) terminalMap[inTerms[1].id] = toFBOId
+
+  const state = { ...standardState, transitionProgress: Math.max(0, Math.min(1, progress)) }
+  const outResolved = {}
+  executeGraphDAG(
+    renderer, subChain, subGraph.edges || [], fromFBOId, null,
+    state, {}, liveNodes, null, scopeId, buildNodeMap(subGraph), terminalMap, outResolved
+  )
+
+  const outTerm = (subGraph.nodes || []).find(t => t.type === 'EFFECT_OUTPUT')
+  return (outTerm && outResolved[outTerm.id]) || null
 }
 
 /**
@@ -244,11 +321,13 @@ export function executeChain(renderer, chain, inputFBOId, outputFBOId, standardS
  * blend). Nodes are walked in topological order (compileGraph already sorts
  * them), so a producer's output FBO is always ready before its consumer runs.
  */
-function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standardState, audioBindings, liveNodes) {
+function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standardState, audioBindings, liveNodes, tapPointNodeId = null, scopeId = '', nodeLookup = null, terminalInputs = null, outputResolved = null) {
   const { fbos } = renderer
 
   if (!chain || chain.length === 0) {
-    blitOrScreen(renderer, inputFBOId, outputFBOId)
+    // Compound context (outputResolved) routes outputs by reference; an empty
+    // sub-chain contributes nothing, so the parent falls back to its primary input.
+    if (!outputResolved) blitOrScreen(renderer, inputFBOId, outputFBOId)
     return
   }
 
@@ -258,9 +337,44 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
   // Only texture-carrying edges matter for routing pixels.
   const texEdges = (edges || []).filter(e => e.toSocket in TEXTURE_INPUT_SOCKETS)
 
-  const floatOverrides = resolveFloatConnections(renderer)
-  const driverVals = audioDriverValues(renderer)
-  const nodeOutput = {} // nodeId → FBO id holding its output this frame
+  // Float wiring (splitter bands / MATH / ENVELOPE → param sockets) is
+  // resolved against THIS graph's nodes and edges — live params preferred —
+  // so it works while executing any graph, at any compound depth.
+  const floatNodes = chain.map(n => ({
+    id: n.nodeId,
+    type: n.type,
+    params: liveNodes?.[n.nodeId]?.params ?? nodeLookup?.[n.nodeId]?.params ?? n.params,
+  }))
+  const floatOverrides = resolveFloatConnections(renderer, floatNodes, edges || [])
+
+  // Audio driver values per producing splitter: master mix by default, or a
+  // stem's analysis when the splitter's upstream AUDIO_INPUT names a file.
+  const masterDriverVals = audioDriverValues(renderer)
+  const audioStoreState = renderer._getAudioStore?.()
+  const driverValsCache = new Map()
+  const driverVals = (fromNodeId) => {
+    if (driverValsCache.has(fromNodeId)) return driverValsCache.get(fromNodeId)
+    let vals = masterDriverVals
+    const src = byId[fromNodeId] ?? nodeLookup?.[fromNodeId]
+    if (src && src.type === 'AUDIO_SPLITTER') {
+      const inEdge = (edges || []).find(e => e.toNode === fromNodeId && e.toSocket === 'audio_in')
+      const feeder = inEdge && (nodeLookup?.[inEdge.fromNode] ?? byId[inEdge.fromNode])
+      const name = feeder?.type === 'AUDIO_INPUT' ? resolveAudioSourceName(feeder.params?.audioSource, renderer) : null
+      const s = name ? audioStoreState?.sources?.[name] : null
+      if (s) {
+        const b = s.smoothedBands || []
+        vals = {
+          sub_bass: b[0] || 0, bass: s.bass || 0, low_mid: b[2] || 0, mid: s.mid || 0,
+          high_mid: b[4] || 0, presence: b[5] || 0, treble: s.treble || 0, rms: s.rms || 0,
+        }
+      }
+    }
+    driverValsCache.set(fromNodeId, vals)
+    return vals
+  }
+  const nodeOutput = {} // nodeId → FBO id holding its (default) output this frame
+  // nodeId → { outputSocketId → FBO id } for multi-output producers (compounds).
+  const nodeOutputBySocket = {}
 
   const ensureFBO = (id) => {
     if (!fbos.has(id)) fbos.create(id, renderer.width, renderer.height)
@@ -268,15 +382,51 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     return id
   }
 
+  // Node-keyed FBOs are namespaced by scopeId so a compound's inner nodes — and
+  // duplicate instances of the same compound — never collide with each other or
+  // with the top-level graph. scopeId is '' at the top level, so keys (and the
+  // cleanup in releaseClipResources) are unchanged there.
+  const nFBO = (nodeId) => `__n_${scopeId}${nodeId}`
+  // The FBO an IMAGE_INPUT source draws into (its own image, not the chain input).
+  const imageFBO = (nodeId) => `__img_${scopeId}${nodeId}`
+
+  // ── Image source pre-pass ──
+  // IMAGE_INPUT nodes are skipped in the main loop (they're sources), so render
+  // each one's image into its dedicated FBO up front. resolveProducer then hands
+  // that FBO to whatever consumes the node, exactly like the composited video
+  // feeds an ordinary source.
+  for (const n of chain) {
+    if (!n.isImage) continue
+    const fboId = ensureFBO(imageFBO(n.nodeId))
+    const liveParams = liveNodes?.[n.nodeId]?.params ?? n.params
+    const cp = normalizeParams(liveParams)
+    const ov = floatOverrides[n.nodeId]
+    if (ov) Object.assign(cp, ov)
+    renderer.renderImageNode(n.nodeId, fboId, standardState, cp)
+  }
+
   // The FBO produced by a node, following bypass/compile-error passthrough.
-  const resolveProducer = (nodeId, guard) => {
+  // fromSocket identifies WHICH output is wanted — relevant for multi-output
+  // producers (compounds expose output_<i>); regular nodes have a single output.
+  const resolveProducer = (nodeId, guard, fromSocket = null) => {
     if (guard.has(nodeId)) return inputFBOId
     guard.add(nodeId)
     const src = byId[nodeId]
-    if (!src || src.isSource) return inputFBOId
+    if (src && src.isImage) return imageFBO(nodeId)
+    if (!src || src.isSource) {
+      // Inside a compound, an EFFECT_INPUT terminal maps to the FBO wired to the
+      // matching outer input socket (terminalInputs). Otherwise a source resolves
+      // to the chain input (the compound's primary input, or the composited video).
+      if (terminalInputs && terminalInputs[nodeId] != null) return terminalInputs[nodeId]
+      return inputFBOId
+    }
     if (src.bypassed || src.compileError) {
       return resolveSocket(nodeId, 'input', guard) ?? inputFBOId
     }
+    // Multi-output producer: route the specific output socket to its own FBO.
+    // (Unknown/legacy fromSocket falls back to the default output below.)
+    const bySocket = nodeOutputBySocket[nodeId]
+    if (fromSocket && bySocket && bySocket[fromSocket] != null) return bySocket[fromSocket]
     return nodeOutput[nodeId] ?? inputFBOId
   }
 
@@ -284,7 +434,7 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
   const resolveSocket = (nodeId, socket, guard = new Set()) => {
     const edge = texEdges.find(e => e.toNode === nodeId && e.toSocket === socket)
     if (!edge) return null
-    return resolveProducer(edge.fromNode, guard)
+    return resolveProducer(edge.fromNode, guard, edge.fromSocket)
   }
 
   let lastProducedFBO = null
@@ -300,14 +450,44 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     const primaryInput = resolveSocket(node.nodeId, 'input') ?? inputFBOId
 
     if (node.isCompound) {
-      const outId = ensureFBO(`__n_${node.nodeId}`)
-      const compoundPPId = `__compound_pp_${node.nodeId}`
-      let compoundPP = fbos.getPingPong(compoundPPId)
-      if (!compoundPP) compoundPP = fbos.createPingPong(compoundPPId, renderer.width, renderer.height)
-      else fbos.resizePingPong(compoundPPId, renderer.width, renderer.height)
-      executeSubChain(renderer, node.subChain, primaryInput, outId, standardState, compoundPPId, compoundPP, node.compoundNode?.subGraph, driverVals)
-      nodeOutput[node.nodeId] = outId
-      lastProducedFBO = outId
+      const sub = node.compoundNode?.subGraph
+      // Map each external input (input_<i>) to its producer FBO, keyed by the
+      // inner EFFECT_INPUT terminal it feeds. This makes a mid-chain compound read
+      // its upstream producer (not the global chain input) and routes true
+      // multi-input compounds. The i-th EFFECT_INPUT terminal (in sub-graph order)
+      // corresponds to socket input_<i>, matching createCompound/expandCompound.
+      // Audio-band terminals are driven via applyAudioDrivers, so they're skipped.
+      const terminalMap = {}
+      const inTerms = (sub?.nodes || []).filter(t => t.type === 'EFFECT_INPUT')
+      for (let k = 0; k < inTerms.length; k++) {
+        if (inTerms[k].audioBand) continue
+        const inEdge = (edges || []).find(e => e.toNode === node.nodeId && e.toSocket === `input_${k}`)
+        if (inEdge) terminalMap[inTerms[k].id] = resolveProducer(inEdge.fromNode, new Set(), inEdge.fromSocket)
+      }
+      // Evaluate the compound's sub-graph with the SAME DAG evaluator, so inner
+      // image sources, multi-input effects and branching all "just work". Inner
+      // FBOs are namespaced under this compound's id (plus any enclosing scope).
+      // Terminals not in terminalMap fall back to primaryInput; buildNodeMap(sub)
+      // lets each terminal resolve its tagged audio band. outResolved is filled
+      // with the FBO feeding each EFFECT_OUTPUT terminal (by reference — no blit).
+      const outResolved = {}
+      executeGraphDAG(
+        renderer, node.subChain, sub?.edges || [], primaryInput, null,
+        standardState, {}, null, null, `${scopeId}${node.nodeId}~`, buildNodeMap(sub), terminalMap, outResolved
+      )
+      // Route each output socket (output_<i>) to the inner FBO feeding the matching
+      // EFFECT_OUTPUT terminal, so downstream consumers of a multi-output compound
+      // each read the correct output (resolved by the consuming edge's fromSocket).
+      const outTerms = (sub?.nodes || []).filter(t => t.type === 'EFFECT_OUTPUT')
+      const socketFBO = {}
+      for (let k = 0; k < outTerms.length; k++) {
+        const fbo = outResolved[outTerms[k].id]
+        if (fbo) socketFBO[`output_${k}`] = fbo
+      }
+      const defaultFBO = socketFBO['output_0'] ?? Object.values(socketFBO)[0] ?? primaryInput
+      nodeOutput[node.nodeId] = defaultFBO
+      nodeOutputBySocket[node.nodeId] = socketFBO
+      lastProducedFBO = defaultFBO
       continue
     }
 
@@ -322,8 +502,26 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     const nodeOverrides = floatOverrides[node.nodeId]
     if (nodeOverrides) Object.assign(customParams, nodeOverrides)
 
+    // Transition progress: any param socket wired from a TRANSITION_PROGRESS
+    // node is driven by the live progress value. During a clip transition the
+    // renderer sets standardState.transitionProgress (0 → 1 over the overlap);
+    // otherwise the progress node's own Preview params drive it, so a
+    // transition compound can be authored and watched right in the editor.
+    // Resolved per recursion level (each level has its own chain/edges), so it
+    // works at the top level and at any compound depth — unlike
+    // resolveFloatConnections, which only sees the top-level graph.
+    if (edges) {
+      for (const e of edges) {
+        if (e.toNode !== node.nodeId) continue
+        const src = byId[e.fromNode] ?? nodeLookup?.[e.fromNode]
+        if (!src || src.type !== 'TRANSITION_PROGRESS') continue
+        customParams[e.toSocket] = resolveTransitionProgress(src, standardState, liveNodes, nodeLookup)
+      }
+    }
+
     // Gated audio drivers: 0 unless wired into this node's Audio Drivers socket.
-    applyAudioDrivers(customParams, node.nodeId, edges, driverVals)
+    // nodeLookup lets a compound's EFFECT_INPUT terminal resolve its tagged band.
+    applyAudioDrivers(customParams, node.nodeId, edges, driverVals, nodeLookup)
 
     // Secondary texture inputs (input_b, disp_map). Fall back to the primary
     // input when nothing is wired, so a lone multi-input node stays well-defined.
@@ -341,7 +539,7 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     const isFeedback = node.uniformLocations.u_prev_frame !== undefined
     let outId
     if (isFeedback) {
-      const ppId = `__npp_${node.nodeId}`
+      const ppId = `__npp_${scopeId}${node.nodeId}`
       let pp = fbos.getPingPong(ppId)
       if (!pp) pp = fbos.createPingPong(ppId, renderer.width, renderer.height)
       else fbos.resizePingPong(ppId, renderer.width, renderer.height)
@@ -350,7 +548,7 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
       renderer.executePass(node, primaryInput, outId, standardState, customParams, prevFrameFBOId, extraTextures)
       pp.swap() // current now points at the buffer we just wrote
     } else {
-      outId = ensureFBO(`__n_${node.nodeId}`)
+      outId = ensureFBO(nFBO(node.nodeId))
       renderer.executePass(node, primaryInput, outId, standardState, customParams, null, extraTextures)
     }
 
@@ -358,9 +556,28 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     lastProducedFBO = outId
   }
 
-  // Final image = whatever feeds the OUTPUT node, else the last node, else input.
+  // Final image. A preview "tap point" (set via a node's Preview button) wins when
+  // it points at a real, non-output node: we show that node's own output so you can
+  // solo any stage of the graph. resolveProducer follows bypass/compile-error/source
+  // passthrough, so the tap is well-defined even on a skipped node. With no tap (or
+  // the tap pointing at OUTPUT) we fall back to whatever feeds the OUTPUT node, then
+  // the last produced node, then the raw input.
+  // Compound context: record the FBO feeding EACH EFFECT_OUTPUT terminal so the
+  // parent can route every output socket independently (by reference — no blit).
+  if (outputResolved) {
+    for (const n of chain) {
+      if (!n.isOutput) continue
+      outputResolved[n.nodeId] = resolveSocket(n.nodeId, 'input') ?? lastProducedFBO ?? inputFBOId
+    }
+    return
+  }
+
   const outputNode = chain.find(n => n.isOutput)
-  let finalFBO = outputNode ? resolveSocket(outputNode.nodeId, 'input') : null
+  let finalFBO = null
+  if (tapPointNodeId && tapPointNodeId !== outputNode?.nodeId && byId[tapPointNodeId]) {
+    finalFBO = resolveProducer(tapPointNodeId, new Set())
+  }
+  if (!finalFBO) finalFBO = outputNode ? resolveSocket(outputNode.nodeId, 'input') : null
   if (!finalFBO) finalFBO = lastProducedFBO ?? inputFBOId
 
   blitOrScreen(renderer, finalFBO, outputFBOId)
@@ -434,17 +651,10 @@ function executeChainLinear(renderer, chain, inputFBOId, outputFBOId, standardSt
     }
 
     if (node.isCompound) {
-      // Execute compound sub-chain
-      const compoundPPId = `__compound_pp_${node.nodeId}`
-      let compoundPP = fbos.getPingPong(compoundPPId)
-      if (!compoundPP) {
-        compoundPP = fbos.createPingPong(compoundPPId, renderer.width, renderer.height)
-      } else {
-        fbos.resizePingPong(compoundPPId, renderer.width, renderer.height)
-      }
-
-      // Execute sub-chain through its own ping-pong
-      executeSubChain(renderer, node.subChain, currentInputId, targetFBOId, standardState, compoundPPId, compoundPP, node.compoundNode?.subGraph, driverVals)
+      // Evaluate the compound's sub-graph with the DAG evaluator (same as the
+      // primary path), so inner image sources and multi-input effects work.
+      const sub = node.compoundNode?.subGraph
+      executeGraphDAG(renderer, node.subChain, sub?.edges || [], currentInputId, targetFBOId, standardState, {}, null, null, `${node.nodeId}~`, buildNodeMap(sub))
     } else {
       // Regular effect node — prefer live params over the compile-time snapshot
       const liveParams = liveNodes?.[node.nodeId]?.params ?? node.params
@@ -501,82 +711,51 @@ function executeChainLinear(renderer, chain, inputFBOId, outputFBOId, standardSt
   }
 }
 
+// Per-node envelope-follower state (smoothed value + last timestamp). Module-
+// level so it persists across frames; entries are tiny and keyed by node id.
+const _envelopeState = new Map()
+
 /**
- * Execute a compound sub-chain through its own ping-pong FBO context.
+ * Evaluate an ENVELOPE node: classic attack/release follower over its input,
+ * then threshold gate (renormalized) and gain. `now` is seconds — the export's
+ * frame-locked time when active, so envelopes behave identically offline.
  */
-function executeSubChain(renderer, subChain, inputFBOId, outputFBOId, standardState, ppId, pp, subGraph = null, driverVals = null) {
-  const fbos = renderer.fbos
-  const gl = renderer.gl
-  const effectNodes = subChain.filter(n =>
-    n.program && !n.bypassed && !n.compileError && !n.isSource && !n.isOutput
-  )
+function evaluateEnvelope(node, input, now) {
+  const p = node.params || {}
+  const attack = Math.max(0.001, p.attack ?? 0.05)
+  const release = Math.max(0.001, p.release ?? 0.35)
+  const threshold = Math.min(0.99, Math.max(0, p.threshold ?? 0))
+  const gain = p.gain ?? 1
 
-  if (effectNodes.length === 0) {
-    if (inputFBOId && outputFBOId) {
-      fbos.blit(inputFBOId, outputFBOId, renderer.width, renderer.height)
-    }
-    return
+  let st = _envelopeState.get(node.id)
+  if (!st) {
+    st = { value: 0, t: now }
+    _envelopeState.set(node.id, st)
   }
+  // dt clamped so tab-switches or export time-jumps can't blow up the smoothing.
+  // Repeat calls within one frame see dt ≈ 0, so multiple resolve passes per
+  // frame (top level + DOM display) don't double-advance the envelope.
+  const dt = Math.min(Math.max(now - st.t, 0), 0.25)
+  st.t = now
 
-  let currentInputId = inputFBOId
+  const x = Math.max(0, input)
+  const tau = x > st.value ? attack : release
+  st.value += (x - st.value) * (1 - Math.exp(-dt / tau))
 
-  for (let i = 0; i < effectNodes.length; i++) {
-    const node = effectNodes[i]
-    const isLast = (i === effectNodes.length - 1)
-
-    let targetFBOId
-    if (isLast && outputFBOId) {
-      targetFBOId = outputFBOId
-    } else if (isLast) {
-      targetFBOId = `${ppId}_${pp.current}`
-    } else {
-      targetFBOId = `${ppId}_${pp.current}`
-    }
-
-    const customParams = normalizeParams(node.params)
-    // Audio drivers for compounded effects (gated by the inner audio_drivers wiring).
-    applyCompoundDrivers(customParams, node.nodeId, subGraph, driverVals)
-
-    let prevFrameFBOId = null
-    if (node.uniformLocations.u_prev_frame !== undefined) {
-      const feedbackPPId = `__fb_sub_${node.nodeId}`
-      let feedbackPP = fbos.getPingPong(feedbackPPId)
-      if (!feedbackPP) {
-        feedbackPP = fbos.createPingPong(feedbackPPId, renderer.width, renderer.height)
-      }
-      prevFrameFBOId = `${feedbackPPId}_${feedbackPP.current}`
-    }
-
-    renderer.executePass(node, currentInputId, targetFBOId, standardState, customParams, prevFrameFBOId)
-
-    if (node.uniformLocations.u_prev_frame !== undefined) {
-      const feedbackPPId = `__fb_sub_${node.nodeId}`
-      const feedbackPP = fbos.getPingPong(feedbackPPId)
-      if (feedbackPP) {
-        fbos.blit(targetFBOId, `${feedbackPPId}_${1 - feedbackPP.current}`, renderer.width, renderer.height)
-        feedbackPP.swap()
-      }
-    }
-
-    currentInputId = targetFBOId
-    if (!isLast) pp.swap()
-  }
-
-  if (!outputFBOId && currentInputId) {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-    gl.viewport(0, 0, renderer.width, renderer.height)
-    gl.useProgram(renderer.passthroughProgram.program)
-    fbos.bindTexture(currentInputId, 0)
-    const loc = renderer.passthroughProgram.uniformLocations.u_texture
-    if (loc != null) gl.uniform1i(loc, 0)
-    renderer.drawQuad()
-  }
+  return Math.max(0, (st.value - threshold) / Math.max(1e-6, 1 - threshold)) * gain
 }
 
 /**
- * Resolve float connections in a graph.
+ * Resolve float connections in a graph (Audio Splitter bands, MATH chains and
+ * ENVELOPE followers wired into param sockets).
+ *
+ * When `nodesArg`/`edgesArg` are provided, THAT graph is evaluated — the DAG
+ * executor passes its own chain and edges, so float wiring works in every
+ * executing graph (master, each clip, compound interiors), not just the one
+ * open in the editor. Without them it falls back to the currently-viewed
+ * graph, which is what the DOM param-display pass wants.
  */
-export function resolveFloatConnections(renderer) {
+export function resolveFloatConnections(renderer, nodesArg = null, edgesArg = null) {
   const overrides = {}
   const graphStore = renderer._getGraphStore?.()
   if (!graphStore) return overrides
@@ -584,9 +763,14 @@ export function resolveFloatConnections(renderer) {
   const audioStore = renderer._getAudioStore?.()
   if (!audioStore) return overrides
 
-  const graphLevel = appStore?.graphLevel || 'master'
-  const graphClipId = appStore?.graphClipId || null
-  const graph = graphLevel === 'master' ? graphStore.masterGraph : graphStore.clipGraphs?.[graphClipId]
+  let graph
+  if (nodesArg && edgesArg) {
+    graph = { nodes: nodesArg, edges: edgesArg }
+  } else {
+    const graphLevel = appStore?.graphLevel || 'master'
+    const graphClipId = appStore?.graphClipId || null
+    graph = graphLevel === 'master' ? graphStore.masterGraph : graphStore.clipGraphs?.[graphClipId]
+  }
   if (!graph) return overrides
 
   const SPLITTER_VALUES = {
@@ -596,10 +780,29 @@ export function resolveFloatConnections(renderer) {
     'treble': audioStore.treble || 0, 'rms': audioStore.rms || 0, 'beat': audioStore.beat || 0,
   }
 
+  // Per-stem analysis: a splitter fed by an AUDIO_INPUT whose "Audio Source"
+  // names a file uses THAT file's analysis (audioStore.sources) instead of the
+  // master mix — so drums can drive one effect while vocals drive another.
+  const splitterValuesFor = (splitterId) => {
+    const inEdge = graph.edges.find(e => e.toNode === splitterId && e.toSocket === 'audio_in')
+    const feeder = inEdge && graph.nodes.find(n => n.id === inEdge.fromNode)
+    const name = feeder?.type === 'AUDIO_INPUT' ? resolveAudioSourceName(feeder.params?.audioSource, renderer) : null
+    const s = name ? audioStore.sources?.[name] : null
+    if (!s) return SPLITTER_VALUES
+    const b = s.smoothedBands || []
+    return {
+      'sub_bass': b[0] || 0, 'bass': s.bass || 0,
+      'low_mid': b[2] || 0, 'mid': s.mid || 0,
+      'high_mid': b[4] || 0, 'presence': b[5] || 0,
+      'treble': s.treble || 0, 'rms': s.rms || 0, 'beat': s.beat || 0,
+    }
+  }
+
   const floatValues = {}
   for (const node of graph.nodes) {
     if (node.type === 'AUDIO_SPLITTER') {
-      for (const [socketId, value] of Object.entries(SPLITTER_VALUES)) {
+      const vals = splitterValuesFor(node.id)
+      for (const [socketId, value] of Object.entries(vals)) {
         floatValues[`${node.id}.${socketId}`] = value
       }
     }
@@ -610,12 +813,39 @@ export function resolveFloatConnections(renderer) {
     }
   }
 
+  // Envelope followers use the export's frame-locked time when active so the
+  // offline render matches live playback; otherwise wall-clock seconds.
+  const now = (renderer._timeOverride != null) ? renderer._timeOverride : performance.now() / 1000
+
   const evaluated = new Set()
   let progress = true
   while (progress) {
     progress = false
     for (const node of graph.nodes) {
-      if (node.type !== 'MATH' || evaluated.has(node.id)) continue
+      if ((node.type !== 'MATH' && node.type !== 'ENVELOPE') || evaluated.has(node.id)) continue
+
+      // ENVELOPE: single float input → smoothed output. If its producer is a
+      // MATH/ENVELOPE that hasn't been evaluated yet, retry on the next pass.
+      if (node.type === 'ENVELOPE') {
+        const edge = graph.edges.find(e => e.toNode === node.id && e.toSocket === 'input')
+        let input = 0
+        if (edge) {
+          const srcKey = `${edge.fromNode}.${edge.fromSocket}`
+          if (floatValues[srcKey] === undefined) {
+            const producer = graph.nodes.find(n => n.id === edge.fromNode)
+            if (producer && (producer.type === 'MATH' || producer.type === 'ENVELOPE') && !evaluated.has(producer.id)) {
+              continue // dependency not ready — another pass is coming
+            }
+          } else {
+            input = floatValues[srcKey]
+          }
+        }
+        floatValues[`${node.id}.output`] = evaluateEnvelope(node, input, now)
+        evaluated.add(node.id)
+        progress = true
+        continue
+      }
+
       const params = node.params || {}
       const operation = params.operation ?? 0
       let valueA = params.value_a ?? 0
@@ -665,6 +895,17 @@ function evaluateMathOperation(operation, a, b) {
 
 export function getActiveClip(clips, trackId, time) {
   return clips.find(c => c.trackId === trackId && time >= c.timelineStart && time < c.timelineEnd) || null
+}
+
+/**
+ * All clips active on a track at `time`, sorted by start time ascending. When
+ * clips overlap in time on one track, the later-starting clip is composited last
+ * (on top), matching standard NLE behaviour (spec §C).
+ */
+export function getActiveClips(clips, trackId, time) {
+  return clips
+    .filter(c => c.trackId === trackId && time >= c.timelineStart && time < c.timelineEnd)
+    .sort((a, b) => a.timelineStart - b.timelineStart)
 }
 
 export function getClipSourceTime(clip, playheadTime) {

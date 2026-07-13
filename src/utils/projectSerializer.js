@@ -8,6 +8,8 @@ import { get as idbGet, set as idbSet, del as idbDel, keys as idbKeys } from 'id
 import useAppStore from '../store/useAppStore.js'
 import useGraphStore from '../store/useGraphStore.js'
 import useTimelineStore from '../store/useTimelineStore.js'
+import { STARTER_TRANSITION_COMPOUND } from '../shaders/compoundPresets.js'
+import { clearHistory } from './history.js'
 
 const PROJECT_PREFIX = 'dalivid_project_'
 const AUTOSAVE_KEY = 'dalivid_autosave'
@@ -34,6 +36,9 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
       fps: app.fps,
       resolution: { ...app.resolution },
       colorSpace: app.colorSpace,
+      bpm: app.bpm,
+      beatOffset: app.beatOffset,
+      beatGridEnabled: app.beatGridEnabled,
     },
 
     timeline: {
@@ -60,7 +65,14 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
         sourceEnd: c.sourceEnd,
         speed: c.speed,
         opacity: c.opacity,
+        volume: c.volume == null ? 1 : c.volume,
+        audioMuted: !!c.audioMuted,
         blendMode: c.blendMode,
+        fadeIn: c.fadeIn || 0,
+        fadeOut: c.fadeOut || 0,
+        transition: c.transition
+          ? { type: c.transition.type, params: { ...(c.transition.params || {}) } }
+          : null,
         transform: { ...c.transform },
         metadata: { ...c.metadata },
         hasEffects: c.hasEffects,
@@ -88,6 +100,14 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
           bypassed: n.bypassed,
           locked: n.locked,
           audioBindings: { ...n.audioBindings },
+          // COMPOUND nodes carry their whole interior — without these fields a
+          // saved compound loses its sub-graph on reload and compiles to
+          // nothing. undefined values are dropped by JSON.stringify.
+          subGraph: n.subGraph ? JSON.parse(JSON.stringify(n.subGraph)) : undefined,
+          exposedParams: n.exposedParams ? JSON.parse(JSON.stringify(n.exposedParams)) : undefined,
+          color: n.color,
+          description: n.description,
+          nodeCount: n.nodeCount,
         })),
         edges: graph.masterGraph.edges.map(e => ({ ...e })),
         tapPointNodeId: graph.masterGraph.tapPointNodeId,
@@ -107,6 +127,12 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
               bypassed: n.bypassed,
               locked: n.locked,
               audioBindings: n.audioBindings ? { ...n.audioBindings } : {},
+              // See masterGraph note: compounds must keep their interior.
+              subGraph: n.subGraph ? JSON.parse(JSON.stringify(n.subGraph)) : undefined,
+              exposedParams: n.exposedParams ? JSON.parse(JSON.stringify(n.exposedParams)) : undefined,
+              color: n.color,
+              description: n.description,
+              nodeCount: n.nodeCount,
             })),
             edges: g.edges.map(e => ({ ...e })),
             tapPointNodeId: g.tapPointNodeId,
@@ -154,6 +180,9 @@ export function deserializeProject(data, getAppStore) {
       fps: data.project.fps,
       resolution: data.project.resolution,
       colorSpace: data.project.colorSpace,
+      bpm: data.project.bpm ?? 120,
+      beatOffset: data.project.beatOffset ?? 0,
+      beatGridEnabled: !!data.project.beatGridEnabled,
     })
   }
 
@@ -161,7 +190,16 @@ export function deserializeProject(data, getAppStore) {
   if (data.timeline) {
     useTimelineStore.setState({
       tracks: data.timeline.tracks || [],
-      clips: data.timeline.clips || [],
+      // Migration: clip blendMode 'Normal' used to mean "fall back to the track's
+      // mode" — that behaviour is now the explicit 'Inherit' value (an explicit
+      // 'Normal' is a real override). Mapping legacy 'Normal'/unset to 'Inherit'
+      // keeps old projects rendering identically.
+      clips: (data.timeline.clips || []).map(c => ({
+        fadeIn: 0,
+        fadeOut: 0,
+        ...c,
+        blendMode: (!c.blendMode || c.blendMode === 'Normal') ? 'Inherit' : c.blendMode,
+      })),
       markers: data.timeline.markers || [],
       inPoint: data.timeline.inPoint,
       outPoint: data.timeline.outPoint,
@@ -191,7 +229,12 @@ export function deserializeProject(data, getAppStore) {
           }
         ])
       ),
-      compoundLibrary: data.graph.compoundLibrary || [],
+      // Older projects saved before the starter transition existed get it
+      // re-seeded so node transitions stay discoverable; a project with its own
+      // library keeps exactly what it saved.
+      compoundLibrary: (data.graph.compoundLibrary && data.graph.compoundLibrary.length > 0)
+        ? data.graph.compoundLibrary
+        : [STARTER_TRANSITION_COMPOUND],
       // Bump so the renderer recompiles the freshly-loaded graph.
       topologyVersion: useGraphStore.getState().topologyVersion + 1,
     })
@@ -206,6 +249,10 @@ export function deserializeProject(data, getAppStore) {
       editMode: data.ui.editMode || 'overwrite',
     })
   }
+
+  // Loading a project is not an undoable edit — Ctrl+Z must never restore the
+  // previously open project's state into this one.
+  clearHistory()
 
   return true
 }

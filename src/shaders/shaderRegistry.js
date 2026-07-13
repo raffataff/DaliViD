@@ -326,24 +326,82 @@ precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform float u_time;
+// @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Radial,Mirror Box,Cell Mirrors,Fractal Fold"
+uniform int u_mode;
 // @param name="Segments" min=2.0 max=24.0 default=6.0 step=1.0
 uniform float u_segments;
 // @param name="Rotation" min=0.0 max=6.283 default=0.0 step=0.01
 uniform float u_rotation;
 // @param name="Zoom" min=0.1 max=4.0 default=1.0 step=0.05
 uniform float u_zoom;
+// @param name="Center X" min=-0.5 max=0.5 default=0.0 step=0.01
+uniform float u_center_x;
+// @param name="Center Y" min=-0.5 max=0.5 default=0.0 step=0.01
+uniform float u_center_y;
+// @param name="Fold Iterations" min=1.0 max=8.0 default=4.0 step=1.0
+uniform float u_fold_iters;
 out vec4 fragColor;
 
+vec2 kRot(vec2 p, float a) { float c = cos(a), s = sin(a); return vec2(c * p.x - s * p.y, s * p.x + c * p.y); }
+// Mirror-repeat into [0,1]: reflected tiling, so every tile edge is a
+// seam-free mirror rather than a hard wrap.
+vec2 kMirror(vec2 p) { vec2 m = mod(p, 2.0); return mix(m, 2.0 - m, step(1.0, m)); }
+
 void main() {
-  vec2 uv = v_uv - 0.5;
-  // Audio drivers (0 until wired): treble spins, bass zooms.
-  float angle = atan(uv.y, uv.x) + u_rotation + u_treble * 1.5;
-  float radius = length(uv) * u_zoom * (1.0 + u_bass * 0.5);
-  float segAngle = 3.14159265 * 2.0 / u_segments;
-  angle = mod(angle, segAngle);
-  if (angle > segAngle * 0.5) angle = segAngle - angle;
-  uv = vec2(cos(angle), sin(angle)) * radius + 0.5;
-  fragColor = texture(u_texture, uv);
+  // Movable mirror origin. Defaults (0,0 offset) keep the legacy centered
+  // behaviour, so old projects render identically (uniforms default to 0).
+  vec2 center = vec2(0.5 + u_center_x, 0.5 + u_center_y);
+  vec2 uv = v_uv - center;
+  vec2 suv;
+
+  if (u_mode == 0) {
+    // Radial — the classic n-fold wedge mirror around the origin.
+    // Audio drivers (0 until wired): treble spins, bass zooms.
+    float angle = atan(uv.y, uv.x) + u_rotation + u_treble * 1.5;
+    float radius = length(uv) * u_zoom * (1.0 + u_bass * 0.5);
+    float segAngle = 6.2831853 / u_segments;
+    angle = mod(angle, segAngle);
+    if (angle > segAngle * 0.5) angle = segAngle - angle;
+    suv = vec2(cos(angle), sin(angle)) * radius + center;
+  }
+  else if (u_mode == 1) {
+    // Mirror Box — hall-of-mirrors: the image reflects across a rectangular
+    // lattice instead of around a point, so the symmetry fills the whole
+    // frame with no privileged centre. Segments sets the tile density.
+    vec2 p = kRot(uv, u_rotation + u_treble * 0.4) * u_zoom * (1.0 + u_bass * 0.5);
+    suv = kMirror(p * max(u_segments * 0.5, 1.0) + center);
+  }
+  else if (u_mode == 2) {
+    // Cell Mirrors — a LATTICE of little kaleidoscopes: each grid cell runs
+    // its own radial wedge fold around its own centre, slowly spinning.
+    vec2 p = kRot(uv, u_rotation) * (1.0 + u_bass * 0.3);
+    float cells = max(u_segments * 0.5, 1.0);
+    vec2 g = p * cells;
+    vec2 id = floor(g);
+    vec2 f = fract(g) - 0.5;
+    float angle = atan(f.y, f.x) + u_time * 0.2 + u_treble;
+    float segAngle = 6.2831853 / max(u_segments, 3.0);
+    angle = mod(angle, segAngle);
+    if (angle > segAngle * 0.5) angle = segAngle - angle;
+    vec2 lp = vec2(cos(angle), sin(angle)) * length(f) * u_zoom;
+    suv = kMirror((id + 0.5 + lp) / cells + center);
+  }
+  else {
+    // Fractal Fold — iterated mirror-and-rotate (abs → offset → rotate):
+    // each iteration folds the plane again, giving nested mandala symmetry
+    // with no single centre. Treble tilts the fold angles.
+    vec2 p = kRot(uv, u_rotation) * u_zoom * (1.0 + u_bass * 0.5);
+    float a = 6.2831853 / max(u_segments, 2.0);
+    float iters = clamp(u_fold_iters, 1.0, 8.0);
+    for (float i = 0.0; i < 8.0; i++) {
+      if (i >= iters) break;
+      p = abs(p) - 0.28 / (i + 1.0);
+      p = kRot(p, a + i * 0.15 + u_treble * 0.3);
+    }
+    suv = kMirror(p + center);
+  }
+
+  fragColor = texture(u_texture, suv);
 }
 `)
 
@@ -749,6 +807,75 @@ uniform sampler2D u_texture;
 out vec4 fragColor;
 void main() {
   fragColor = texture(u_texture, v_uv);
+}
+`)
+
+// ── Image Input (still image source) ─────────────────────────────────────────
+// The image texture is bound to u_image (unit 0) by the Renderer's image pass.
+// This shader fits/transforms the image to the canvas and adds optional, always-
+// live audio reactivity (no wiring needed) via the standard u_audio_bands/u_beat
+// uniforms. Downstream effect nodes provide the rest of the reactivity.
+registerShader('IMAGE_INPUT', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_image;        // loaded image, bound by the renderer
+uniform vec2 u_resolution;        // output canvas size
+uniform vec2 u_image_res;         // natural image size (px)
+uniform float u_audio_bands[8];   // always-live FFT bands
+uniform float u_beat;             // always-live beat trigger
+// @param name="Fit" min=0 max=3 default=0 step=1 type=select options="Cover,Contain,Stretch,Tile"
+uniform int u_fit;
+// @param name="Scale" min=0.1 max=4.0 default=1.0 step=0.01
+uniform float u_img_scale;
+// @param name="Offset X" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_offset_x;
+// @param name="Offset Y" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_offset_y;
+// @param name="Rotation" min=-3.1416 max=3.1416 default=0.0 step=0.01
+uniform float u_img_rot;
+// @param name="Bass Zoom" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bass_zoom;
+// @param name="Beat Punch" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_beat_punch;
+// @param name="Background" type=color default="#000000"
+uniform vec3 u_bg_color;
+out vec4 fragColor;
+
+void main() {
+  vec2 c = v_uv - 0.5;
+
+  // Aspect-preserving fit (Cover crops, Contain letterboxes).
+  float canvasAspect = u_resolution.x / max(u_resolution.y, 1.0);
+  float imgAspect = u_image_res.x / max(u_image_res.y, 1.0);
+  vec2 fitScale = vec2(1.0);
+  if (u_fit == 0) {            // Cover
+    if (canvasAspect > imgAspect) fitScale = vec2(1.0, imgAspect / canvasAspect);
+    else                          fitScale = vec2(canvasAspect / imgAspect, 1.0);
+  } else if (u_fit == 1) {    // Contain
+    if (canvasAspect > imgAspect) fitScale = vec2(canvasAspect / imgAspect, 1.0);
+    else                          fitScale = vec2(1.0, imgAspect / canvasAspect);
+  } // Stretch (2) and Tile (3) leave fitScale at 1.0
+
+  // Always-live reactive zoom: bass swells, beat punches.
+  float bass = u_audio_bands[1];
+  float zoom = u_img_scale * (1.0 + bass * u_bass_zoom * 1.5 + u_beat * u_beat_punch * 0.5);
+  c /= max(zoom, 0.001);
+
+  // Rotation
+  float ca = cos(u_img_rot), sa = sin(u_img_rot);
+  c = mat2(ca, -sa, sa, ca) * c;
+
+  c *= fitScale;
+  c += vec2(u_offset_x, u_offset_y) * 0.5;
+  vec2 suv = c + 0.5;
+
+  if (u_fit == 3) {                       // Tile: wrap
+    fragColor = texture(u_image, fract(suv));
+  } else if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
+    fragColor = vec4(u_bg_color, 1.0);    // outside image → background
+  } else {
+    fragColor = texture(u_image, suv);
+  }
 }
 `)
 
@@ -1903,7 +2030,7 @@ uniform float u_bass;
 uniform float u_mid;
 uniform float u_treble;
 
-// @param name="Mode" min=0 max=7 default=0 step=1 type=select options="Julia,Mandelbrot Zoom,KIFS,Fractal Grid,Newton Fractal,Sierpinski Gasket,Burning Ship,Mainframe"
+// @param name="Mode" min=0 max=7 default=0 step=1 type=select options="Julia Deep,Apollonian,KIFS,Fractal Grid,Newton Fractal,Kali Trap,Burning Ship,Mainframe"
 uniform int u_mode;
 // @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
 uniform int u_palette;
@@ -1969,32 +2096,51 @@ void main() {
   vec3 genColor = vec3(0.0);
   float t = u_time * u_speed;
 
-  if (u_mode == 0) { // Julia
-    vec2 p = uv * 1.5;
-    vec2 c = vec2(sin(t * 0.3), cos(t * 0.4));
+  if (u_mode == 0) { // Julia Deep
+    // High-iteration Julia with smooth (banding-free) colouring and a line
+    // orbit trap that draws luminous filaments through the set. c orbits just
+    // off the main cardioid — the boundary zone where Julia sets stay
+    // connected, filamented and interesting for every moment of the loop.
+    vec2 p = uv * 1.5 / max(u_scale_val, 0.1);
+    float ct = t * 0.12;
+    vec2 c = vec2(-0.745 + 0.113 * cos(ct), 0.186 + 0.09 * sin(ct * 1.31));
+    vec2 z = p;
+    float trap = 1e9;
     float iter = 0.0;
-    int maxIters = int(10.0 * u_complexity);
-    for(int i=0; i<16; i++) {
-      if (i >= maxIters) break;
-      p = vec2(p.x*p.x - p.y*p.y, 2.0*p.x*p.y) + c;
-      if (length(p) > 4.0) break;
+    float maxI = min(24.0 + 40.0 * u_complexity, 64.0);
+    for (float i = 0.0; i < 64.0; i++) {
+      if (i >= maxI) break;
+      z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
+      trap = min(trap, abs(dot(z, vec2(0.7071))));
+      if (dot(z, z) > 64.0) break;
       iter += 1.0;
     }
-    genColor = palette(u_palette, iter * 0.1 + t) * u_intensity;
+    float sm = iter - log2(max(log2(max(dot(z, z), 2.0)), 1.0));
+    vec3 col = palette(u_palette, sm * 0.035 + t * 0.04) * smoothstep(maxI, maxI * 0.2, iter);
+    col += palette(u_palette, 0.55 + sm * 0.02) * exp(-trap * 8.0) * 0.75;
+    genColor = col * (0.85 + u_bass * 0.6) * u_intensity;
   }
-  else if (u_mode == 1) { // Mandelbrot Zoom
-    vec2 p = uv / (u_scale_val + 0.1) - vec2(0.7, 0.0);
-    vec2 c = p;
-    vec2 z = vec2(0.0);
-    float iter = 0.0;
-    int maxIters = int(12.0 * u_complexity);
-    for(int i=0; i<16; i++) {
-      if (i >= maxIters) break;
-      z = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
-      if (length(z) > 2.0) break;
-      iter += 1.0;
+  else if (u_mode == 1) { // Apollonian
+    // Circle-inversion (Apollonian gasket) fractal — repeated sphere
+    // inversions of a 3D slice, IQ-style. The slice plane drifts through the
+    // gasket over time so the circle packing continuously reorganises.
+    vec2 p = uv * 1.3 / max(u_scale_val, 0.1);
+    float ss = 1.8 + 0.15 * sin(t * 0.2) + u_bass * 0.1;
+    vec3 q = vec3(p, 0.3 + 0.1 * sin(t * 0.13));
+    float scale = 1.0;
+    float maxI = min(5.0 + 5.0 * u_complexity, 12.0);
+    for (float i = 0.0; i < 12.0; i++) {
+      if (i >= maxI) break;
+      q = -1.0 + 2.0 * fract(0.5 * q + 0.5);
+      float k = ss / dot(q, q);
+      q *= k;
+      scale *= k;
     }
-    genColor = palette(u_palette, iter / 8.0 + t * 0.2) * u_bass * u_intensity;
+    float d = 0.25 * abs(q.y) / scale;
+    float v = smoothstep(3.0 / u_resolution.y, 0.0, d);
+    vec3 col = palette(u_palette, log2(scale) * 0.12 + t * 0.04) * v;
+    col += palette(u_palette, 0.5 + log2(scale) * 0.08) * exp(-d * 900.0) * 0.6;
+    genColor = col * (0.8 + u_bass * 0.7) * u_intensity;
   }
   else if (u_mode == 2) { // KIFS
     vec2 p = uv * 2.0;
@@ -2044,23 +2190,27 @@ void main() {
     col = tanh(col * 0.3);
     genColor = col * (0.8 + u_bass * 0.5) * u_intensity;
   }
-  else if (u_mode == 5) { // Sierpinski Gasket
-    vec2 p = uv * 2.0;
-    p += vec2(sin(t * 0.3), cos(t * 0.4)) * 0.1;
+  else if (u_mode == 5) { // Kali Trap
+    // Kaliset (abs(p)/dot(p,p) - c) with two orbit traps: min distance to the
+    // x-axis draws razor filaments, min distance to a circle draws a woven
+    // web. Distinct from KIFS (which sums lengths) — this is all filigree.
+    vec2 p = uv * 1.4;
+    p += vec2(sin(t * 0.21), cos(t * 0.17)) * 0.15;
+    vec2 kc = vec2(0.85 + 0.08 * sin(t * 0.11), 0.64 + 0.08 * cos(t * 0.09));
     vec3 col = vec3(0.0);
-    float scale = 1.0;
-    int maxIters = int(8.0 * u_complexity);
-    for(int i=0; i<10; i++) {
-      if (i >= maxIters) break;
-      p = abs(p);
-      float angle = t * 0.1 + float(i) * 0.2;
-      p = rotate(p, angle);
-      p = p * 2.0 - vec2(1.0, 0.0);
-      vec3 pal = cos(p.x + vec3(1.0, 2.0, 3.0) + t * 0.2) + 1.0;
-      col += pal * scale * 0.1;
-      scale *= 0.5;
+    float trapA = 1e9;
+    float trapC = 1e9;
+    float maxI = min(6.0 + 7.0 * u_complexity, 13.0);
+    for (float i = 0.0; i < 13.0; i++) {
+      if (i >= maxI) break;
+      p = abs(p) / dot(p, p) - kc;
+      trapA = min(trapA, abs(p.x));
+      trapC = min(trapC, abs(length(p) - 0.45));
+      col += palette(u_palette, i * 0.11 + t * 0.04) * exp(-abs(p.y) * 16.0) * 0.10;
     }
-    genColor = col * (0.8 + u_bass * 0.5) * u_intensity;
+    col += palette(u_palette, t * 0.05) * exp(-trapA * 22.0) * 0.7;
+    col += palette(u_palette, 0.4 + t * 0.03) * exp(-trapC * 15.0) * 0.5;
+    genColor = col * (0.75 + u_bass * 0.8) * u_intensity;
   }
   else if (u_mode == 6) { // Burning Ship
     vec2 c = vec2(-0.4 + sin(t * 0.2) * 0.1, -0.5 + cos(t * 0.15) * 0.1);
@@ -2275,7 +2425,7 @@ uniform float u_bass;
 uniform float u_mid;
 uniform float u_treble;
 
-// @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Sacred Geometry,Hexagonal Grid,Rotating Crosses,Geode"
+// @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Phyllotaxis Bloom,Flower of Life,Truchet Flow,Geode"
 uniform int u_mode;
 // @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
 uniform int u_palette;
@@ -2330,32 +2480,64 @@ vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
   );
 }
 
+float geoHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
 void main() {
   vec2 uv = (v_uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
   vec3 genColor = vec3(0.0);
   float t = u_time * u_speed;
 
-  if (u_mode == 0) { // Sacred Geometry
-    vec2 p = abs(uv) - 0.5;
-    float d = length(p);
-    float s = sin(d * 20.0 * u_complexity - t * 4.0 + u_bass);
-    s = smoothstep(0.4, 0.5, s);
-    genColor = palette(u_palette, d) * s * u_intensity;
+  if (u_mode == 0) { // Phyllotaxis Bloom
+    // The REAL golden-ratio pattern: Vogel's spiral. Seed n sits at angle
+    // n·137.5077° (the golden angle) and radius ∝ √n — the sunflower-head
+    // arrangement. Each seed is a gaussian glow; waves of size ripple outward
+    // through the spiral, and the beat kicks the ripple amplitude.
+    const float GA = 2.39996323; // golden angle, radians
+    float N = min(60.0 + 70.0 * u_complexity, 180.0);
+    vec3 col = vec3(0.0);
+    float spin = t * 0.25;
+    for (float i = 1.0; i < 180.0; i++) {
+      if (i >= N) break;
+      float a = i * GA + spin;
+      float r = 0.052 * sqrt(i) * (1.0 + u_bass * 0.2);
+      vec2 seed = vec2(cos(a), sin(a)) * r;
+      float size = 0.012 + 0.014 * (0.5 + 0.5 * sin(sqrt(i) * 2.2 - t * 2.5)) * (1.0 + u_beat);
+      float d = length(uv - seed) / size;
+      col += palette(u_palette, i / N + t * 0.08) * exp(-d * d);
+    }
+    genColor = col * u_intensity;
   }
-  else if (u_mode == 1) { // Hexagonal Grid
-    vec2 p = uv * 5.0 * u_complexity;
-    vec2 q = vec2(p.x * 2.0 * 0.5773503, p.y + p.x * 0.5773503);
-    vec2 pi = floor(q);
-    vec2 pf = fract(q);
-    float ca = step(1.0, max(abs(pf.x - 0.5) * 1.5 + abs(pf.y - 0.5), abs(pf.y - 0.5) * 2.0));
-    genColor = vec3(ca) * palette(u_palette, pi.x * 0.1 + t) * u_intensity;
+  else if (u_mode == 1) { // Flower of Life
+    // Proper sacred geometry: equal circles on a hexagonal lattice, each
+    // passing through its six neighbours' centres — the classic overlapping
+    // rosette. Rendered as glowing rings with a breathing radial pulse.
+    vec2 p = uv * 3.2 * u_complexity;
+    const vec2 rep = vec2(1.0, 1.7320508);
+    vec2 q1 = mod(p, rep) - rep * 0.5;
+    vec2 q2 = mod(p + rep * 0.5, rep) - rep * 0.5;
+    float d = min(abs(length(q1) - 1.0), abs(length(q2) - 1.0));
+    float ring = smoothstep(0.06, 0.015, d);
+    float pulse = 0.6 + 0.5 * sin(length(uv) * 5.0 - t * 2.0 + u_bass * 3.0);
+    genColor = (palette(u_palette, length(uv) * 0.5 + t * 0.1) * ring * pulse
+             + palette(u_palette, 0.5 + t * 0.05) * exp(-d * 6.0) * 0.35) * u_intensity;
   }
-  else if (u_mode == 2) { // Rotating Crosses
-    vec2 p = fract(uv * 4.0 * u_complexity) - 0.5;
-    p = rotate(p, t + u_bass);
-    float crossShape = min(abs(p.x), abs(p.y));
-    float mask = smoothstep(0.1, 0.09, crossShape);
-    genColor = mask * palette(u_palette, uv.x + uv.y + t) * u_intensity;
+  else if (u_mode == 2) { // Truchet Flow
+    // Quarter-circle truchet tiling: two arcs per cell, cells mirrored by
+    // hash, so the arcs join into endless weaving paths. Luminous dashes
+    // flow along the paths; mids speed the flow, bass brightens it.
+    vec2 p = uv * 4.0 * u_complexity + vec2(t * 0.15, 0.0);
+    vec2 id = floor(p);
+    vec2 f = fract(p);
+    float h = geoHash(id);
+    if (h < 0.5) f.x = 1.0 - f.x;
+    float d1 = abs(length(f) - 0.5);
+    float d2 = abs(length(f - 1.0) - 0.5);
+    float d = min(d1, d2);
+    float ang = (d1 < d2) ? atan(f.y, f.x) : atan(f.y - 1.0, f.x - 1.0);
+    float line = smoothstep(0.10, 0.045, d);
+    float flow = 0.55 + 0.45 * sin(ang * 6.0 + (h - 0.5) * 12.0 - t * (2.0 + u_mid * 2.0));
+    genColor = palette(u_palette, h * 0.6 + ang * 0.15 + t * 0.07) * line * flow
+             * (1.0 + u_bass * 0.5) * u_intensity;
   }
   else { // Geode
     vec3 p = vec3(0.0);
@@ -2396,7 +2578,7 @@ uniform float u_bass;
 uniform float u_mid;
 uniform float u_treble;
 
-// @param name="Mode" min=0 max=2 default=0 step=1 type=select options="Spectral Tesla,Waveform Bolt,Chaos Storm"
+// @param name="Mode" min=0 max=2 default=0 step=1 type=select options="Fractal Bolt,Plasma Globe,Storm Flash"
 uniform int u_mode;
 // @param name="Palette" min=0 max=16 default=0 step=1 type=select options="Rainbow,Neon,Cosmic,Fire,Ocean,Pastel,Monochrome,Sunset,Forest,Cyberpunk,Arctic,Lava,Galaxy,Toxic,Vaporwave,Ember,Aqua"
 uniform int u_palette;
@@ -2449,69 +2631,91 @@ vec3 blend(int blend_mode, vec3 bg, vec3 fg) {
   );
 }
 
-float lightning(vec2 uv, float offset, float t) {
-  float col = 0.0;
-  float y = 0.5;
-  float segCount = 8.0 * u_complexity;
-  for (float i = 0.0; i < 12.0; i++) {
-    if (i > segCount) break;
-    float seg = i / segCount;
-    float nextY = 0.5 + (random(vec2(i, offset)) - 0.5) * 0.8;
-    float x = seg + offset * 0.1 + t * 0.2;
-    float dx = x - uv.x;
-    float dy = mix(y, nextY, smoothstep(0.0, 1.0, (uv.x - seg + offset * 0.1 + t * 0.2) / (0.1 / u_complexity)));
-    float d = abs(uv.y - dy) / (0.02 + seg * 0.01);
-    col += exp(-d * d) * (1.0 - seg * 0.5);
-    y = nextY;
-  }
-  return col;
+// Value noise + fbm — the displacement fields that make bolts look organic.
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 w = f * f * (3.0 - 2.0 * f);
+  return mix(mix(random(i), random(i + vec2(1.0, 0.0)), w.x),
+             mix(random(i + vec2(0.0, 1.0)), random(i + vec2(1.0, 1.0)), w.x), w.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { v += a * vnoise(p); p = p * 2.03 + 17.7; a *= 0.5; }
+  return v;
 }
 
 void main() {
   vec2 uv = v_uv;
   vec3 genColor = vec3(0.0);
   float t = u_time * u_speed;
+  float aspect = u_resolution.x / u_resolution.y;
 
-  if (u_mode == 0) { // Spectral Tesla
-    float bolt = 0.0;
-    for (float i = 0.0; i < 3.0; i++) {
-      bolt += lightning(uv, i * 100.0 + floor(t * 2.0 + i * 10.0), t);
+  if (u_mode == 0) { // Fractal Bolt
+    // One main strike: a vertical channel displaced by fbm, re-seeded per
+    // strike so every bolt has new geometry, with hot core + wide glow and
+    // forked branches that decay along their run. Bass/beat drive the punch.
+    vec2 p = (uv - 0.5) * vec2(aspect, 1.0);
+    float strike = floor(t * 1.7);
+    float age = fract(t * 1.7);
+    float flick = 0.65 + 0.7 * random(vec2(strike, 7.0));
+    float decay = exp(-age * (3.0 + 2.0 * random(vec2(strike, 4.0))));
+    float wob = (fbm(vec2(p.y * (2.5 + u_complexity * 2.5) + strike * 13.7, strike * 3.1)) - 0.5) * 0.9;
+    float x = p.x - wob;
+    float core = exp(-abs(x) * 160.0);
+    float glow = exp(-abs(x) * 9.0) * 0.55;
+    float br = 0.0;
+    for (float i = 1.0; i <= 4.0; i++) {
+      float h0 = random(vec2(i, strike)) * 1.6 - 0.8;          // fork height
+      float side = sign(random(vec2(i, strike + 0.5)) - 0.5);  // fork direction
+      float run = (p.y - h0) * side;
+      float live = step(0.0, run) * exp(-run * 3.0);
+      float bwob = (fbm(vec2(p.y * 7.0 + i * 47.0 + strike * 7.7, i)) - 0.5) * 0.5;
+      float bx = p.x - wob - side * run * 0.7 - bwob * run;
+      br += exp(-abs(bx) * 220.0) * live * 0.8;
     }
-    bolt *= 0.3 + u_bass * 0.5;
-    vec3 glow = palette(u_palette, bolt * 2.0 + t * 0.1);
-    genColor = glow * bolt * u_intensity;
-    genColor += palette(u_palette, 0.5 + t * 0.05) * exp(-abs(uv.y - 0.5) * 10.0) * bolt * 0.3 * u_intensity;
+    float bolt = (core + glow + br) * flick * decay * (1.0 + u_bass * 1.2 + u_beat * 0.8);
+    genColor = (palette(u_palette, p.y * 0.25 + t * 0.05) * bolt + vec3(1.0) * core * decay * 0.6) * u_intensity;
   }
-  else if (u_mode == 1) { // Waveform Bolt
-    float wave = sin(uv.x * 20.0 + t * 5.0) * 0.1;
-    wave += sin(uv.x * 40.0 - t * 3.0) * 0.05 * u_mid;
-    float lightningY = 0.5 + wave * (0.5 + u_bass);
-    float d = abs(uv.y - lightningY);
-    float bolt = exp(-d * d * 200.0) * (0.5 + u_treble);
-    bolt += exp(-d * d * 50.0) * 0.2;
-    genColor = palette(u_palette, uv.x + t * 0.2) * bolt * u_intensity;
-  }
-  else { // Chaos Storm
+  else if (u_mode == 1) { // Plasma Globe
+    // Tendrils radiating from a central electrode along fbm-wobbled angular
+    // paths, contained by a faint glass shell — a plasma ball. Bass surges
+    // the electrode, treble crackles the tendrils.
+    vec2 p = (uv - 0.5) * vec2(aspect, 1.0) * 2.4;
+    float r = length(p);
+    float ang = atan(p.y, p.x);
     vec3 col = vec3(0.0);
-    vec2 p = (uv - 0.5) * vec2(u_resolution.x / u_resolution.y, 1.0);
-    float rt = t + u_bass * 3.0;
-    for (float i = 0.0; i < 5.0; i++) {
-      vec2 origin = vec2(sin(rt * 0.7 + i * 2.0) * 0.8, cos(rt * 0.5 + i * 3.0) * 0.8);
-      vec2 dir = normalize(p - origin);
-      float angle = atan(dir.y, dir.x) + rt * 0.1;
-      float boltLen = 0.0;
-      vec2 pos = origin;
-      for (float j = 0.0; j < 10.0; j++) {
-        float r = random(vec2(i * 100.0 + j, floor(rt)));
-        pos += dir * 0.05;
-        dir = normalize(vec2(cos(angle + r * 2.0), sin(angle + r * 2.0)));
-        angle += (r - 0.5) * 2.0;
-        float d = length(p - pos);
-        boltLen += exp(-d * d * 100.0) * 0.3;
-      }
-      col += palette(u_palette, i * 0.2 + rt * 0.1) * boltLen;
+    float n = clamp(3.0 + floor(u_complexity * 3.0), 3.0, 9.0);
+    for (float i = 0.0; i < 9.0; i++) {
+      if (i >= n) break;
+      float a0 = i * 6.2831853 / n + t * (0.3 + 0.07 * i);
+      float wig = (fbm(vec2(r * 3.5 - t * 2.5, i * 19.3)) - 0.5) * 1.6 * smoothstep(0.0, 0.6, r);
+      float da = atan(sin(ang - a0 - wig), cos(ang - a0 - wig)); // wrap-safe angular distance
+      float tendril = exp(-da * da * (50.0 + 90.0 * r * r)) * smoothstep(1.25, 0.1, r);
+      col += palette(u_palette, i / n + t * 0.1) * tendril * (0.8 + u_treble * 0.8);
     }
-    genColor = col * u_intensity * (0.7 + u_treble * 0.3);
+    col += palette(u_palette, t * 0.08) * exp(-r * r * 16.0) * (1.4 + u_bass * 2.5); // electrode
+    col += palette(u_palette, 0.6 + t * 0.04) * exp(-abs(r - 1.1) * 26.0) * 0.35;    // glass shell
+    genColor = col * u_intensity;
+  }
+  else { // Storm Flash
+    // A rolling fbm cloud layer; strikes fire at random moments/positions,
+    // light up the cloudscape with a full-frame flash, then decay — the
+    // cinematic "storm on the horizon" look.
+    vec2 p = vec2(uv.x * aspect, uv.y);
+    float cl = fbm(p * (2.5 * u_complexity) + vec2(t * 0.25, -t * 0.06));
+    vec3 col = palette(u_palette, cl * 0.4 + 0.15) * cl * cl * 0.4;
+    float cell = floor(t * 2.2);
+    float age = fract(t * 2.2);
+    float gate = step(0.45, random(vec2(cell, 9.0)));
+    float decay = exp(-age * 7.0) * gate;
+    float sx = (0.15 + 0.7 * random(vec2(cell, 3.0))) * aspect;
+    float wob = (fbm(vec2(uv.y * 7.0 + cell * 31.0, cell * 1.7)) - 0.5) * 0.35;
+    float d = abs(p.x - sx - wob * (1.0 - uv.y));
+    float bolt = exp(-d * 260.0) * decay * (1.0 + u_bass);
+    col += (palette(u_palette, 0.75 + cell * 0.03) + vec3(0.8)) * bolt;
+    col += exp(-d * 18.0) * decay * palette(u_palette, 0.7) * 0.35;   // corridor glow
+    col += vec3(0.85, 0.9, 1.0) * decay * decay * (0.15 + cl * 0.35); // sky flash lights the clouds
+    genColor = col * u_intensity * (0.8 + u_mid * 0.5);
   }
 
   vec4 bg = texture(u_texture, uv);

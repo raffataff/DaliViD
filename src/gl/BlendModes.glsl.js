@@ -182,7 +182,7 @@ vec3 blendMinus(vec3 base, vec3 blend) { return max(vec3(0.0), base - blend); }
 vec4 applyBlendMode(vec4 base, vec4 blend, int mode, float opacity) {
   vec3 result;
   if (mode == 0) result = blendNormal(base.rgb, blend.rgb);
-  else if (mode == 1) result = blend.rgb; // Dissolve handled separately with noise
+  else if (mode == 1) result = blend.rgb; // Dissolve: per-pixel noise applied by the compositor (COMPOSITE_FS)
   else if (mode == 2) result = blendDarken(base.rgb, blend.rgb);
   else if (mode == 3) result = blendMultiply(base.rgb, blend.rgb);
   else if (mode == 4) result = blendColorBurn(base.rgb, blend.rgb);
@@ -213,18 +213,44 @@ vec4 applyBlendMode(vec4 base, vec4 blend, int mode, float opacity) {
   else if (mode == 29) result = base.rgb * blend.a; // Multiply Alpha
   else result = blend.rgb;
 
-  // Apply opacity and alpha compositing (Normal/Over formula)
+  // Backdrop coverage (W3C compositing): a blend mode is defined against an
+  // existing backdrop, so where the backdrop is absent (base.a → 0) there is
+  // nothing to blend with and the source must show as-is (Normal). Where the
+  // backdrop is opaque the full blend mode applies; partial alpha mixes between
+  // the two. This keeps Multiply/Screen/etc. correct over transparent or
+  // uncovered regions — e.g. an upper track that doesn't fill the frame, or a
+  // chroma-keyed clip. (mode 0 / Normal is unaffected: result == blend.rgb.)
+  vec3 effectiveSrc = mix(blend.rgb, result, base.a);
+
+  // Source-over with opacity (matches the spec's Normal-mode formula).
   float a = blend.a * opacity;
-  vec3 composited = result * a + base.rgb * (1.0 - a);
+  vec3 composited = effectiveSrc * a + base.rgb * (1.0 - a);
   float outA = a + base.a * (1.0 - a);
   return vec4(composited, outA);
 }
 `
 
+// Friendly aliases for blend-mode names that differ from the canonical
+// BLEND_MODE_NAMES entries. The Inspector's per-clip / per-track dropdowns offer
+// a short "Add" label, which is the canonical "Linear Dodge (Add)". Without this
+// mapping the name wouldn't resolve and would silently fall back to Normal.
+const BLEND_MODE_ALIASES = {
+  'Add': 'Linear Dodge (Add)',
+  'Linear Dodge': 'Linear Dodge (Add)',
+  'Additive': 'Plus (Additive)',
+  'Plus': 'Plus (Additive)',
+}
+
 /**
- * Get the integer index for a blend mode name.
+ * Get the integer index for a blend mode name (used as the u_blend_mode uniform).
+ * Accepts the canonical names in BLEND_MODE_NAMES plus the aliases above.
+ * Unknown names fall back to Normal (0).
  */
 export function getBlendModeIndex(name) {
-  const idx = BLEND_MODE_NAMES.indexOf(name)
+  if (!name) return 0
+  let idx = BLEND_MODE_NAMES.indexOf(name)
+  if (idx === -1 && BLEND_MODE_ALIASES[name]) {
+    idx = BLEND_MODE_NAMES.indexOf(BLEND_MODE_ALIASES[name])
+  }
   return idx === -1 ? 0 : idx
 }

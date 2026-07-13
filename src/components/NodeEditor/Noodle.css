@@ -26,3 +26,8 @@
 .noodle--dragging .noodle__cable {
   animation: marchingAnts 0.4s linear infinite;
 }
+
+/* Ctrl+drag auto-insert: the wire the dragged node will splice into */
+.noodle--insert-target .noodle__cable {
+  animation: marchingAnts 0.3s linear infinite;
+}

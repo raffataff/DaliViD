@@ -208,6 +208,17 @@ input:focus, select:focus, textarea:focus {
   transition-delay: 250ms;
 }
 
+/* ── Tooltip Flip ──
+   Panel headers and the toolbar sit flush against the top edge of an
+   `overflow: hidden` ancestor (.panel / .app), so there's no room for the
+   default "open upward" tooltip — it renders almost entirely outside the
+   clipped box and never becomes visible. Open these downward instead. */
+.toolbar [data-tooltip]::after,
+.panel__header [data-tooltip]::after {
+  bottom: auto;
+  top: calc(100% + 6px);
+}
+
 /* ── Viewport Warning ── */
 .viewport-warning {
   position: fixed;

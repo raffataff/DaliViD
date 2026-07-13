@@ -6,6 +6,9 @@
 
 import { create } from 'zustand'
 import { createCompound, updateExposedParam, expandCompound } from '../utils/compoundUtils'
+import { STARTER_TRANSITION_COMPOUND } from '../shaders/compoundPresets'
+import { removeNodeImage } from '../gl/imageRegistry'
+import { emitNodeRemoved } from '../gl/nodeLifecycle'
 
 let nodeCounter = 0
 function newNodeId() {
@@ -53,7 +56,9 @@ function createDefaultMasterGraph() {
 const useGraphStore = create((set, get) => ({
   masterGraph: createDefaultMasterGraph(),
   clipGraphs: {},
-  compoundLibrary: [],
+  // Seeded with the starter node-graph transition so the clip Inspector's
+  // "Custom (Node Graph)" list is never empty and the pattern is discoverable.
+  compoundLibrary: [STARTER_TRANSITION_COMPOUND],
   undoStack: [],
   redoStack: [],
 
@@ -88,6 +93,13 @@ const useGraphStore = create((set, get) => ({
   },
 
   removeNode: (graphLevel, clipId, nodeId) => {
+    // Free the decoded-image cache and, via the lifecycle hook, all GPU resources
+    // this node owns — its output/feedback FBOs, image FBO+texture, and any
+    // compound inner FBOs. Look the node up before it's filtered out of the graph.
+    const activeGraph = graphLevel === 'master' ? get().masterGraph : get().clipGraphs[clipId]
+    const removedNode = activeGraph?.nodes.find(n => n.id === nodeId) || null
+    removeNodeImage(nodeId)
+    emitNodeRemoved(removedNode)
     set((state) => {
       const graph = graphLevel === 'master' ? state.masterGraph : state.clipGraphs[clipId]
       if (!graph) return state
@@ -172,6 +184,52 @@ const useGraphStore = create((set, get) => ({
     })
   },
 
+  /**
+   * Deep-copy a clip's effect graph to another clip with fresh node/edge ids —
+   * used when splitting a clip, so the new right half keeps the same effects
+   * (and is enterable at all: without a graph the clip editor has nothing to
+   * open). Falls back to a default graph when the source has none.
+   */
+  duplicateClipGraph: (sourceClipId, newClipId, clipName = 'Clip', clipType = 'video') => {
+    set((state) => {
+      const src = state.clipGraphs[sourceClipId]
+      if (!src) {
+        return {
+          clipGraphs: { ...state.clipGraphs, [newClipId]: createClipGraph(clipName, clipType) },
+          topologyVersion: state.topologyVersion + 1,
+        }
+      }
+      const stamp = Date.now()
+      let seq = 0
+      const idMap = {}
+      for (const n of src.nodes) idMap[n.id] = `node_${stamp}_sp${++seq}`
+      const nodes = src.nodes.map(n => {
+        const copy = JSON.parse(JSON.stringify(n)) // params, subGraph, bindings
+        copy.id = idMap[n.id]
+        return copy
+      })
+      const edges = src.edges.map((e, i) => ({
+        ...e,
+        id: `edge_${stamp}_sp${i}`,
+        fromNode: idMap[e.fromNode] || e.fromNode,
+        toNode: idMap[e.toNode] || e.toNode,
+      }))
+      return {
+        clipGraphs: {
+          ...state.clipGraphs,
+          [newClipId]: {
+            nodes,
+            edges,
+            tapPointNodeId: idMap[src.tapPointNodeId] || null,
+            compiledChain: [],
+            compileErrors: [],
+          },
+        },
+        topologyVersion: state.topologyVersion + 1,
+      }
+    })
+  },
+
   initClipGraph: (clipId, clipName, clipType = 'video') => {
     set((state) => ({
       clipGraphs: { ...state.clipGraphs, [clipId]: createClipGraph(clipName, clipType) },
@@ -208,6 +266,14 @@ const useGraphStore = create((set, get) => ({
 
     const result = createCompound(selectedNodeIds, graph.nodes, graph.edges, compoundName, color, description)
     const { compoundNode, updatedEdges, removedNodeIds } = result
+
+    // The selected nodes are relocated into the compound's sub-graph; free the
+    // top-level GPU resources they held so they don't orphan (they re-execute
+    // inside the compound under namespaced FBO keys).
+    for (const id of removedNodeIds) {
+      const relocated = graph.nodes.find(n => n.id === id)
+      if (relocated) emitNodeRemoved(relocated)
+    }
 
     const newNodes = graph.nodes.filter(n => !removedNodeIds.includes(n.id))
     newNodes.push(compoundNode)
@@ -246,6 +312,12 @@ const useGraphStore = create((set, get) => ({
   },
 
   expandCompoundNode: (graphLevel, clipId, compoundNodeId) => {
+    // Free the compound's GPU resources (recursing its sub-graph) before it's
+    // replaced — its inner nodes re-execute at the top level under fresh, un
+    // -namespaced FBO keys. Looked up before the set() that rewrites the graph.
+    const activeGraph = graphLevel === 'master' ? get().masterGraph : get().clipGraphs[clipId]
+    const compoundToFree = activeGraph?.nodes.find(n => n.id === compoundNodeId && n.type === 'COMPOUND') || null
+    if (compoundToFree) emitNodeRemoved(compoundToFree)
     set((state) => {
       const graph = graphLevel === 'master' ? state.masterGraph : state.clipGraphs[clipId]
       if (!graph) return state
@@ -268,10 +340,6 @@ const useGraphStore = create((set, get) => ({
     })
   },
 }))
-
-function createEmptyGraph() {
-  return { nodes: [], edges: [], tapPointNodeId: null, compiledChain: [], compileErrors: [] }
-}
 
 function createClipGraph(clipName = 'Clip', clipType = 'video') {
   const sourceId = newNodeId()

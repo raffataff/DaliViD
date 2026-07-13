@@ -5,7 +5,9 @@ import reactHooks from 'eslint-plugin-react-hooks'
 import reactRefresh from 'eslint-plugin-react-refresh'
 
 export default [
-  { ignores: ['dist'] },
+  // scratch/ and the root-level shader-generator experiment aren't part of the
+  // app build — keep them out of lint so `npm run lint` guards real code.
+  { ignores: ['dist', 'scratch', 'shader-generator-effects.js'] },
   {
     files: ['**/*.{js,jsx}'],
     languageOptions: {

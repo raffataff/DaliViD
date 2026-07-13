@@ -4,8 +4,40 @@ import useGraphStore from '../../store/useGraphStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import { parseParams } from '../../utils/paramParser'
 import { getNodeSource } from '../../shaders/shaderRegistry'
-import { parseParams as parseShaderParams } from '../../utils/paramParser'
+import { BLEND_MODE_NAMES } from '../../gl/BlendModes.glsl.js'
+import { TRANSITION_TYPES, getTransitionLabel, getTransitionParams, getTransitionDefaults } from '../../shaders/transitionRegistry.js'
+import { isTransitionCompound } from '../../utils/compoundUtils'
+import { keyAtTime } from '../../utils/keyframes'
 import './Inspector.css'
+
+// Photoshop-style grouping of BLEND_MODE_NAMES (which is already in canonical
+// group order) so the 30-entry dropdown stays scannable.
+const BLEND_MODE_GROUPS = [
+  { label: 'Basic', modes: BLEND_MODE_NAMES.slice(0, 2) },       // Normal, Dissolve
+  { label: 'Darken', modes: BLEND_MODE_NAMES.slice(2, 7) },      // Darken … Darker Color
+  { label: 'Lighten', modes: BLEND_MODE_NAMES.slice(7, 12) },    // Lighten … Lighter Color
+  { label: 'Contrast', modes: BLEND_MODE_NAMES.slice(12, 19) },  // Overlay … Hard Mix
+  { label: 'Comparative', modes: BLEND_MODE_NAMES.slice(19, 23) }, // Difference … Divide
+  { label: 'Component', modes: BLEND_MODE_NAMES.slice(23, 27) }, // Hue … Luminosity
+  { label: 'Compositing', modes: BLEND_MODE_NAMES.slice(27) },   // Plus, Minus, Multiply Alpha
+]
+
+/**
+ * Grouped blend-mode dropdown. `allowInherit` adds the clip-only "Inherit"
+ * option (use the track's mode) so an explicit "Normal" is a real choice.
+ */
+function BlendModeSelect({ value, onChange, allowInherit = false }) {
+  return (
+    <select className="inspector__select" value={value} onChange={(e) => onChange(e.target.value)}>
+      {allowInherit && <option value="Inherit">Inherit (track)</option>}
+      {BLEND_MODE_GROUPS.map(group => (
+        <optgroup key={group.label} label={group.label}>
+          {group.modes.map(name => <option key={name} value={name}>{name}</option>)}
+        </optgroup>
+      ))}
+    </select>
+  )
+}
 
 export default function Inspector() {
   const inspectorContext = useAppStore(s => s.inspectorContext)
@@ -84,8 +116,33 @@ function NodeInspector({ nodeId, graphLevel, clipId }) {
   const expandCompoundNode = useGraphStore(s => s.expandCompoundNode)
   const enterCompound = useAppStore(s => s.enterCompound)
 
+  // ── Keyframes ──
+  const keyframes = useTimelineStore(s => s.keyframes)
+  const addKeyframe = useTimelineStore(s => s.addKeyframe)
+  const removeKeyframe = useTimelineStore(s => s.removeKeyframe)
+  const clips = useTimelineStore(s => s.clips)
+  const playheadTime = useAppStore(s => s.playheadTime)
+  const fps = useAppStore(s => s.fps)
+
   const node = graph?.nodes.find(n => n.id === nodeId)
   if (!node) return <div className="inspector__empty">No node selected</div>
+
+  // Keyframe context: clip-graph params key against the clip (clip-relative
+  // time), master-graph params key against 'master' (absolute time).
+  const kfClipKey = graphLevel === 'master' ? 'master' : clipId
+  const kfClip = graphLevel === 'master' ? null : clips.find(c => c.id === clipId)
+  const kfLocalTime = kfClip ? Math.max(0, playheadTime - kfClip.timelineStart) : playheadTime
+  const kfTolerance = 0.5 / (fps || 30)
+
+  const getTrack = (paramName) => keyframes.find(
+    k => k.clipId === kfClipKey && k.nodeId === nodeId && k.paramName === paramName
+  )
+  const toggleKeyframe = (paramName, currentValue) => {
+    const track = getTrack(paramName)
+    const existing = track && keyAtTime(track.keys, kfLocalTime, kfTolerance)
+    if (existing) removeKeyframe(kfClipKey, nodeId, paramName, existing.time)
+    else addKeyframe(kfClipKey, nodeId, paramName, kfLocalTime, currentValue)
+  }
 
   if (node.type === 'COMPOUND') {
     return (
@@ -128,12 +185,37 @@ function NodeInspector({ nodeId, graphLevel, clipId }) {
       {paramConfigs.length > 0 && (
         <>
           <div className="inspector__section-header" style={{ marginTop: 16 }}>Parameters</div>
-          {paramConfigs.map(param => (
-            <InspectorParam key={param.uniformName} nodeId={nodeId} param={param}
-              value={node.params[param.uniformName] ?? param.default}
-              onChange={(val) => setNodeParam(graphLevel, clipId, nodeId, param.uniformName, val)}
-              isConnected={isParamConnected(param.uniformName)} />
-          ))}
+          {paramConfigs.map(param => {
+            const keyframable = param.type === 'slider'
+            const track = keyframable ? getTrack(param.uniformName) : null
+            const keyHere = track ? keyAtTime(track.keys, kfLocalTime, kfTolerance) : null
+            const value = node.params[param.uniformName] ?? param.default
+            return (
+              <div key={param.uniformName} className="inspector__param-row">
+                {keyframable && (
+                  <button
+                    className={`inspector__kf-btn ${keyHere ? 'inspector__kf-btn--on' : ''} ${track && !keyHere ? 'inspector__kf-btn--track' : ''}`}
+                    title={keyHere ? 'Remove keyframe at playhead' : (track ? 'Add keyframe at playhead (param is animated)' : 'Add keyframe at playhead')}
+                    onClick={() => toggleKeyframe(param.uniformName, value)}
+                  >
+                    ◆
+                  </button>
+                )}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <InspectorParam nodeId={nodeId} param={param}
+                    value={value}
+                    onChange={(val) => {
+                      setNodeParam(graphLevel, clipId, nodeId, param.uniformName, val)
+                      // Auto-key: while a param is animated, slider edits write a
+                      // key at the playhead (standard NLE behaviour) — otherwise
+                      // the change would be silently overridden by the animation.
+                      if (track) addKeyframe(kfClipKey, nodeId, param.uniformName, kfLocalTime, val)
+                    }}
+                    isConnected={isParamConnected(param.uniformName)} />
+                </div>
+              </div>
+            )
+          })}
         </>
       )}
     </div>
@@ -344,8 +426,28 @@ function ClipInspector({ clipId }) {
   const clips = useTimelineStore(s => s.clips)
   const updateClip = useTimelineStore(s => s.updateClip)
   const enterClipGraph = useAppStore(s => s.enterClipGraph)
+  const compoundLibrary = useGraphStore(s => s.compoundLibrary)
   const clip = clips.find(c => c.id === clipId)
   if (!clip) return <div className="inspector__empty">No clip selected</div>
+
+  const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera'
+
+  // Node-graph transitions: any library compound with ≥ 2 image inputs.
+  const transitionCompounds = compoundLibrary.filter(isTransitionCompound)
+  const isCompoundTransition = clip.transition?.type?.startsWith('compound:')
+  const compoundEntry = isCompoundTransition
+    ? transitionCompounds.find(c => `compound:${c.id}` === clip.transition.type) || null
+    : null
+
+  // The previous clip on this track that overlaps this clip's start — the
+  // transition-in plays across that overlap window.
+  const prevOverlap = clips
+    .filter(c => c.trackId === clip.trackId && c.id !== clip.id &&
+      c.timelineStart < clip.timelineStart && c.timelineEnd > clip.timelineStart)
+    .sort((a, b) => b.timelineStart - a.timelineStart)[0] || null
+  const overlapDur = prevOverlap
+    ? Math.min(prevOverlap.timelineEnd, clip.timelineEnd) - clip.timelineStart
+    : 0
 
   return (
     <div className="inspector__section">
@@ -355,7 +457,106 @@ function ClipInspector({ clipId }) {
       <div className="inspector__field"><label className="inspector__label">Duration</label><span className="inspector__value inspector__value--mono">{(clip.timelineEnd - clip.timelineStart).toFixed(2)}s</span></div>
       <div className="inspector__field"><label className="inspector__label">Speed</label><div className="inspector__slider"><input type="range" min={0.1} max={4} step={0.05} value={clip.speed || 1} onChange={(e) => updateClip(clipId, { speed: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.speed || 1).toFixed(2)}×</span></div></div>
       <div className="inspector__field"><label className="inspector__label">Opacity</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={clip.opacity || 1} onChange={(e) => updateClip(clipId, { opacity: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{((clip.opacity || 1) * 100).toFixed(0)}%</span></div></div>
-      <div className="inspector__field"><label className="inspector__label">Blend Mode</label><select className="inspector__select" value={clip.blendMode || 'Normal'} onChange={(e) => updateClip(clipId, { blendMode: e.target.value })}><option>Normal</option><option>Multiply</option><option>Screen</option><option>Overlay</option><option>Add</option><option>Difference</option></select></div>
+      <div className="inspector__field"><label className="inspector__label">Blend Mode</label><BlendModeSelect allowInherit value={clip.blendMode || 'Inherit'} onChange={(v) => updateClip(clipId, { blendMode: v })} /></div>
+      <div className="inspector__field"><label className="inspector__label">Fade In</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeIn || 0} onChange={(e) => updateClip(clipId, { fadeIn: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeIn || 0).toFixed(2)}s</span></div></div>
+      <div className="inspector__field"><label className="inspector__label">Fade Out</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeOut || 0} onChange={(e) => updateClip(clipId, { fadeOut: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeOut || 0).toFixed(2)}s</span></div></div>
+
+      {(clip.fileType === 'video' || clip.fileType === 'audio') && (
+        <>
+          <div className="inspector__section-header" style={{ marginTop: 12 }}>Audio</div>
+          <div className="inspector__field">
+            <label className="inspector__label">Mute Audio</label>
+            <label className="inspector__toggle">
+              <input type="checkbox" checked={!!clip.audioMuted} onChange={(e) => updateClip(clipId, { audioMuted: e.target.checked })} />
+              <span className="inspector__toggle-slider" />
+            </label>
+          </div>
+          <div className="inspector__field"><label className="inspector__label">Volume</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={clip.volume == null ? 1 : clip.volume} onChange={(e) => updateClip(clipId, { volume: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{((clip.volume == null ? 1 : clip.volume) * 100).toFixed(0)}%</span></div></div>
+          <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '0 8px 6px' }}>
+            Audio follows the clip's fades; transitions crossfade it automatically
+          </div>
+        </>
+      )}
+
+      {isVideoClip && (
+        <>
+          <div className="inspector__section-header" style={{ marginTop: 12 }}>Transition In</div>
+          <div className="inspector__field">
+            <label className="inspector__label">Type</label>
+            <select
+              className="inspector__select"
+              value={clip.transition?.type || ''}
+              onChange={(e) => {
+                const type = e.target.value
+                // Built-ins start from registry defaults; compound transitions
+                // start empty — the entry's exposedParams carry their defaults.
+                const params = type && !type.startsWith('compound:') ? getTransitionDefaults(type) : {}
+                updateClip(clipId, { transition: type ? { type, params } : null })
+              }}
+            >
+              <option value="">None</option>
+              <optgroup label="Built-in">
+                {TRANSITION_TYPES.map(t => <option key={t} value={t}>{getTransitionLabel(t)}</option>)}
+              </optgroup>
+              {transitionCompounds.length > 0 && (
+                <optgroup label="Custom (Node Graph)">
+                  {transitionCompounds.map(c => (
+                    <option key={c.id} value={`compound:${c.id}`}>{c.name}</option>
+                  ))}
+                </optgroup>
+              )}
+              {isCompoundTransition && !compoundEntry && (
+                <option value={clip.transition.type} disabled>(missing compound)</option>
+              )}
+            </select>
+          </div>
+          {clip.transition?.type && (
+            <>
+              {overlapDur > 0 ? (
+                <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '2px 8px 6px' }}>
+                  Plays over the {overlapDur.toFixed(2)}s overlap with “{prevOverlap.filename}”
+                </div>
+              ) : (
+                <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
+                  No overlap — drag this clip so it overlaps the previous clip on this track to activate
+                </div>
+              )}
+              {isCompoundTransition && !compoundEntry && (
+                <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
+                  This node transition is no longer in the compound library — the clip falls back to its blend mode
+                </div>
+              )}
+              {/* Built-in transitions: params parsed from the registry shader */}
+              {!isCompoundTransition && getTransitionParams(clip.transition.type).map(param => (
+                <InspectorParam
+                  key={param.uniformName}
+                  nodeId={clipId}
+                  param={param}
+                  value={clip.transition.params?.[param.uniformName] ?? param.default}
+                  onChange={(v) => updateClip(clipId, {
+                    transition: { ...clip.transition, params: { ...clip.transition.params, [param.uniformName]: v } },
+                  })}
+                  isConnected={false}
+                />
+              ))}
+              {/* Node transitions: the compound's exposed params, keyed by index */}
+              {compoundEntry && (compoundEntry.exposedParams || []).map((ep, i) => (
+                <InspectorParam
+                  key={`${compoundEntry.id}_${i}`}
+                  nodeId={clipId}
+                  param={{ ...ep.paramConfig, name: ep.displayName || ep.paramConfig?.name }}
+                  value={clip.transition.params?.[i] ?? ep.value ?? ep.paramConfig?.default}
+                  onChange={(v) => updateClip(clipId, {
+                    transition: { ...clip.transition, params: { ...clip.transition.params, [i]: v } },
+                  })}
+                  isConnected={false}
+                />
+              ))}
+            </>
+          )}
+        </>
+      )}
+
       <button className="inspector__btn inspector__btn--primary" onClick={() => enterClipGraph(clipId)} style={{ marginTop: 12 }}>Open Effect Graph</button>
     </div>
   )
@@ -374,7 +575,7 @@ function TrackInspector({ trackId }) {
       <div className="inspector__field"><label className="inspector__label">Name</label><input className="inspector__input" type="text" value={track.name} onChange={(e) => updateTrack(trackId, { name: e.target.value })} /></div>
       <div className="inspector__field"><label className="inspector__label">Type</label><span className="inspector__value">{track.type}</span></div>
       <div className="inspector__field"><label className="inspector__label">Opacity</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={track.opacity} onChange={(e) => updateTrack(trackId, { opacity: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(track.opacity * 100).toFixed(0)}%</span></div></div>
-      <div className="inspector__field"><label className="inspector__label">Blend Mode</label><select className="inspector__select" value={track.blendMode} onChange={(e) => updateTrack(trackId, { blendMode: e.target.value })}><option>Normal</option><option>Multiply</option><option>Screen</option><option>Overlay</option><option>Add</option><option>Difference</option></select></div>
+      <div className="inspector__field"><label className="inspector__label">Blend Mode</label><BlendModeSelect value={track.blendMode || 'Normal'} onChange={(v) => updateTrack(trackId, { blendMode: v })} /></div>
       <button className="inspector__btn" onClick={() => removeTrack(trackId)} style={{ marginTop: 12, color: 'var(--status-error)' }}>Delete Track</button>
     </div>
   )

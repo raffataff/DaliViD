@@ -3,10 +3,12 @@ import Socket from './Socket'
 import { IconChevronDown, IconSettings, IconEye, IconCode, IconClose } from '../common/Icons'
 import { getNodeSockets } from '../../shaders/nodeDefinitions'
 import { getNodeSource } from '../../shaders/shaderRegistry'
+import { prepareImageDataURL, dataUrlBytes, formatBytes } from '../../utils/imageProcessing'
 import './NodeCard.css'
 
 const NODE_COLORS = {
   'CLIP_SOURCE': '#44cc88', 'CLIP_OUTPUT': '#ff6644', 'VIDEO_INPUT': '#44cc88',
+  'IMAGE_INPUT': '#44cc88',
   'CAMERA_INPUT': '#44aaff', 'AUDIO_INPUT': '#ff00aa', 'AUDIO_SPLITTER': '#cc44ff',
   'AUDIO_VISUALIZER': '#ff00aa', 'OUTPUT': '#ff6644', 'EDGE_DETECTION': '#ff8844',
   'COLOR_INVERSION': '#ff44cc', 'GLITCH': '#ff3344', 'FEEDBACK': '#aa44ff',
@@ -14,7 +16,7 @@ const NODE_COLORS = {
   'BLOOM': '#ffcc44', 'CRT': '#88aa44', 'VORONOI': '#44ffaa', 'FLUID_WARP': '#4488ff',
   'HALFTONE': '#aaaacc', 'THRESHOLD': '#ccaa44', 'DEPTH_BLUR': '#44aacc',
   'MIRROR': '#cc44ff', 'PARTICLE': '#ff6644', 'LUT': '#ffaa44',
-  'MATH_BLEND': '#aaccff', 'MIX_BLEND': '#aaccff', 'MATH': '#ffdd00',
+  'MATH_BLEND': '#aaccff', 'MIX_BLEND': '#aaccff', 'MATH': '#ffdd00', 'TRANSITION_PROGRESS': '#ffdd00', 'ENVELOPE': '#ffdd00',
   'CUSTOM': '#00e5ff', 'COMPOUND': '#ff00aa',
   'AUDIO_WARP': '#ff00aa', 'SPECTRUM_GLOW': '#ff00aa',
   'EFFECT_INPUT': '#44cc88', 'EFFECT_OUTPUT': '#ff6644',
@@ -25,7 +27,9 @@ const NODE_COLORS = {
   'SPACE_DISTORTION': '#ccaa44',
 }
 
-export const NODE_WIDTH = 210
+// Must match .node-card { width } in NodeCard.css — marquee hit-testing and the
+// socket-position fallback in NodeCanvas both derive geometry from this.
+export const NODE_WIDTH = 270
 
 function ParamSlider({ nodeId, param, value, onChange, hasAudioBind, disabled = false }) {
   const [isEditing, setIsEditing] = useState(false)
@@ -64,22 +68,64 @@ function ParamSlider({ nodeId, param, value, onChange, hasAudioBind, disabled = 
       </div>
     )
   }
-  const displayValue = typeof value === 'number' ? value.toFixed(2) : value
+  // ── Numeric slider param ──
+  const min = param.min ?? 0
+  const max = param.max ?? 1
+  const step = param.step || 0.01
+  // Show enough decimals for the param's step (0.001 step → 3 decimals).
+  const decimals = Math.min(4, Math.max(2, Math.ceil(-Math.log10(step))))
+  const displayValue = typeof value === 'number' ? value.toFixed(decimals) : value
+
+  const clampSnap = (v) => {
+    const snapped = Math.round(v / step) * step
+    return parseFloat(Math.max(min, Math.min(max, snapped)).toFixed(6))
+  }
+
+  // Drag the value readout to scrub it (delta-based, so huge min/max ranges stay
+  // controllable): a full ~250px drag sweeps the whole range; hold Shift for 10×
+  // fine adjustment. A plain click (< 3px of movement) opens the type-in box.
+  const handleValueMouseDown = (e) => {
+    if (disabled) return
+    e.stopPropagation()
+    e.preventDefault()
+    const startX = e.clientX
+    const startValue = typeof value === 'number' ? value : (parseFloat(value) || 0)
+    let scrubbed = false
+    const handleMove = (ev) => {
+      const dx = ev.clientX - startX
+      if (!scrubbed && Math.abs(dx) < 3) return
+      scrubbed = true
+      const sensitivity = (max - min) / (ev.shiftKey ? 2500 : 250)
+      onChange(clampSnap(startValue + dx * sensitivity))
+    }
+    const handleUp = () => {
+      document.removeEventListener('mousemove', handleMove)
+      document.removeEventListener('mouseup', handleUp)
+      if (!scrubbed) { setEditValue(String(value)); setIsEditing(true) }
+    }
+    document.addEventListener('mousemove', handleMove)
+    document.addEventListener('mouseup', handleUp)
+  }
+
   return (
     <div className={`node-card__slider-row ${disabled ? 'node-card__slider-row--disabled' : ''}`}>
       <span className="node-card__slider-label">{param.name}</span>
-      <input type="range" className="node-card__slider" min={param.min} max={param.max} step={param.step} value={value}
-        onChange={(e) => onChange(parseFloat(e.target.value))} disabled={disabled} />
+      <input type="range" className="node-card__slider" min={min} max={max} step={step} value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))} disabled={disabled}
+        onDoubleClick={() => { if (!disabled && param.default !== undefined) onChange(param.default) }}
+        data-tooltip="Double-click to reset" />
       {isEditing ? (
         <input className="node-card__slider-value-input mono" type="number" value={editValue} autoFocus
+          min={min} max={max} step={step}
           onFocus={(e) => e.target.select()}
           onChange={(e) => setEditValue(e.target.value)}
-          onBlur={() => { const num = parseFloat(editValue); if (!isNaN(num)) onChange(Math.max(param.min, Math.min(param.max, num))); setIsEditing(false) }}
-          onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); if (e.key === 'Escape') setIsEditing(false) }}
+          onBlur={() => { const num = parseFloat(editValue); if (!isNaN(num)) onChange(Math.max(min, Math.min(max, num))); setIsEditing(false) }}
+          onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); if (e.key === 'Escape') setIsEditing(false); e.stopPropagation() }}
         />
       ) : (
         <span className="node-card__slider-value mono" data-node-id={nodeId} data-node-param-display={param.uniformName}
-          onClick={() => { if (!disabled) { setEditValue(String(value)); setIsEditing(true) } }}
+          onMouseDown={handleValueMouseDown}
+          data-tooltip="Drag to scrub (Shift = fine) · Click to type"
         >
           {disabled ? '⚡' : displayValue}
         </span>
@@ -91,10 +137,10 @@ function ParamSlider({ nodeId, param, value, onChange, hasAudioBind, disabled = 
 
 const NodeCard = memo(function NodeCard({
   node, selected = false, isMultiSelected = false, isPreviewTap = false, isOrphaned = false,
-  executionOrder = null, paramConfigs = [], onSelect, onDelete, onMove, onOpenMonaco,
+  executionOrder = null, paramConfigs = [], onSelect, onDelete, onMove, onMoveEnd, onOpenMonaco,
   onSetPreview, onToggleBypass, onParamChange, onSocketDragStart, onSocketDragEnd,
   onDuplicate, onDetachNode, connectedInputs = new Set(), connectedOutputs = new Set(),
-  zoom = 1, onEnterCompound, onExposedParamChange, onExpandCompound,
+  zoom = 1, onEnterCompound, onExposedParamChange,
 }) {
   const cardRef = useRef(null)
   const [isDragging, setIsDragging] = useState(false)
@@ -105,7 +151,7 @@ const NodeCard = memo(function NodeCard({
   const isLocked = node.locked
   const isCompound = node.type === 'COMPOUND'
 
-  const { inputs, outputs } = getNodeSockets(node.type, paramConfigs)
+  const { inputs, outputs } = getNodeSockets(node.type, paramConfigs, node)
   const fixedInputs = inputs.filter(s => !s.isParam)
   const paramInputs = inputs.filter(s => s.isParam)
   const compoundExposedParams = isCompound ? (node.exposedParams || []) : []
@@ -127,16 +173,67 @@ const NodeCard = memo(function NodeCard({
     const handleMouseMove = (e) => {
       const dx = (e.clientX - dragStart.current.x) / zoom
       const dy = (e.clientY - dragStart.current.y) / zoom
-      onMove?.(dragNodeId, { x: dragStart.current.nodeX + dx, y: dragStart.current.nodeY + dy })
+      // Pass the live event through so the canvas can do modifier-aware work
+      // (Ctrl+drag = highlight a wire under the node for auto-insert).
+      onMove?.(dragNodeId, { x: dragStart.current.nodeX + dx, y: dragStart.current.nodeY + dy }, e)
     }
-    const handleMouseUp = () => { setIsDragging(false); document.removeEventListener('mousemove', handleMouseMove); document.removeEventListener('mouseup', handleMouseUp) }
+    const handleMouseUp = (e) => {
+      setIsDragging(false)
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+      onMoveEnd?.(dragNodeId, e)
+    }
     document.addEventListener('mousemove', handleMouseMove)
     document.addEventListener('mouseup', handleMouseUp)
-  }, [node.id, node.position, zoom, onSelect, onMove, onDuplicate, onDetachNode])
+  }, [node.id, node.position, zoom, onSelect, onMove, onMoveEnd, onDuplicate, onDetachNode])
 
   const handleDoubleClick = useCallback((e) => {
     if (isCompound && onEnterCompound) { e.stopPropagation(); onEnterCompound(node.id) }
   }, [isCompound, node.id, onEnterCompound])
+
+  // ── Image source: load / replace the still image on this node ──
+  const isImageNode = node.type === 'IMAGE_INPUT'
+
+  const readImageFile = useCallback(async (file) => {
+    if (!file || !file.type?.startsWith('image/')) return
+    try {
+      // Downscale + re-encode so the persisted data URL stays small.
+      const { dataUrl } = await prepareImageDataURL(file)
+      const after = dataUrlBytes(dataUrl)
+      const pct = file.size > 0 ? Math.round((1 - after / file.size) * 100) : 0
+      console.log(`[DaliVid] Loaded "${file.name}": ${formatBytes(file.size)} → ${formatBytes(after)} (${pct}% smaller)`)
+      onParamChange?.(node.id, 'imageSrc', dataUrl) // data URL → persisted in params
+      onParamChange?.(node.id, 'imageName', file.name)
+    } catch (err) {
+      console.error('[DaliVid] Failed to load image:', err)
+    }
+  }, [node.id, onParamChange])
+
+  const handleLoadImage = useCallback(() => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'image/*'
+    input.onchange = (e) => readImageFile(e.target.files?.[0])
+    input.click()
+  }, [readImageFile])
+
+  const handleImageDrop = useCallback((e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const file = e.dataTransfer?.files?.[0]
+    if (file) { readImageFile(file); return }
+    // Also accept an image card dragged from the Media Pool.
+    const raw = e.dataTransfer?.getData('application/dalivid-drag')
+    if (raw) {
+      try {
+        const payload = JSON.parse(raw)
+        if (payload.imageSrc) {
+          onParamChange?.(node.id, 'imageSrc', payload.imageSrc)
+          onParamChange?.(node.id, 'imageName', payload.imageName || payload.name || '')
+        }
+      } catch { /* ignore malformed payloads */ }
+    }
+  }, [readImageFile, node.id, onParamChange])
 
   const exposedParamCount = compoundExposedParams.length
 
@@ -205,6 +302,43 @@ const NodeCard = memo(function NodeCard({
           ))}
         </div>
       </div>
+
+      {isImageNode && (
+        <div
+          className="node-card__image-loader"
+          onMouseDown={(e) => e.stopPropagation()}
+          onDragOver={(e) => { e.preventDefault(); e.stopPropagation() }}
+          onDrop={handleImageDrop}
+          style={{ padding: '6px 8px', display: 'flex', flexDirection: 'column', gap: 4 }}
+        >
+          <div
+            style={{
+              width: '100%', aspectRatio: '16 / 9', borderRadius: 3, overflow: 'hidden',
+              background: '#0a0a0e', border: '1px dashed #2a2a35',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >
+            {node.params?.imageSrc ? (
+              <img src={node.params.imageSrc} alt="" draggable={false}
+                style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+            ) : (
+              <span style={{ fontSize: 10, color: '#888899' }}>Drop or load an image</span>
+            )}
+          </div>
+          <button
+            className="node-card__action-btn"
+            onClick={(e) => { e.stopPropagation(); handleLoadImage() }}
+            style={{ width: '100%', height: 22, fontSize: 11, color: accentColor, borderColor: accentColor }}
+          >
+            {node.params?.imageSrc ? 'Replace Image' : 'Load Image'}
+          </button>
+          {node.params?.imageName && (
+            <div className="mono" style={{ fontSize: 9, color: '#888899', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {node.params.imageName}
+            </div>
+          )}
+        </div>
+      )}
 
       {compoundExpanded && isCompound && exposedParamCount > 0 && (
         <div className="node-card__params">

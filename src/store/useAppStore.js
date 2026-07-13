@@ -43,6 +43,10 @@ const useAppStore = create(
     monacoOpen: false,
     monacoNodeId: null,
     scopesOpen: false,
+    // When previewing a node inside a clip graph, route the preview through the
+    // master effect chain (true) or show the node's raw output in isolation
+    // (false). Lets you "tap" a node both with and without master FX applied.
+    previewThroughMaster: false,
     exportModalOpen: false,
     newProjectModalOpen: false,
     welcomeShown: false,
@@ -65,6 +69,12 @@ const useAppStore = create(
 
     // ── Audio Reactive ──
     audioReactiveEnabled: true,
+
+    // ── Beat Grid / Snapping ──
+    bpm: 120,
+    beatOffset: 0,          // seconds — where beat 1 falls on the timeline
+    beatGridEnabled: false, // draw beat/bar lines + include beats in snapping
+    snapEnabled: true,      // timeline snapping (clip edges/playhead/markers)
 
     // ── Edit Mode ──
     editMode: 'overwrite', // 'overwrite' | 'insert'
@@ -146,6 +156,8 @@ const useAppStore = create(
     openMonaco: (nodeId) => set({ monacoOpen: true, monacoNodeId: nodeId }),
     closeMonaco: () => set({ monacoOpen: false, monacoNodeId: null }),
     toggleScopes: () => set((state) => ({ scopesOpen: !state.scopesOpen })),
+    togglePreviewThroughMaster: () => set((state) => ({ previewThroughMaster: !state.previewThroughMaster })),
+    setPreviewThroughMaster: (on) => set({ previewThroughMaster: !!on }),
     setExportModalOpen: (open) => set({ exportModalOpen: open }),
     setNewProjectModalOpen: (open) => set({ newProjectModalOpen: open }),
     setWelcomeShown: () => set({ welcomeShown: true }),
@@ -209,6 +221,12 @@ const useAppStore = create(
     toggleAudioReactive: () => set((state) => ({
       audioReactiveEnabled: !state.audioReactiveEnabled,
     })),
+
+    // Beat grid / snapping
+    setBpm: (bpm) => set({ bpm: Math.max(20, Math.min(300, bpm || 120)), autosaveState: 'unsaved' }),
+    setBeatOffset: (sec) => set({ beatOffset: Math.max(0, sec || 0), autosaveState: 'unsaved' }),
+    toggleBeatGrid: () => set((state) => ({ beatGridEnabled: !state.beatGridEnabled, autosaveState: 'unsaved' })),
+    toggleSnap: () => set((state) => ({ snapEnabled: !state.snapEnabled })),
 
     // Edit Mode
     toggleEditMode: () => set((state) => ({

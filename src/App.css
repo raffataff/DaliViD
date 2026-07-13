@@ -125,7 +125,6 @@
   height: var(--panel-header-height, 28px);
   padding: 0 var(--space-xs);
   flex-shrink: 0;
-  overflow: hidden;
 }
 
 .panel__header-title {

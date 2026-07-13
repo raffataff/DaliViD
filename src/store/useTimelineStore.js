@@ -141,7 +141,15 @@ const useTimelineStore = create((set, get) => ({
       sourceEnd: clipData.sourceEnd || 10,
       speed: 1.0,
       opacity: 1.0,
-      blendMode: 'Normal',
+      volume: 1.0,       // clip audio gain (0..1); multiplied by fades/transitions
+      audioMuted: false, // hard-mute this clip's own audio (video sound, etc.)
+      // 'Inherit' = use the track's blend mode; any concrete name (incl. 'Normal') overrides it.
+      blendMode: 'Inherit',
+      fadeIn: 0,  // seconds of linear opacity ramp at the clip's start
+      fadeOut: 0, // seconds of linear opacity ramp at the clip's end
+      // Transition-in: { type, params } from transitionRegistry — plays across
+      // the overlap with the previous clip on the track. null = hard cut/blend.
+      transition: null,
       transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 },
       metadata: {
         width: clipData.width || 1920,
@@ -245,12 +253,19 @@ const useTimelineStore = create((set, get) => ({
     set((state) => ({
       clips: state.clips.map(c => {
         if (c.id !== clipId) return c
-        return { ...c, timelineEnd: splitTime, sourceEnd: splitSourceTime }
+        // Fades belong to the outer edges: the left half keeps the fade-in and
+        // loses the fade-out (the cut is now its end), and vice versa — so a
+        // split doesn't introduce a dip at the cut point.
+        return { ...c, timelineEnd: splitTime, sourceEnd: splitSourceTime, fadeOut: 0 }
       }).concat({
         ...clip,
         id: rightId,
         timelineStart: splitTime,
         sourceStart: splitSourceTime,
+        fadeIn: 0,
+        // The right half starts at a hard cut — a transition-in belongs to the
+        // original clip's start, so it stays with the left half only.
+        transition: null,
       }),
     }))
 
@@ -317,7 +332,9 @@ const useTimelineStore = create((set, get) => ({
             if (k.clipId === clipId && k.nodeId === nodeId && k.paramName === paramName) {
               return {
                 ...k,
-                keys: [...k.keys, { time, value, easing, bezierHandles: null }]
+                // Re-keying at (almost) the same time REPLACES the key, so
+                // dragging a slider with auto-key on doesn't stack duplicates.
+                keys: [...k.keys.filter(key => Math.abs(key.time - time) > 0.001), { time, value, easing, bezierHandles: null }]
                   .sort((a, b) => a.time - b.time),
               }
             }

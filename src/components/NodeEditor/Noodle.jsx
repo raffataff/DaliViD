@@ -14,6 +14,7 @@ const Noodle = memo(function Noodle({
   id,
   onClick,
   onDelete,
+  insertHighlight = false, // Ctrl+drag auto-insert: this wire is the splice target
 }) {
   const colorMap = {
     texture: '#00e5ff',
@@ -21,7 +22,7 @@ const Noodle = memo(function Noodle({
     float: '#ffdd00',
     param: '#ffdd00',
   }
-  const strokeColor = colorMap[dataType] || color
+  const strokeColor = insertHighlight ? '#ffffff' : (colorMap[dataType] || color)
 
   // Calculate control points for smooth bezier
   const dx = Math.abs(toX - fromX)
@@ -30,7 +31,7 @@ const Noodle = memo(function Noodle({
   const path = `M ${fromX} ${fromY} C ${fromX + cpOffset} ${fromY}, ${toX - cpOffset} ${toY}, ${toX} ${toY}`
 
   return (
-    <g className={`noodle ${selected ? 'noodle--selected' : ''}`}>
+    <g className={`noodle ${selected ? 'noodle--selected' : ''} ${insertHighlight ? 'noodle--insert-target' : ''}`}>
       {/* Invisible wider hit area for clicking */}
       <path
         className="noodle__hitarea"
@@ -53,9 +54,9 @@ const Noodle = memo(function Noodle({
         d={path}
         fill="none"
         stroke={strokeColor}
-        strokeWidth={selected ? 5 : 4}
+        strokeWidth={selected || insertHighlight ? 5 : 4}
         strokeLinecap="round"
-        opacity={0.15}
+        opacity={insertHighlight ? 0.35 : 0.15}
         filter="url(#noodleBlur)"
       />
 
@@ -65,9 +66,9 @@ const Noodle = memo(function Noodle({
         d={path}
         fill="none"
         stroke={strokeColor}
-        strokeWidth={selected ? 3 : 2}
+        strokeWidth={selected || insertHighlight ? 3 : 2}
         strokeLinecap="round"
-        strokeDasharray={selected ? '8 4' : 'none'}
+        strokeDasharray={selected || insertHighlight ? '8 4' : 'none'}
       />
     </g>
   )

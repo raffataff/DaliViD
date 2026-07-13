@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
+import { useWaveform } from '../../utils/waveformCache'
 import useTimelineStore from '../../store/useTimelineStore'
 import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
@@ -21,18 +22,23 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const toggleLock = useTimelineStore(s => s.toggleLock)
   const moveClip = useTimelineStore(s => s.moveClip)
   const trimClip = useTimelineStore(s => s.trimClip)
+  const updateClip = useTimelineStore(s => s.updateClip)
   const splitClip = useTimelineStore(s => s.splitClip)
   const removeClip = useTimelineStore(s => s.removeClip)
   const timelineZoom = useTimelineStore(s => s.timelineZoom)
   const setTimelineZoom = useTimelineStore(s => s.setTimelineZoom)
   const timelineScrollLeft = useTimelineStore(s => s.timelineScrollLeft)
   const setTimelineScrollLeft = useTimelineStore(s => s.setTimelineScrollLeft)
+  const keyframes = useTimelineStore(s => s.keyframes)
   const inPointStore = useTimelineStore(s => s.inPoint)
   const outPointStore = useTimelineStore(s => s.outPoint)
   const setInPoint = useTimelineStore(s => s.setInPoint)
   const setOutPoint = useTimelineStore(s => s.setOutPoint)
   const clearInOutPoints = useTimelineStore(s => s.clearInOutPoints)
   const addMarker = useTimelineStore(s => s.addMarker)
+  const removeMarker = useTimelineStore(s => s.removeMarker)
+  const updateMarker = useTimelineStore(s => s.updateMarker)
+  const markers = useTimelineStore(s => s.markers)
   const calculateDuration = useTimelineStore(s => s.calculateDuration)
 
   const inPoint = inPointStore ?? 0
@@ -40,6 +46,13 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const outPoint = outPointStore ?? projectDuration
 
   const setPlayheadTime = useAppStore(s => s.setPlayheadTime)
+  const bpm = useAppStore(s => s.bpm)
+  const beatGridEnabled = useAppStore(s => s.beatGridEnabled)
+  const snapEnabled = useAppStore(s => s.snapEnabled)
+  const setBpm = useAppStore(s => s.setBpm)
+  const setBeatOffset = useAppStore(s => s.setBeatOffset)
+  const toggleBeatGrid = useAppStore(s => s.toggleBeatGrid)
+  const toggleSnap = useAppStore(s => s.toggleSnap)
   const editMode = useAppStore(s => s.editMode)
   const toggleEditMode = useAppStore(s => s.toggleEditMode)
   const selectClip = useAppStore(s => s.selectClip)
@@ -101,6 +114,59 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     return () => el.removeEventListener('wheel', handleRulerWheel)
   }, [handleRulerWheel])
 
+  // ── Beat grid lines (beats faint, bars strong) ──
+  // Rendered inside the same translated container as the ruler marks. Beats are
+  // skipped when they'd be denser than ~7px so zoomed-out views stay readable.
+  const generateBeatLines = () => {
+    if (!beatGridEnabled || !bpm || bpm <= 0) return null
+    const app = useAppStore.getState()
+    const spb = 60 / bpm // seconds per beat
+    const beatPx = spb * pxPerSec
+    if (beatPx < 3) return null
+    const showBeats = beatPx >= 7
+    const lines = []
+    const totalSeconds = Math.max(300, Math.ceil(projectDuration * 1.1))
+    const startBeat = Math.max(0, Math.floor((timelineScrollLeft / pxPerSec - app.beatOffset) / spb) - 1)
+    const endTime = (timelineScrollLeft + 2500) / pxPerSec
+    for (let b = startBeat; ; b++) {
+      const t = app.beatOffset + b * spb
+      if (t > endTime || t > totalSeconds) break
+      const isBar = b % 4 === 0
+      if (!isBar && !showBeats) continue
+      lines.push(
+        <div
+          key={`beat_${b}`}
+          className={`timeline__beat-line ${isBar ? 'timeline__beat-line--bar' : ''}`}
+          style={{ left: t * pxPerSec }}
+        />
+      )
+    }
+    return lines
+  }
+
+  // ── Tap tempo ──
+  // Tap along with the song: BPM = average of the recent tap intervals.
+  // A gap > 2.5s starts a fresh measurement. Alt+click sets the beat OFFSET
+  // to the playhead instead (aligns beat 1 with the downbeat).
+  const tapTimesRef = useRef([])
+  const handleTapTempo = useCallback((e) => {
+    if (e.altKey) {
+      setBeatOffset(useAppStore.getState().playheadTime)
+      return
+    }
+    const now = performance.now()
+    const taps = tapTimesRef.current
+    if (taps.length > 0 && now - taps[taps.length - 1] > 2500) taps.length = 0
+    taps.push(now)
+    if (taps.length > 8) taps.shift()
+    if (taps.length >= 2) {
+      const intervals = []
+      for (let i = 1; i < taps.length; i++) intervals.push(taps[i] - taps[i - 1])
+      const avgMs = intervals.reduce((a, b) => a + b, 0) / intervals.length
+      setBpm(Math.round((60000 / avgMs) * 10) / 10)
+    }
+  }, [setBpm, setBeatOffset])
+
   // Generate ruler time marks
   const generateRulerMarks = () => {
     const marks = []
@@ -137,17 +203,66 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     return marks
   }
 
+  // ── Snapping ──
+  // Snap targets (seconds): other clips' edges, markers, in/out, playhead, 0.
+  // Collected once at drag start; the beat grid is evaluated analytically in
+  // applySnap so it never needs enumerating.
+  const collectSnapPoints = useCallback((excludeClipId = null) => {
+    const state = useTimelineStore.getState()
+    const pts = [0, useAppStore.getState().playheadTime]
+    for (const c of state.clips) {
+      if (c.id === excludeClipId) continue
+      pts.push(c.timelineStart, c.timelineEnd)
+    }
+    for (const m of state.markers) pts.push(m.time)
+    if (state.inPoint != null) pts.push(state.inPoint)
+    if (state.outPoint != null) pts.push(state.outPoint)
+    return pts
+  }, [])
+
+  // Snap a time to the nearest target within a zoom-scaled pixel threshold.
+  // Shift (passed as `disable`) bypasses snapping entirely.
+  const applySnap = useCallback((time, snapPoints, disable = false) => {
+    const app = useAppStore.getState()
+    if (disable || !app.snapEnabled) return time
+    const threshold = 8 / pxPerSec // 8 screen px, in seconds
+    let best = time
+    let bestDist = threshold
+    for (const p of snapPoints) {
+      const d = Math.abs(p - time)
+      if (d < bestDist) { bestDist = d; best = p }
+    }
+    if (app.beatGridEnabled && app.bpm > 0) {
+      const spb = 60 / app.bpm
+      const nearest = Math.round((time - app.beatOffset) / spb) * spb + app.beatOffset
+      const d = Math.abs(nearest - time)
+      if (d < bestDist) { bestDist = d; best = nearest }
+    }
+    return Math.max(0, best)
+  }, [pxPerSec])
+
+  // Snap a moving clip by whichever of its two edges lands closest to a target.
+  const snapClipStart = useCallback((start, duration, snapPoints, disable = false) => {
+    const snappedByStart = applySnap(start, snapPoints, disable)
+    const snappedByEnd = applySnap(start + duration, snapPoints, disable) - duration
+    const dStart = Math.abs(snappedByStart - start)
+    const dEnd = Math.abs(snappedByEnd - start)
+    return Math.max(0, dEnd < dStart ? snappedByEnd : snappedByStart)
+  }, [applySnap])
+
   // Clip dragging
   const [draggingClip, setDraggingClip] = useState(null)
   const [trimming, setTrimming] = useState(null) // { clipId, edge }
 
-  // Clip body drag (move)
+  // Clip body drag (move). Snaps either clip edge to targets; Shift disables.
   const handleClipMouseDown = useCallback((e, clip) => {
     e.stopPropagation()
     selectClip(clip.id)
-    
+
     const startX = e.clientX
     const originalStart = clip.timelineStart
+    const duration = clip.timelineEnd - clip.timelineStart
+    const snapPoints = collectSnapPoints(clip.id)
 
     const onMove = (me) => {
       const dx = me.clientX - startX
@@ -159,7 +274,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
       if (trackEl) {
         const trackId = trackEl.getAttribute('data-track-id')
         const trackType = trackEl.getAttribute('data-track-type')
-        
+
         // Helper to check clip compatibility (video/camera on video tracks, audio on audio tracks)
         const isCompatible = (clip.fileType === 'video' || clip.fileType === 'camera')
           ? trackType === 'video'
@@ -170,7 +285,8 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
         }
       }
 
-      moveClip(clip.id, Math.max(0, originalStart + dt), targetTrackId)
+      const newStart = snapClipStart(Math.max(0, originalStart + dt), duration, snapPoints, me.shiftKey)
+      moveClip(clip.id, newStart, targetTrackId)
     }
 
     const onUp = () => {
@@ -182,9 +298,9 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     setDraggingClip(clip.id)
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
-  }, [pxPerSec, selectClip, moveClip])
+  }, [pxPerSec, selectClip, moveClip, collectSnapPoints, snapClipStart])
 
-  // Trim handle drag (left or right edge)
+  // Trim handle drag (left or right edge). Edge snaps to targets; Shift disables.
   const handleTrimMouseDown = useCallback((e, clip, edge) => {
     e.stopPropagation()
     e.preventDefault()
@@ -192,11 +308,13 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
 
     const startX = e.clientX
     const originalTime = edge === 'left' ? clip.timelineStart : clip.timelineEnd
+    const snapPoints = collectSnapPoints(clip.id)
 
     const onMove = (me) => {
       const dx = me.clientX - startX
       const dt = dx / pxPerSec
-      trimClip(clip.id, edge, Math.max(0, originalTime + dt))
+      const snapped = applySnap(Math.max(0, originalTime + dt), snapPoints, me.shiftKey)
+      trimClip(clip.id, edge, snapped)
     }
 
     const onUp = () => {
@@ -208,7 +326,35 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     setTrimming({ clipId: clip.id, edge })
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
-  }, [pxPerSec, selectClip, trimClip])
+  }, [pxPerSec, selectClip, trimClip, collectSnapPoints, applySnap])
+
+  // Fade handle drag — sets the clip's fadeIn / fadeOut duration (seconds).
+  // The fade-in handle lives at the end of the fade-in ramp (drag right =
+  // longer); the fade-out handle at the start of its ramp (drag left = longer).
+  const handleFadeMouseDown = useCallback((e, clip, side) => {
+    e.stopPropagation()
+    e.preventDefault()
+    selectClip(clip.id)
+
+    const startX = e.clientX
+    const original = side === 'in' ? (clip.fadeIn || 0) : (clip.fadeOut || 0)
+    const duration = clip.timelineEnd - clip.timelineStart
+
+    const onMove = (me) => {
+      const dx = me.clientX - startX
+      const dt = (side === 'in' ? dx : -dx) / pxPerSec
+      const next = Math.max(0, Math.min(duration, original + dt))
+      updateClip(clip.id, side === 'in' ? { fadeIn: next } : { fadeOut: next })
+    }
+
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [pxPerSec, selectClip, updateClip])
 
   // Drag Left Marker (In Point)
   const handleInMarkerMouseDown = useCallback((e) => {
@@ -258,11 +404,49 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     document.addEventListener('mouseup', onUp)
   }, [pxPerSec, setOutPoint, projectDuration])
 
-  // Split selected clip at playhead
+  // Marker drag (move along the ruler). Alt+click deletes; double-click renames.
+  const handleMarkerMouseDown = useCallback((e, marker) => {
+    e.stopPropagation()
+    e.preventDefault()
+    if (e.altKey) {
+      removeMarker(marker.id)
+      return
+    }
+    const startX = e.clientX
+    const originalTime = marker.time
+    const snapPoints = collectSnapPoints()
+    const onMove = (me) => {
+      const dt = (me.clientX - startX) / pxPerSec
+      updateMarker(marker.id, { time: applySnap(Math.max(0, originalTime + dt), snapPoints, me.shiftKey) })
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [pxPerSec, removeMarker, updateMarker, collectSnapPoints, applySnap])
+
+  const handleMarkerRename = useCallback((marker) => {
+    const label = window.prompt('Marker label:', marker.label || '')
+    if (label !== null) updateMarker(marker.id, { label })
+  }, [updateMarker])
+
+  // Split selected clip at playhead. The right half is a brand-new clip id, so
+  // it needs its own effect graph — a deep copy of the original's, so the split
+  // doesn't strip effects from one side (and the clip editor can open it).
   const handleSplitAtPlayhead = useCallback(() => {
     if (!selectedClipId) return
     const currentPlayheadTime = useAppStore.getState().playheadTime
-    splitClip(selectedClipId, currentPlayheadTime)
+    const clip = useTimelineStore.getState().clips.find(c => c.id === selectedClipId)
+    const rightId = splitClip(selectedClipId, currentPlayheadTime)
+    if (rightId) {
+      useGraphStore.getState().duplicateClipGraph(
+        selectedClipId, rightId,
+        clip?.filename || 'Clip',
+        clip?.fileType === 'audio' ? 'audio' : 'video'
+      )
+    }
   }, [selectedClipId, splitClip])
 
   // Delete selected clip
@@ -358,6 +542,38 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
         </button>
         <span className="panel__header-title">Timeline</span>
         <div style={{ flex: 1 }} />
+        {/* ── Beat grid / snapping controls ── */}
+        <input
+          className="timeline__bpm-input mono"
+          type="number"
+          min={20}
+          max={300}
+          step={0.1}
+          value={bpm}
+          onChange={(e) => setBpm(parseFloat(e.target.value))}
+          title="Project BPM"
+        />
+        <button
+          className="timeline__mode-btn"
+          onClick={handleTapTempo}
+          data-tooltip="Tap along to set BPM (Alt+click: set beat offset to playhead)"
+        >
+          TAP
+        </button>
+        <button
+          className={`timeline__mode-btn ${beatGridEnabled ? 'timeline__mode-btn--active' : ''}`}
+          onClick={toggleBeatGrid}
+          data-tooltip="Beat grid: draw beat/bar lines and snap to beats"
+        >
+          GRID
+        </button>
+        <button
+          className={`timeline__mode-btn ${snapEnabled ? 'timeline__mode-btn--active' : ''}`}
+          onClick={toggleSnap}
+          data-tooltip="Snapping: clip edges, playhead, markers, in/out (hold Shift to bypass)"
+        >
+          SNAP
+        </button>
         <button
           className={`timeline__mode-btn ${editMode === 'insert' ? 'timeline__mode-btn--active' : ''}`}
           onClick={toggleEditMode}
@@ -390,6 +606,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
               onClick={handleRulerClick}
             >
               <div className="timeline__ruler-marks" style={{ transform: `translateX(-${timelineScrollLeft}px)` }}>
+                {generateBeatLines()}
                 {generateRulerMarks()}
               </div>
               {/* Loop Highlight and Markers */}
@@ -416,6 +633,23 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                 onMouseDown={handleOutMarkerMouseDown}
                 title={`Out Point: ${formatTimecode(outPoint)}`}
               />
+              {/* Markers (M drops one at the playhead; drag to move, Alt+click
+                  to delete, double-click to rename) */}
+              {markers.map(marker => (
+                <div
+                  key={marker.id}
+                  className="timeline__marker"
+                  style={{
+                    left: `${marker.time * pxPerSec - timelineScrollLeft}px`,
+                    borderTopColor: marker.color || '#ff3344',
+                  }}
+                  onMouseDown={(e) => handleMarkerMouseDown(e, marker)}
+                  onDoubleClick={(e) => { e.stopPropagation(); handleMarkerRename(marker) }}
+                  title={`${marker.label || 'Marker'} — ${formatTimecode(marker.time)} (drag to move, Alt+click to delete, double-click to rename)`}
+                >
+                  {marker.label && <span className="timeline__marker-label">{marker.label}</span>}
+                </div>
+              ))}
               {/* Playhead on ruler */}
               <TimelinePlayhead pxPerSec={pxPerSec} timelineScrollLeft={timelineScrollLeft} />
             </div>
@@ -478,6 +712,11 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                         const width = (clip.timelineEnd - clip.timelineStart) * pxPerSec
                         const hasGraph = clipGraphs[clip.id] && clipGraphs[clip.id].nodes.length > 2
                         const isTrimming = trimming?.clipId === clip.id
+                        // Fade overlays / handles are video-only: the compositor's
+                        // opacity ramp doesn't touch audio playback (yet).
+                        const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera'
+                        const fadeInW = Math.min(width, (clip.fadeIn || 0) * pxPerSec)
+                        const fadeOutW = Math.min(width, (clip.fadeOut || 0) * pxPerSec)
                         return (
                           <div
                             key={clip.id}
@@ -504,25 +743,81 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                               className="timeline__clip-trim timeline__clip-trim--right"
                               onMouseDown={(e) => handleTrimMouseDown(e, clip, 'right')}
                             />
+                            {/* Fade ramps: shaded wedge = attenuated region, diagonal = the opacity ramp */}
+                            {isVideoClip && fadeInW > 1 && (
+                              <svg
+                                className="timeline__clip-fade"
+                                style={{ left: 0, width: fadeInW }}
+                                viewBox="0 0 1 1"
+                                preserveAspectRatio="none"
+                              >
+                                <polygon points="0,0 1,0 0,1" />
+                                <line x1="0" y1="1" x2="1" y2="0" vectorEffect="non-scaling-stroke" />
+                              </svg>
+                            )}
+                            {isVideoClip && fadeOutW > 1 && (
+                              <svg
+                                className="timeline__clip-fade"
+                                style={{ right: 0, width: fadeOutW }}
+                                viewBox="0 0 1 1"
+                                preserveAspectRatio="none"
+                              >
+                                <polygon points="0,0 1,0 1,1" />
+                                <line x1="0" y1="0" x2="1" y2="1" vectorEffect="non-scaling-stroke" />
+                              </svg>
+                            )}
+                            {/* Fade handles (visible on hover/selection) */}
+                            {isVideoClip && width > 24 && (
+                              <>
+                                <div
+                                  className="timeline__clip-fade-handle"
+                                  style={{ left: Math.max(1, Math.min(width - 11, fadeInW - 5)) }}
+                                  onMouseDown={(e) => handleFadeMouseDown(e, clip, 'in')}
+                                  title={`Fade in: ${(clip.fadeIn || 0).toFixed(2)}s — drag`}
+                                />
+                                <div
+                                  className="timeline__clip-fade-handle"
+                                  style={{ left: Math.max(1, Math.min(width - 11, width - fadeOutW - 5)) }}
+                                  onMouseDown={(e) => handleFadeMouseDown(e, clip, 'out')}
+                                  title={`Fade out: ${(clip.fadeOut || 0).toFixed(2)}s — drag`}
+                                />
+                              </>
+                            )}
                             <div className="timeline__clip-header" style={{ backgroundColor: `${track.color}33` }}>
                               <span className="timeline__clip-name">{clip.filename}</span>
                               {clip.speed && clip.speed !== 1 && (
                                 <span className="timeline__clip-speed mono">{clip.speed.toFixed(1)}×</span>
                               )}
                             </div>
-                            {/* Audio waveform placeholder */}
+                            {/* Audio waveform (real peaks, decoded once per file) */}
                             {clip.fileType === 'audio' && (
-                              <div className="timeline__clip-waveform">
-                                {Array.from({ length: Math.max(1, Math.floor(width / 3)) }, (_, i) => (
-                                  <div key={i} className="timeline__clip-waveform-bar" style={{
-                                    height: `${20 + Math.sin(i * 0.7) * 30 + Math.cos(i * 1.3) * 20}%`,
-                                    backgroundColor: track.color,
-                                  }} />
-                                ))}
-                              </div>
+                              <ClipWaveform clip={clip} width={Math.max(4, width)} color={track.color} />
                             )}
                             {(hasGraph || clip.hasEffects) && (
                               <div className="timeline__clip-fx-badge" style={{ color: track.color }}>FX</div>
+                            )}
+                            {clip.transition?.type && (
+                              <div className="timeline__clip-transition-badge" title="Has a transition-in — plays over the overlap with the previous clip">⇄</div>
+                            )}
+                            {clip.audioMuted && (
+                              <div className="timeline__clip-audio-muted" title="Clip audio muted">♪×</div>
+                            )}
+                            {/* Keyframe diamonds (clip-relative key times, all params merged) */}
+                            {keyframes.some(k => k.clipId === clip.id) && (
+                              <div className="timeline__clip-keyframes">
+                                {[...new Set(
+                                  keyframes
+                                    .filter(k => k.clipId === clip.id)
+                                    .flatMap(k => k.keys.map(key => Math.round(key.time * 1000)))
+                                )].map(ms => (
+                                  <div
+                                    key={ms}
+                                    className="timeline__keyframe"
+                                    style={{ left: (ms / 1000) * pxPerSec, bottom: 3 }}
+                                    title={`Keyframe @ ${(ms / 1000).toFixed(2)}s (clip time)`}
+                                  />
+                                ))}
+                              </div>
                             )}
                           </div>
                         )
@@ -544,6 +839,45 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
       )}
     </>
   )
+}
+
+/**
+ * Real waveform for an audio clip: canvas of mirrored peak bars covering the
+ * clip's source range. Decodes once per file (waveformCache); shows nothing
+ * until peaks are ready (the clip body itself is the placeholder).
+ */
+function ClipWaveform({ clip, width, color }) {
+  const canvasRef = useRef(null)
+  const wf = useWaveform(clip.fileUrl)
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas || !wf || !wf.peaks || wf.duration <= 0) return
+    const w = Math.max(1, Math.round(width))
+    const h = 26
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    ctx.clearRect(0, 0, w, h)
+    ctx.fillStyle = color || '#00e5ff'
+    ctx.globalAlpha = 0.75
+
+    const { peaks, duration } = wf
+    const srcStart = Math.max(0, clip.sourceStart || 0)
+    const srcEnd = Math.min(duration, clip.sourceEnd || duration)
+    const srcSpan = Math.max(0.001, srcEnd - srcStart)
+    const mid = h / 2
+    for (let x = 0; x < w; x += 2) {
+      const t = srcStart + (x / w) * srcSpan
+      const bucket = Math.min(peaks.length - 1, Math.floor((t / duration) * peaks.length))
+      const p = peaks[bucket] || 0
+      const barH = Math.max(1, p * (h - 2))
+      ctx.fillRect(x, mid - barH / 2, 1.5, barH)
+    }
+  }, [wf, width, color, clip.sourceStart, clip.sourceEnd])
+
+  if (!wf) return null
+  return <canvas ref={canvasRef} className="timeline__clip-waveform-canvas" />
 }
 
 function formatTimecode(seconds) {

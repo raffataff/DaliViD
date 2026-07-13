@@ -7,6 +7,10 @@
 import { parseParams } from './paramParser'
 import { getNodeSource } from '../shaders/shaderRegistry'
 
+// I/O terminals and timeline/camera sources that shouldn't be wrapped into a
+// compound. IMAGE_INPUT is NOT excluded: it's a self-contained source that the
+// unified DAG executor renders inside a compound (image pre-pass), so an image
+// (e.g. as a displacement/blend input) can be compounded like any effect.
 const EXCLUDED_FROM_SELECTION = new Set([
   'OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT',
   'CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT',
@@ -19,6 +23,17 @@ const EXCLUDED_FROM_SELECTION = new Set([
  */
 export function isCompoundable(nodeType) {
   return !EXCLUDED_FROM_SELECTION.has(nodeType)
+}
+
+/**
+ * Can this compound library entry be used as a CLIP TRANSITION?
+ * Requires two image inputs: the renderer binds the 1st to the outgoing frame
+ * (FROM) and the 2nd to the incoming clip (TO). Audio-band terminals don't
+ * count — they route splitter bands, not images.
+ */
+export function isTransitionCompound(entry) {
+  const nodes = entry?.subGraph?.nodes || []
+  return nodes.filter(n => n.type === 'EFFECT_INPUT' && !n.audioBand).length >= 2
 }
 
 /**

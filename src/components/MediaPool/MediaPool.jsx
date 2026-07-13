@@ -5,10 +5,14 @@ import useAudioStore from '../../store/useAudioStore'
 import useAppStore from '../../store/useAppStore'
 import { copyFileToProjectFolder } from '../../utils/projectSerializer'
 import { COMPOUND_PRESETS } from '../../shaders/compoundPresets'
+import { setCameraStream } from '../../gl/cameraRegistry'
+import { getAudioEngine } from '../../audio/AudioEngine'
+import { prepareImageDataURL, dataUrlBytes, formatBytes } from '../../utils/imageProcessing'
 import './MediaPool.css'
 
 const TABS = [
   { id: 'videos', label: 'Videos' },
+  { id: 'images', label: 'Images' },
   { id: 'cameras', label: 'Cameras' },
   { id: 'audio', label: 'Audio' },
   { id: 'effects', label: 'Effects' },
@@ -19,6 +23,7 @@ export default function MediaPool() {
   const [activeTab, setActiveTab] = useState('videos')
   const [importedVideos, setImportedVideos] = useState([])
   const [importedAudio, setImportedAudio] = useState([])
+  const [importedImages, setImportedImages] = useState([])
   const [cameras, setCameras] = useState([])
 
   const clips = useTimelineStore(s => s.clips)
@@ -28,6 +33,8 @@ export default function MediaPool() {
   const tracks = useTimelineStore(s => s.tracks)
   const initClipGraph = useGraphStore(s => s.initClipGraph)
   const projectFolderHandle = useAppStore(s => s.projectFolderHandle)
+  const micEnabled = useAudioStore(s => s.micEnabled)
+  const toggleMic = useAudioStore(s => s.toggleMic)
 
   // Derive media pool entries from timeline clips so loaded projects show their media
   const videoEntries = useMemo(() => {
@@ -220,9 +227,53 @@ export default function MediaPool() {
     input.click()
   }, [tracks, addTrack, addClip, updateClip, initClipGraph, projectFolderHandle])
 
-  // Detect cameras
+  // Import still images. Each image is read as a data URL so it can be embedded
+  // in the IMAGE_INPUT node's params and persisted with the project. Cards are
+  // dragged onto the Node Editor to create an image source node.
+  const handleImportImage = useCallback(() => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'image/*'
+    input.multiple = true
+    input.onchange = async (e) => {
+      const files = Array.from(e.target.files)
+      for (const file of files) {
+        try {
+          // Downscale + re-encode so the embedded data URL stays small.
+          const { dataUrl, width, height } = await prepareImageDataURL(file)
+          const after = dataUrlBytes(dataUrl)
+          const pct = file.size > 0 ? Math.round((1 - after / file.size) * 100) : 0
+          console.log(`[DaliVid] Imported "${file.name}": ${formatBytes(file.size)} → ${formatBytes(after)} (${pct}% smaller)`)
+          const entry = {
+            id: `image_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+            filename: file.name,
+            dataUrl,
+            width,
+            height,
+            size: after,
+          }
+          setImportedImages(prev => [...prev.filter(i => i.filename !== file.name), entry])
+        } catch (err) {
+          console.error('[DaliVid] Failed to import image:', file.name, err)
+        }
+      }
+    }
+    input.click()
+  }, [])
+
+  // Detect cameras. Request permission first so device labels are populated
+  // (enumerateDevices returns blank labels until camera access is granted).
   const handleDetectCameras = useCallback(async () => {
     try {
+      // Prompt for access, then immediately release the probe stream — we only
+      // need it so the browser will reveal device labels below.
+      try {
+        const probe = await navigator.mediaDevices.getUserMedia({ video: true })
+        probe.getTracks().forEach(t => t.stop())
+      } catch (permErr) {
+        console.warn('Camera permission not granted:', permErr)
+      }
+
       const devices = await navigator.mediaDevices.enumerateDevices()
       const videoDevices = devices.filter(d => d.kind === 'videoinput')
       setCameras(videoDevices.map(d => ({
@@ -234,6 +285,57 @@ export default function MediaPool() {
       console.error('Failed to enumerate devices:', err)
     }
   }, [])
+
+  // Start a live camera: open its video+audio stream, add a camera clip to a
+  // video track, hand the stream to the renderer, and route its audio into the
+  // analysis path.
+  const handleSelectCamera = useCallback(async (cam) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: cam.deviceId ? { deviceId: { exact: cam.deviceId } } : true,
+        audio: true,
+      })
+
+      const videoTrackStream = stream.getVideoTracks()[0]
+      const settings = videoTrackStream?.getSettings?.() || {}
+      const width = settings.width || 1280
+      const height = settings.height || 720
+      const fps = settings.frameRate ? Math.round(settings.frameRate) : 30
+
+      let videoTrack = tracks.find(t => t.type === 'video')
+      if (!videoTrack) {
+        const trackId = addTrack('video')
+        videoTrack = { id: trackId }
+      }
+
+      // Live source has no fixed length; give the timeline clip a default
+      // duration the user can trim.
+      const duration = 60
+      const clipId = addClip(videoTrack.id, {
+        filename: cam.label,
+        fileType: 'camera',
+        timelineStart: 0,
+        timelineEnd: duration,
+        sourceStart: 0,
+        sourceEnd: duration,
+        width,
+        height,
+        fps,
+        duration,
+      })
+
+      // Register the stream so the Renderer can upload its frames each tick.
+      setCameraStream(clipId, stream)
+      initClipGraph(clipId, cam.label)
+
+      // Route the webcam's microphone audio (if present) into the analyser.
+      if (stream.getAudioTracks().length > 0) {
+        await getAudioEngine().useExternalAudioStream(stream)
+      }
+    } catch (err) {
+      console.error('Failed to start camera:', err)
+    }
+  }, [tracks, addTrack, addClip, initClipGraph])
 
   const formatSize = (bytes) => {
     if (bytes < 1024) return `${bytes} B`
@@ -298,6 +400,60 @@ export default function MediaPool() {
           </>
         )}
 
+        {/* ── Images Tab ── */}
+        {activeTab === 'images' && (
+          <>
+            <button className="media-pool__import-btn" onClick={handleImportImage}>
+              + Import Image
+            </button>
+            {importedImages.length === 0 ? (
+              <div className="media-pool__empty">
+                <div className="media-pool__empty-icon">
+                  <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1" opacity="0.3">
+                    <rect x="4" y="6" width="24" height="20" rx="2" />
+                    <circle cx="11" cy="13" r="2.5" />
+                    <path d="M4 22l7-6 5 4 4-3 8 7" />
+                  </svg>
+                </div>
+                <p className="media-pool__empty-text">Import images to feed the node graph</p>
+                <p className="media-pool__empty-hint">Drag an image card onto the Node Editor</p>
+              </div>
+            ) : (
+              <div className="media-pool__file-list">
+                {importedImages.map(img => (
+                  <div
+                    key={img.id}
+                    className="media-pool__file-item media-pool__file-item--interactive"
+                    draggable="true"
+                    title="Drag onto the Node Editor to create an Image source node"
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData('application/dalivid-drag', JSON.stringify({
+                        kind: 'node',
+                        nodeType: 'IMAGE_INPUT',
+                        name: 'Image',
+                        imageSrc: img.dataUrl,
+                        imageName: img.filename,
+                      }))
+                      e.dataTransfer.effectAllowed = 'copy'
+                    }}
+                  >
+                    <div className="media-pool__file-thumb" style={{ overflow: 'hidden', padding: 0 }}>
+                      <img src={img.dataUrl} alt="" draggable={false}
+                        style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    </div>
+                    <div className="media-pool__file-info">
+                      <div className="media-pool__file-name">{img.filename}</div>
+                      <div className="media-pool__file-meta mono">
+                        {img.width}×{img.height} · {formatSize(img.size)}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
         {/* ── Cameras Tab ── */}
         {activeTab === 'cameras' && (
           <>
@@ -312,7 +468,12 @@ export default function MediaPool() {
             ) : (
               <div className="media-pool__file-list">
                 {cameras.map(cam => (
-                  <div key={cam.id} className="media-pool__file-item media-pool__file-item--interactive">
+                  <div
+                    key={cam.id}
+                    className="media-pool__file-item media-pool__file-item--interactive"
+                    onClick={() => handleSelectCamera(cam)}
+                    title="Click to add this camera to the timeline"
+                  >
                     <div className="media-pool__file-thumb" style={{ color: 'var(--accent-cyan)' }}>
                       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
                         <rect x="2" y="6" width="14" height="12" rx="1" />
@@ -334,6 +495,13 @@ export default function MediaPool() {
           <>
             <button className="media-pool__import-btn" onClick={handleImportAudio}>
               + Import Audio
+            </button>
+            <button
+              className="media-pool__import-btn"
+              onClick={() => toggleMic()}
+              style={micEnabled ? { borderColor: 'var(--accent-magenta)', color: 'var(--accent-magenta)' } : undefined}
+            >
+              {micEnabled ? '● Microphone On' : 'Enable Microphone'}
             </button>
             {audioEntries.length === 0 ? (
               <div className="media-pool__empty">
@@ -459,6 +627,7 @@ function ScopesBars() {
 }
 
 const EFFECT_PRESETS = [
+  { type: 'IMAGE_INPUT', name: 'Image', color: '#44cc88', icon: '◳' },
   { type: 'EDGE_DETECTION', name: 'Edge Detection', color: '#ff8844', icon: '◈' },
   { type: 'COLOR_INVERSION', name: 'Color / HSV', color: '#ff44cc', icon: '◐' },
   { type: 'GLITCH', name: 'Glitch', color: '#ff3344', icon: '▦' },

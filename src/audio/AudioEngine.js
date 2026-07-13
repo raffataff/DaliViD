@@ -57,6 +57,11 @@ export class AudioEngine {
     this.rafId = null
     this.isRunning = false
 
+    // Per-source (stem) analysers: name → { analyser, freqData, timeData,
+    // bandValues, beatEnergy, beatThreshold, lastBeatTime, connected:Set }.
+    // Tapped PRE-gain, so a muted stem clip still drives reactivity.
+    this.sourceAnalysers = new Map()
+
     // Store accessor
     this._getStore = null
 
@@ -107,9 +112,21 @@ export class AudioEngine {
   }
 
   /**
-   * Connect an HTMLMediaElement (video or audio) as the audio source.
+   * Connect an HTMLMediaElement (video or audio) as an audio source.
+   *
+   * Routing per element:
+   *   source → playbackGain → mediaGain → (master analyser + speakers)
+   *   source → per-name analyser              (full signal, PRE-gain)
+   *
+   * playbackGain carries the clip's audible level (mute/volume/fades — set by
+   * the renderer each frame), so the MASTER analysis hears the audible mix
+   * while a named source's analyser always hears the raw stem. That's what
+   * lets a muted drums.wav still drive visuals.
+   *
+   * @param {HTMLMediaElement} mediaElement
+   * @param {string|null} sourceName — clip filename for per-stem analysis
    */
-  connectMediaElement(mediaElement) {
+  connectMediaElement(mediaElement, sourceName = null) {
     if (!this.ctx) return
 
     try {
@@ -117,11 +134,41 @@ export class AudioEngine {
       if (!sourceNode) {
         sourceNode = this.ctx.createMediaElementSource(mediaElement)
         mediaElement._mediaSourceNode = sourceNode
-        sourceNode.connect(this.mediaGain)
+        const playbackGain = this.ctx.createGain()
+        mediaElement._playbackGain = playbackGain
+        sourceNode.connect(playbackGain)
+        playbackGain.connect(this.mediaGain)
         console.log('[AudioEngine] Created and connected media element source node')
       }
       this.mediaSource = sourceNode
       this.activeSource = 'track'
+
+      // Per-source analysis tap (best-effort; never affects playback).
+      if (sourceName) {
+        let entry = this.sourceAnalysers.get(sourceName)
+        if (!entry) {
+          const analyser = this.ctx.createAnalyser()
+          analyser.fftSize = this.fftSize
+          analyser.smoothingTimeConstant = this.smoothingTimeConstant
+          analyser.minDecibels = -90
+          analyser.maxDecibels = -10
+          entry = {
+            analyser,
+            freqData: new Uint8Array(analyser.frequencyBinCount),
+            timeData: new Uint8Array(analyser.fftSize),
+            bandValues: new Float32Array(8),
+            beatEnergy: 0,
+            beatThreshold: 0.35,
+            lastBeatTime: 0,
+            connected: new Set(),
+          }
+          this.sourceAnalysers.set(sourceName, entry)
+        }
+        if (!entry.connected.has(sourceNode)) {
+          sourceNode.connect(entry.analyser)
+          entry.connected.add(sourceNode)
+        }
+      }
     } catch (e) {
       console.warn('[AudioEngine] Could not connect media element:', e.message)
     }
@@ -140,6 +187,23 @@ export class AudioEngine {
     this.micSource = this.ctx.createMediaStreamSource(stream)
     this.micSource.connect(this.micGain)
     this.micStream = stream
+  }
+
+  /**
+   * Route an externally-provided stream's audio (e.g. a webcam's microphone
+   * track captured alongside its video) into the mic input path so it is
+   * analysed and monitored. Returns true if an audio track was connected.
+   */
+  async useExternalAudioStream(stream) {
+    if (!this.ctx) await this.init()
+    if (!stream || typeof stream.getAudioTracks !== 'function') return false
+    if (stream.getAudioTracks().length === 0) return false
+
+    this.connectStream(stream)
+    this.micGain.gain.setValueAtTime(1, this.ctx.currentTime)
+    this.activeSource = 'mic'
+    console.log('[AudioEngine] External audio stream connected')
+    return true
   }
 
   /**
@@ -218,20 +282,17 @@ export class AudioEngine {
   }
 
   /**
-   * Perform FFT analysis and extract 8-band values + beat detection.
+   * Read an analyser and fill `bandValues` with the 8 bands (7 FFT + RMS).
+   * Shared by the master mix and every per-source (stem) analyser.
    */
-  _analyze() {
-    if (!this.analyser || !this.freqData) return
+  _extractBandsInto(analyser, freqData, timeData, bandValues) {
+    analyser.getByteFrequencyData(freqData)
+    analyser.getByteTimeDomainData(timeData)
 
-    // Get frequency data
-    this.analyser.getByteFrequencyData(this.freqData)
-    this.analyser.getByteTimeDomainData(this.timeData)
-
-    const binCount = this.analyser.frequencyBinCount
+    const binCount = analyser.frequencyBinCount
     const sampleRate = this.ctx.sampleRate
     const hzPerBin = sampleRate / this.fftSize
 
-    // Extract 8 bands
     for (let b = 0; b < 7; b++) {
       const [lo, hi] = BAND_RANGES[b]
       const startBin = Math.floor(lo / hzPerBin)
@@ -240,19 +301,28 @@ export class AudioEngine {
       let sum = 0
       let count = 0
       for (let i = startBin; i <= endBin; i++) {
-        sum += this.freqData[i] / 255
+        sum += freqData[i] / 255
         count++
       }
-      this.bandValues[b] = count > 0 ? sum / count : 0
+      bandValues[b] = count > 0 ? sum / count : 0
     }
 
-    // RMS from time-domain data
     let rmsSum = 0
-    for (let i = 0; i < this.timeData.length; i++) {
-      const sample = (this.timeData[i] - 128) / 128
+    for (let i = 0; i < timeData.length; i++) {
+      const sample = (timeData[i] - 128) / 128
       rmsSum += sample * sample
     }
-    this.bandValues[7] = Math.sqrt(rmsSum / this.timeData.length)
+    bandValues[7] = Math.sqrt(rmsSum / timeData.length)
+  }
+
+  /**
+   * Perform FFT analysis and extract 8-band values + beat detection —
+   * for the master mix and every connected per-source (stem) analyser.
+   */
+  _analyze() {
+    if (!this.analyser || !this.freqData) return
+
+    this._extractBandsInto(this.analyser, this.freqData, this.timeData, this.bandValues)
 
     // Beat detection — energy threshold on bass + sub-bass
     const bassEnergy = (this.bandValues[0] + this.bandValues[1]) * 0.5
@@ -269,12 +339,30 @@ export class AudioEngine {
       this.beatThreshold = this.beatThreshold * 0.95 + bassEnergy * 0.05
     }
 
+    // Per-source stems: same extraction + per-source beat state.
+    let sourceResults = null
+    for (const [name, entry] of this.sourceAnalysers) {
+      this._extractBandsInto(entry.analyser, entry.freqData, entry.timeData, entry.bandValues)
+      const e = (entry.bandValues[0] + entry.bandValues[1]) * 0.5
+      const srcBeat = e > entry.beatThreshold &&
+                      e > entry.beatEnergy * 1.2 &&
+                      (now - entry.lastBeatTime) > this.beatMinInterval
+      entry.beatEnergy = entry.beatEnergy * this.beatDecay + e * (1 - this.beatDecay)
+      if (srcBeat) {
+        entry.lastBeatTime = now
+        entry.beatThreshold = entry.beatThreshold * 0.95 + e * 0.05
+      }
+      if (!sourceResults) sourceResults = {}
+      sourceResults[name] = { bands: entry.bandValues, isBeat: srcBeat }
+    }
+
     // Write to store
     if (this._getStore) {
       const store = this._getStore()
       store.updateBands(this.bandValues)
       store.updateBeat(isBeat)
       store.updatePeakHold()
+      if (sourceResults && store.updateSources) store.updateSources(sourceResults)
     }
   }
 

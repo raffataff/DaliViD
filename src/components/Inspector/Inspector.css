@@ -23,6 +23,41 @@
   border-bottom: 1px solid var(--border-subtle);
 }
 
+/* ── Keyframe button (◆ per animatable param) ── */
+.inspector__param-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.inspector__kf-btn {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  font-size: 9px;
+  line-height: 16px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0.5;
+}
+.inspector__kf-btn:hover {
+  opacity: 1;
+  color: var(--accent-amber);
+}
+.inspector__kf-btn--track {
+  /* param is animated, but no key at the playhead */
+  color: var(--accent-amber);
+  opacity: 0.55;
+}
+.inspector__kf-btn--on {
+  /* key exactly at the playhead */
+  color: var(--accent-amber);
+  opacity: 1;
+  text-shadow: 0 0 6px var(--accent-amber);
+}
+
 .inspector__field {
   display: flex;
   align-items: center;

@@ -152,6 +152,26 @@
   color: var(--accent-cyan);
 }
 
+/* Over-budget warning */
+.export-modal__warning {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  background: rgba(255, 170, 0, 0.08);
+  border: 1px solid var(--accent-amber, #ffaa00);
+  border-radius: var(--radius-sm);
+}
+.export-modal__warning span {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--accent-amber, #ffaa00);
+}
+.export-modal__warning .export-modal__preset-btn {
+  flex: none;
+  align-self: flex-start;
+}
+
 /* Progress */
 .export-modal__progress {
   display: flex;
