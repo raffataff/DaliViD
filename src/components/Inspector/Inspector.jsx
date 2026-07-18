@@ -430,7 +430,7 @@ function ClipInspector({ clipId }) {
   const clip = clips.find(c => c.id === clipId)
   if (!clip) return <div className="inspector__empty">No clip selected</div>
 
-  const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera'
+  const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen'
 
   // Node-graph transitions: any library compound with ≥ 2 image inputs.
   const transitionCompounds = compoundLibrary.filter(isTransitionCompound)
@@ -473,7 +473,7 @@ function ClipInspector({ clipId }) {
           </div>
           <div className="inspector__field"><label className="inspector__label">Volume</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={clip.volume == null ? 1 : clip.volume} onChange={(e) => updateClip(clipId, { volume: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{((clip.volume == null ? 1 : clip.volume) * 100).toFixed(0)}%</span></div></div>
           <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '0 8px 6px' }}>
-            Audio follows the clip's fades; transitions crossfade it automatically
+            Audio follows the clip&apos;s fades; transitions crossfade it automatically
           </div>
         </>
       )}

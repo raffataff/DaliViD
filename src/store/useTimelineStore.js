@@ -134,7 +134,7 @@ const useTimelineStore = create((set, get) => ({
     const clip = {
       filename: clipData.filename || 'Untitled',
       fileUrl: clipData.fileUrl || null,
-      fileType: clipData.fileType || 'video', // 'video' | 'audio' | 'camera'
+      fileType: clipData.fileType || 'video', // 'video' | 'audio' | 'camera' | 'screen'
       timelineStart: clipData.timelineStart || 0,
       timelineEnd: clipData.timelineEnd || 10,
       sourceStart: clipData.sourceStart || 0,

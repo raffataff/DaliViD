@@ -275,8 +275,8 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
         const trackId = trackEl.getAttribute('data-track-id')
         const trackType = trackEl.getAttribute('data-track-type')
 
-        // Helper to check clip compatibility (video/camera on video tracks, audio on audio tracks)
-        const isCompatible = (clip.fileType === 'video' || clip.fileType === 'camera')
+        // Helper to check clip compatibility (video/camera/screen on video tracks, audio on audio tracks)
+        const isCompatible = (clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen')
           ? trackType === 'video'
           : (clip.fileType === 'audio' ? trackType === 'audio' : false)
 
@@ -714,7 +714,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                         const isTrimming = trimming?.clipId === clip.id
                         // Fade overlays / handles are video-only: the compositor's
                         // opacity ramp doesn't touch audio playback (yet).
-                        const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera'
+                        const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen'
                         const fadeInW = Math.min(width, (clip.fadeIn || 0) * pxPerSec)
                         const fadeOutW = Math.min(width, (clip.fadeOut || 0) * pxPerSec)
                         return (

@@ -13,7 +13,7 @@ import { getNodeSource } from '../shaders/shaderRegistry'
 // (e.g. as a displacement/blend input) can be compounded like any effect.
 const EXCLUDED_FROM_SELECTION = new Set([
   'OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT',
-  'CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT',
+  'CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT',
   'AUDIO_INPUT', 'AUDIO_SPLITTER',
   'EFFECT_INPUT',
 ])

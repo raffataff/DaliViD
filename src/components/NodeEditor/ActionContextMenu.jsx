@@ -13,7 +13,7 @@ export function pickCompoundColor(existingLibrary) {
   return COMPOUND_COLORS[Math.floor(Math.random() * COMPOUND_COLORS.length)]
 }
 
-export default function ActionContextMenu({ position, selectedCount, onCreateCompound, onCopy, onClose }) {
+export default function ActionContextMenu({ position, selectedCount, onCreateCompound, onDuplicate, onToggleBypass, onDeleteNodes, onDeselect, onClose }) {
   const menuRef = useRef(null)
 
   const handleKeyDown = useCallback((e) => {
@@ -50,9 +50,9 @@ export default function ActionContextMenu({ position, selectedCount, onCreateCom
       <div className="node-canvas__menu-section">
         <button
           className="node-canvas__menu-item"
-          onClick={() => { onCopy(); onClose() }}
+          onClick={() => { onDuplicate(); onClose() }}
         >
-          Copy Nodes
+          Duplicate Nodes
         </button>
         <button
           className="node-canvas__menu-item"
@@ -61,11 +61,23 @@ export default function ActionContextMenu({ position, selectedCount, onCreateCom
         >
           Create Compound Effect
         </button>
+        <button
+          className="node-canvas__menu-item"
+          onClick={() => { onToggleBypass(); onClose() }}
+        >
+          Bypass / Enable All
+        </button>
       </div>
       <div className="node-canvas__menu-section">
         <button
+          className="node-canvas__menu-item node-canvas__menu-item--danger"
+          onClick={() => { onDeleteNodes(); onClose() }}
+        >
+          Delete Nodes
+        </button>
+        <button
           className="node-canvas__menu-item"
-          onClick={() => { onClose() }}
+          onClick={() => { onDeselect?.(); onClose() }}
           style={{ color: 'var(--text-disabled)' }}
         >
           Deselect

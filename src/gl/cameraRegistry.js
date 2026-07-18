@@ -1,11 +1,14 @@
 /**
  * DaliVid — cameraRegistry.js
- * In-memory registry mapping a timeline clipId → its live camera MediaStream.
+ * In-memory registry mapping a timeline clipId → its live stream (camera OR
+ * screen capture) MediaStream.
  *
- * Camera clips are backed by a getUserMedia MediaStream rather than a file URL,
- * and a MediaStream can't be serialized into the timeline/clip state. This tiny
- * module lets the capture UI (MediaPool) hand a stream to the Renderer, which
- * reads it back by clipId each frame to upload camera frames to a texture.
+ * Live-source clips are backed by a getUserMedia / getDisplayMedia MediaStream
+ * rather than a file URL, and a MediaStream can't be serialized into the
+ * timeline/clip state. This tiny module lets the capture UI (MediaPool) hand a
+ * stream to the Renderer, which reads it back by clipId each frame to upload
+ * frames to a texture. (Exports keep the `Camera` name — screen streams reuse
+ * them unchanged.)
  */
 
 const _streams = new Map() // clipId → MediaStream

@@ -897,6 +897,24 @@ void main() {
 }
 `)
 
+// ── Screen Input (passthrough — composited frame, like camera) ──
+registerShader('SCREEN_INPUT', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+// @param name="Mirror X" type=bool default=false
+uniform bool u_mirror_x;
+// @param name="Mirror Y" type=bool default=false
+uniform bool u_mirror_y;
+out vec4 fragColor;
+void main() {
+  vec2 uv = v_uv;
+  if (u_mirror_x) uv.x = 1.0 - uv.x;
+  if (u_mirror_y) uv.y = 1.0 - uv.y;
+  fragColor = texture(u_texture, uv);
+}
+`)
+
 // ── Output (final passthrough to screen / export) ──
 registerShader('OUTPUT', `#version 300 es
 precision highp float;

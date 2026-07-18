@@ -1,6 +1,6 @@
 import { useRef, useState, useCallback, useMemo, useEffect } from 'react'
 import { IconChevronDown, IconFitWindow, IconShaderGenerate } from '../common/Icons'
-import NodeCard, { NODE_WIDTH } from './NodeCard'
+import NodeCard, { NODE_WIDTH, NODE_COLORS } from './NodeCard'
 import Noodle, { NoodleDrag, NoodleFilters } from './Noodle'
 import NodeSearchMenu from './NodeSearchMenu'
 import MonacoDrawer from './MonacoDrawer'
@@ -20,7 +20,7 @@ import './NodeCanvas.css'
 
 const EXCLUDED_FROM_MARQUEE = new Set([
   'OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT',
-  'CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT',
+  'CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT',
   'AUDIO_INPUT', 'AUDIO_SPLITTER',
 ])
 
@@ -47,6 +47,19 @@ const AUDIO_AUTOWIRE = {
   // Audio-reactive post effect
   PARTICLE_DISPLACE: ['rms'],
 }
+
+// Estimated card height: header(30) + sockets + params + footer. Shared by the
+// marquee hit test, fit-to-window, the wire-insert hit test and the minimap so
+// they can never drift apart again.
+function estimateNodeHeight(node, params) {
+  const { inputs, outputs } = getNodeSockets(node.type, params, node)
+  const socketCount = Math.max(inputs.filter(s => !s.isParam).length, outputs.length)
+  return 30 + socketCount * 22 + params.length * 26 + 40
+}
+
+// Node clipboard (Ctrl+C / Ctrl+V) — module-level so it survives graph
+// switches (copy in a clip graph, paste in master) and canvas remounts.
+let nodeClipboard = null
 
 // Sample points along a noodle's cubic bezier (same control-point math as
 // Noodle.jsx) — used to hit-test "is this wire under the dragged node?".
@@ -117,6 +130,13 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   const marqueeMousePos = useRef({ x: 0, y: 0 })
   const isPanning = useRef(false)
   const lastPanPos = useRef({ x: 0, y: 0 })
+  const panMoved = useRef(false)
+  // Last mouse position over the canvas (client coords) — paste target.
+  const lastMouseClient = useRef(null)
+  // The mouseup that ends a marquee (or a pan) also fires a `click` on the
+  // grid, and handleCanvasClick would instantly clear the fresh selection and
+  // hide the action menu. Set this to swallow exactly that one click.
+  const suppressCanvasClick = useRef(false)
 
   const outputNode = graph.nodes.find(n => n.type === 'OUTPUT' || n.type === 'CLIP_OUTPUT' || n.type === 'EFFECT_OUTPUT')
   // Active preview tap, but only when it points at a real upstream node. The tap
@@ -218,29 +238,58 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   }, [handleWheel])
 
   // ── Pan / Marquee ──
+  // Which nodes intersect a marquee rect (graph-space), unioned with the
+  // selection that existed when a Shift+drag (additive) marquee started.
+  // Shared by the live highlight (mousemove) and the finalize (mouseup).
+  const computeMarqueeSelection = useCallback((m) => {
+    const left = Math.min(m.startX, m.endX)
+    const right = Math.max(m.startX, m.endX)
+    const top = Math.min(m.startY, m.endY)
+    const bottom = Math.max(m.startY, m.endY)
+    const selected = m.baseIds ? [...m.baseIds] : []
+    const already = new Set(selected)
+    for (const node of graph.nodes) {
+      if (EXCLUDED_FROM_MARQUEE.has(node.type) || node.locked || already.has(node.id)) continue
+      const nodeBottom = node.position.y + estimateNodeHeight(node, nodeParamConfigs[node.id] || [])
+      // Any intersection counts
+      if (node.position.x < right && node.position.x + NODE_WIDTH > left &&
+          node.position.y < bottom && nodeBottom > top) {
+        selected.push(node.id)
+      }
+    }
+    return selected
+  }, [graph.nodes, nodeParamConfigs])
+
   const handleMouseDown = useCallback((e) => {
     const isGrid = e.target === containerRef.current?.querySelector('.node-canvas__grid')
 
-    if (e.button === 1 || (e.button === 0 && isGrid && !e.ctrlKey && !e.altKey)) {
-      // Middle-click or plain left-click on grid -> pan
+    if (e.button === 1 || (e.button === 0 && isGrid && e.altKey)) {
+      // Middle-click anywhere or Alt+left-drag on grid -> pan
       isPanning.current = true
+      panMoved.current = false
       lastPanPos.current = { x: e.clientX, y: e.clientY }
       e.preventDefault()
-    } else if (e.button === 0 && isGrid && e.ctrlKey) {
-      // Ctrl+left-click on grid -> start marquee selection
+    } else if (e.button === 0 && isGrid) {
+      // Plain left-drag on grid -> marquee box-select (Ctrl+drag still works).
+      // Shift+drag is additive: the box's nodes join the existing selection.
       const rect = containerRef.current.getBoundingClientRect()
       const graphX = (e.clientX - rect.left - pan.x) / zoom
       const graphY = (e.clientY - rect.top - pan.y) / zoom
-      setMarquee({ startX: graphX, startY: graphY, endX: graphX, endY: graphY })
+      setMarquee({
+        startX: graphX, startY: graphY, endX: graphX, endY: graphY,
+        baseIds: e.shiftKey ? [...selectedNodeIds] : [],
+      })
       marqueeMousePos.current = { x: e.clientX, y: e.clientY }
       e.preventDefault()
     }
-  }, [pan, zoom])
+  }, [pan, zoom, selectedNodeIds])
 
   const handleMouseMove = useCallback((e) => {
+    lastMouseClient.current = { x: e.clientX, y: e.clientY }
     if (isPanning.current) {
       const dx = e.clientX - lastPanPos.current.x
       const dy = e.clientY - lastPanPos.current.y
+      if (dx !== 0 || dy !== 0) panMoved.current = true
       setPan(prev => ({ x: prev.x + dx, y: prev.y + dy }))
       lastPanPos.current = { x: e.clientX, y: e.clientY }
     }
@@ -248,8 +297,15 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       const rect = containerRef.current.getBoundingClientRect()
       const graphX = (e.clientX - rect.left - pan.x) / zoom
       const graphY = (e.clientY - rect.top - pan.y) / zoom
-      setMarquee(prev => ({ ...prev, endX: graphX, endY: graphY }))
+      const next = { ...marquee, endX: graphX, endY: graphY }
+      setMarquee(next)
       marqueeMousePos.current = { x: e.clientX, y: e.clientY }
+      // Live highlight: keep the multi-selection in sync with the box while
+      // dragging (only write to the store when membership actually changes).
+      const selected = computeMarqueeSelection(next)
+      if (selected.length !== selectedNodeIds.length || selected.some((id, i) => id !== selectedNodeIds[i])) {
+        setSelectedNodeIds(selected)
+      }
     }
     if (dragNoodle) {
       const rect = containerRef.current.getBoundingClientRect()
@@ -259,37 +315,28 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
         toY: (e.clientY - rect.top - pan.y) / zoom,
       }))
     }
-  }, [marquee, dragNoodle, pan, zoom])
+  }, [marquee, dragNoodle, pan, zoom, computeMarqueeSelection, selectedNodeIds, setSelectedNodeIds])
 
   const handleMouseUp = useCallback(() => {
-    isPanning.current = false
+    if (isPanning.current) {
+      isPanning.current = false
+      // A drag-pan's release also fires a click on the grid, which would clear
+      // the current selection — only a stationary click should do that.
+      if (panMoved.current) suppressCanvasClick.current = true
+    }
 
     if (marquee) {
-      // Compute which nodes intersect the marquee
-      const marqueeLeft = Math.min(marquee.startX, marquee.endX)
-      const marqueeRight = Math.max(marquee.startX, marquee.endX)
-      const marqueeTop = Math.min(marquee.startY, marquee.endY)
-      const marqueeBottom = Math.max(marquee.startY, marquee.endY)
-
-      const selected = []
-      for (const node of graph.nodes) {
-        if (EXCLUDED_FROM_MARQUEE.has(node.type) || node.locked) continue
-        const nodeLeft = node.position.x
-        const nodeRight = node.position.x + NODE_WIDTH
-        const nodeTop = node.position.y
-        // Estimate card height: header(30) + sockets + params
-        const paramCount = nodeParamConfigs[node.id]?.length || 0
-        const socketCount = Math.max(
-          getNodeSockets(node.type, nodeParamConfigs[node.id] || [], node).inputs.filter(s => !s.isParam).length,
-          getNodeSockets(node.type, nodeParamConfigs[node.id] || [], node).outputs.length
-        )
-        const nodeBottom = node.position.y + 30 + socketCount * 22 + paramCount * 26 + 40
-
-        // Any intersection counts
-        if (nodeLeft < marqueeRight && nodeRight > marqueeLeft && nodeTop < marqueeBottom && nodeBottom > marqueeTop) {
-          selected.push(node.id)
-        }
+      // A box smaller than ~4px is a stationary click, not a box-select — let
+      // the ensuing grid click clear the selection as it always did.
+      const tiny = Math.abs(marquee.endX - marquee.startX) < 4 / zoom &&
+                   Math.abs(marquee.endY - marquee.startY) < 4 / zoom
+      if (tiny) {
+        setMarquee(null)
+        return
       }
+
+      const selected = computeMarqueeSelection(marquee)
+      suppressCanvasClick.current = true
 
       if (selected.length > 0) {
         setSelectedNodeIds(selected)
@@ -305,7 +352,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     if (dragNoodle) {
       setDragNoodle(null)
     }
-  }, [marquee, dragNoodle, graph.nodes, nodeParamConfigs, setSelectedNodeIds, clearNodeSelection])
+  }, [marquee, dragNoodle, zoom, computeMarqueeSelection, setSelectedNodeIds, clearNodeSelection])
 
   // Finalize pan/marquee/noodle on release ANYWHERE — not just over the canvas.
   // Node cards stopPropagation on mouseup, so a release over a node never reached
@@ -329,7 +376,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   }, [])
 
   // ── Actions from context menu ──
-  const handleCopySelectedNodes = useCallback(() => {
+  const handleDuplicateSelectedNodes = useCallback(() => {
     const selected = new Set(selectedNodeIds)
     const nodeIdMap = {}
     for (const nodeId of selectedNodeIds) {
@@ -351,6 +398,73 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     setSelectedNodeIds(Object.values(nodeIdMap))
     setShowActionMenu(false)
   }, [selectedNodeIds, graph, addNode, addEdge, graphLevel, graphClipId, setSelectedNodeIds])
+
+  const handleDeleteSelectedNodes = useCallback(() => {
+    for (const id of selectedNodeIds) {
+      const node = graph.nodes.find(n => n.id === id)
+      if (node && !node.locked) removeNode(graphLevel, graphClipId, id)
+    }
+    clearNodeSelection()
+    setShowActionMenu(false)
+  }, [selectedNodeIds, graph.nodes, removeNode, graphLevel, graphClipId, clearNodeSelection])
+
+  const handleToggleBypassSelected = useCallback(() => {
+    // If any selected node is active, bypass all; otherwise un-bypass all —
+    // one click always lands the group in a uniform state.
+    const nodes = selectedNodeIds.map(id => graph.nodes.find(n => n.id === id)).filter(Boolean)
+    const bypass = nodes.some(n => !n.bypassed)
+    for (const n of nodes) updateNode(graphLevel, graphClipId, n.id, { bypassed: bypass })
+    setShowActionMenu(false)
+  }, [selectedNodeIds, graph.nodes, updateNode, graphLevel, graphClipId])
+
+  // ── Clipboard (Ctrl+C / Ctrl+V) ──
+  const handleCopyToClipboard = useCallback(() => {
+    const ids = selectedNodeIds.length > 0 ? selectedNodeIds : (selectedNodeId ? [selectedNodeId] : [])
+    const nodes = ids
+      .map(id => graph.nodes.find(n => n.id === id))
+      .filter(n => n && !n.locked && !EXCLUDED_FROM_MARQUEE.has(n.type))
+    if (nodes.length === 0) return
+    const idSet = new Set(nodes.map(n => n.id))
+    nodeClipboard = {
+      nodes: JSON.parse(JSON.stringify(nodes)),
+      edges: graph.edges
+        .filter(e => idSet.has(e.fromNode) && idSet.has(e.toNode))
+        .map(e => ({ ...e })),
+    }
+  }, [selectedNodeIds, selectedNodeId, graph.nodes, graph.edges])
+
+  const handlePasteFromClipboard = useCallback(() => {
+    if (!nodeClipboard || nodeClipboard.nodes.length === 0) return
+    // Anchor the copied layout's top-left at the cursor (if it's over the
+    // canvas), else offset from the original spot.
+    let minX = Infinity, minY = Infinity
+    for (const n of nodeClipboard.nodes) {
+      minX = Math.min(minX, n.position.x)
+      minY = Math.min(minY, n.position.y)
+    }
+    let baseX = minX + 40, baseY = minY + 40
+    const rect = containerRef.current?.getBoundingClientRect()
+    const mouse = lastMouseClient.current
+    if (rect && mouse &&
+        mouse.x >= rect.left && mouse.x <= rect.right &&
+        mouse.y >= rect.top && mouse.y <= rect.bottom) {
+      baseX = (mouse.x - rect.left - pan.x) / zoom
+      baseY = (mouse.y - rect.top - pan.y) / zoom
+    }
+    const idMap = {}
+    for (const n of nodeClipboard.nodes) {
+      const copy = JSON.parse(JSON.stringify(n))
+      delete copy.id // addNode assigns a fresh id
+      idMap[n.id] = addNode(graphLevel, graphClipId, {
+        ...copy,
+        position: { x: baseX + (n.position.x - minX), y: baseY + (n.position.y - minY) },
+      })
+    }
+    for (const e of nodeClipboard.edges) {
+      addEdge(graphLevel, graphClipId, idMap[e.fromNode], e.fromSocket, idMap[e.toNode], e.toSocket)
+    }
+    setSelectedNodeIds(Object.values(idMap))
+  }, [addNode, addEdge, graphLevel, graphClipId, pan, zoom, setSelectedNodeIds])
 
   const handleCreateCompound = useCallback(() => {
     setShowActionMenu(false)
@@ -639,8 +753,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     if (inputs.length === 0 || outputs.length === 0) return null
 
     // Approximate the card's bounding box (same estimate as the marquee).
-    const socketCount = Math.max(inputs.filter(s => !s.isParam).length, outputs.length)
-    const height = 30 + socketCount * 22 + params.length * 26 + 40
+    const height = estimateNodeHeight(node, params)
     const box = { left: position.x, right: position.x + NODE_WIDTH, top: position.y, bottom: position.y + height }
     const cx = position.x + NODE_WIDTH / 2
     const cy = position.y + height / 2
@@ -703,13 +816,54 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   }, [])
 
   const handleNodeMove = useCallback((nodeId, position, e) => {
+    // Group drag: moving a multi-selected node moves the whole selection.
+    // NodeCard captures this callback at mousedown, so `graph.nodes` positions
+    // here are the drag-START positions — the delta is cumulative and each
+    // node lands at start + delta, which is exactly right.
+    if (selectedNodeIds.length > 1 && selectedNodeIds.includes(nodeId)) {
+      const dragged = graph.nodes.find(n => n.id === nodeId)
+      const dx = position.x - (dragged?.position.x ?? position.x)
+      const dy = position.y - (dragged?.position.y ?? position.y)
+      updateNode(graphLevel, graphClipId, nodeId, { position })
+      for (const id of selectedNodeIds) {
+        if (id === nodeId) continue
+        const other = graph.nodes.find(n => n.id === id)
+        if (other && !other.locked) {
+          updateNode(graphLevel, graphClipId, id, {
+            position: { x: other.position.x + dx, y: other.position.y + dy },
+          })
+        }
+      }
+      applyInsertTarget(null) // no wire-insert while dragging a group
+      return
+    }
     updateNode(graphLevel, graphClipId, nodeId, { position })
     if (e && (e.ctrlKey || e.metaKey)) {
       applyInsertTarget(findInsertCandidate(nodeId, position))
     } else if (insertTargetRef.current) {
       applyInsertTarget(null)
     }
-  }, [updateNode, graphLevel, graphClipId, findInsertCandidate, applyInsertTarget])
+  }, [updateNode, graphLevel, graphClipId, selectedNodeIds, graph.nodes, findInsertCandidate, applyInsertTarget])
+
+  // Node selection from a card click/drag. Ctrl+click toggles the node in and
+  // out of the multi-selection; a plain click on a node that's already part of
+  // the multi-selection keeps the group intact (so it can be group-dragged)
+  // while focusing the Inspector on it.
+  const handleNodeSelect = useCallback((nodeId, e) => {
+    if (e && (e.ctrlKey || e.metaKey)) {
+      const next = selectedNodeIds.includes(nodeId)
+        ? selectedNodeIds.filter(id => id !== nodeId)
+        : [...selectedNodeIds, nodeId]
+      setSelectedNodeIds(next)
+      return
+    }
+    if (selectedNodeIds.includes(nodeId)) {
+      selectNode(nodeId) // clears selectedNodeIds…
+      setSelectedNodeIds(selectedNodeIds) // …so restore the group
+    } else {
+      selectNode(nodeId)
+    }
+  }, [selectedNodeIds, setSelectedNodeIds, selectNode])
 
   const handleNodeMoveEnd = useCallback((nodeId) => {
     const target = insertTargetRef.current
@@ -771,10 +925,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     // Frame every node (with padding) instead of just resetting the view.
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
     for (const node of graph.nodes) {
-      const params = nodeParamConfigs[node.id] || []
-      const { inputs, outputs } = getNodeSockets(node.type, params, node)
-      const socketCount = Math.max(inputs.filter(s => !s.isParam).length, outputs.length)
-      const height = 30 + socketCount * 22 + params.length * 26 + 40
+      const height = estimateNodeHeight(node, nodeParamConfigs[node.id] || [])
       minX = Math.min(minX, node.position.x)
       minY = Math.min(minY, node.position.y)
       maxX = Math.max(maxX, node.position.x + NODE_WIDTH)
@@ -791,7 +942,89 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     })
   }, [graph.nodes, nodeParamConfigs])
 
+  // ── Minimap ──
+  // Graph → minimap mapping: fit the graph's bounding box (plus margin, so the
+  // viewport rect stays visible when panned past the nodes) into 180×100.
+  const MINIMAP_W = 180
+  const MINIMAP_H = 100
+  const minimap = useMemo(() => {
+    if (graph.nodes.length === 0) return null
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    const heights = {}
+    for (const node of graph.nodes) {
+      const h = estimateNodeHeight(node, nodeParamConfigs[node.id] || [])
+      heights[node.id] = h
+      minX = Math.min(minX, node.position.x)
+      minY = Math.min(minY, node.position.y)
+      maxX = Math.max(maxX, node.position.x + NODE_WIDTH)
+      maxY = Math.max(maxY, node.position.y + h)
+    }
+    const MARGIN = 300
+    minX -= MARGIN; minY -= MARGIN; maxX += MARGIN; maxY += MARGIN
+    const scale = Math.min(MINIMAP_W / (maxX - minX), MINIMAP_H / (maxY - minY))
+    const ox = (MINIMAP_W - (maxX - minX) * scale) / 2
+    const oy = (MINIMAP_H - (maxY - minY) * scale) / 2
+    const toMini = (gx, gy) => ({ x: ox + (gx - minX) * scale, y: oy + (gy - minY) * scale })
+    return {
+      minX, minY, scale, ox, oy,
+      rects: graph.nodes.map(node => {
+        const p = toMini(node.position.x, node.position.y)
+        return {
+          id: node.id,
+          x: p.x, y: p.y,
+          w: Math.max(2, NODE_WIDTH * scale),
+          h: Math.max(2, heights[node.id] * scale),
+          color: node.type === 'COMPOUND' ? (node.color || '#ff00aa') : (NODE_COLORS[node.type] || '#00e5ff'),
+        }
+      }),
+    }
+  }, [graph.nodes, nodeParamConfigs])
+
+  // Visible-area rectangle in minimap coords (recomputed on pan/zoom renders).
+  const minimapView = useMemo(() => {
+    if (!minimap) return null
+    const rect = containerRef.current?.getBoundingClientRect()
+    if (!rect) return null
+    const gx = -pan.x / zoom
+    const gy = -pan.y / zoom
+    return {
+      x: minimap.ox + (gx - minimap.minX) * minimap.scale,
+      y: minimap.oy + (gy - minimap.minY) * minimap.scale,
+      w: (rect.width / zoom) * minimap.scale,
+      h: (rect.height / zoom) * minimap.scale,
+    }
+  }, [minimap, pan, zoom])
+
+  // Click/drag the minimap to jump/scrub the view.
+  const handleMinimapMouseDown = useCallback((e) => {
+    if (!minimap) return
+    e.stopPropagation()
+    e.preventDefault()
+    const mmRect = e.currentTarget.getBoundingClientRect()
+    const rect = containerRef.current?.getBoundingClientRect()
+    if (!rect) return
+    const centerOn = (cx, cy) => {
+      const gx = minimap.minX + (cx - mmRect.left - minimap.ox) / minimap.scale
+      const gy = minimap.minY + (cy - mmRect.top - minimap.oy) / minimap.scale
+      setPan({ x: rect.width / 2 - gx * zoom, y: rect.height / 2 - gy * zoom })
+    }
+    centerOn(e.clientX, e.clientY)
+    const onMove = (ev) => centerOn(ev.clientX, ev.clientY)
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [minimap, zoom])
+
   const handleCanvasClick = useCallback((e) => {
+    // Swallow the click generated by a marquee/pan release — it would clear
+    // the selection (and hide the action menu) the instant they appeared.
+    if (suppressCanvasClick.current) {
+      suppressCanvasClick.current = false
+      return
+    }
     if (e.target === containerRef.current?.querySelector('.node-canvas__grid')) {
       clearSelection()
       clearNodeSelection()
@@ -839,26 +1072,51 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
           selectNode(newId)
         }
       }
-      if ((e.code === 'Delete' || e.code === 'Backspace') && selectedNodeId) {
-        const node = graph.nodes.find(n => n.id === selectedNodeId)
-        if (node && !node.locked) {
+      if ((e.ctrlKey || e.metaKey) && e.code === 'KeyA') {
+        // Select all (skips locked/structural nodes, same as the marquee)
+        e.preventDefault()
+        const all = graph.nodes
+          .filter(n => !EXCLUDED_FROM_MARQUEE.has(n.type) && !n.locked)
+          .map(n => n.id)
+        if (all.length > 0) setSelectedNodeIds(all)
+      }
+      if ((e.ctrlKey || e.metaKey) && e.code === 'KeyC') {
+        handleCopyToClipboard()
+      }
+      if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') {
+        handlePasteFromClipboard()
+      }
+      if ((e.code === 'Delete' || e.code === 'Backspace') && (selectedNodeId || selectedNodeIds.length > 0)) {
+        // Delete the marquee multi-selection if there is one, else the single
+        // selected node. Locked nodes are skipped either way.
+        const ids = selectedNodeIds.length > 0 ? selectedNodeIds : [selectedNodeId]
+        const deletable = ids.filter(id => {
+          const node = graph.nodes.find(n => n.id === id)
+          return node && !node.locked
+        })
+        if (deletable.length > 0) {
           e.preventDefault()
-          removeNode(graphLevel, graphClipId, selectedNodeId)
+          for (const id of deletable) removeNode(graphLevel, graphClipId, id)
           clearSelection()
+          clearNodeSelection()
+          setShowActionMenu(false)
         }
       }
       if (e.code === 'KeyF' && !e.ctrlKey && !e.metaKey) {
         e.preventDefault()
         fitToWindow()
       }
-      if (e.code === 'Escape' && selectedNodeIds.length > 0) {
-        clearNodeSelection()
-        setShowActionMenu(false)
+      if (e.code === 'Escape') {
+        if (marquee) setMarquee(null) // cancel an in-progress box-select
+        if (selectedNodeIds.length > 0) {
+          clearNodeSelection()
+          setShowActionMenu(false)
+        }
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [selectedNodeId, selectedNodeIds, graph.nodes, addNode, removeNode, graphLevel, graphClipId, selectNode, clearSelection, clearNodeSelection, fitToWindow])
+  }, [selectedNodeId, selectedNodeIds, marquee, graph.nodes, addNode, removeNode, graphLevel, graphClipId, selectNode, clearSelection, clearNodeSelection, setSelectedNodeIds, fitToWindow, handleCopyToClipboard, handlePasteFromClipboard])
 
   return (
     <>
@@ -983,7 +1241,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
                   connectedInputs={connectedInputsMap[node.id] || new Set()}
                   connectedOutputs={connectedOutputsMap[node.id] || new Set()}
                   zoom={zoom}
-                  onSelect={selectNode}
+                  onSelect={handleNodeSelect}
                   onDelete={handleNodeDelete}
                   onMove={handleNodeMove}
                   onMoveEnd={handleNodeMoveEnd}
@@ -1010,12 +1268,26 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
             <div className="node-canvas__empty-hint">
               <p>Right-click to add nodes</p>
               <p className="text-muted">Drag effects from the Media Pool</p>
+              <p className="text-muted">Drag on empty space to box-select · Alt-drag or middle-drag to pan</p>
               <p className="text-muted">Ctrl-drag a node onto a wire to insert it</p>
             </div>
           )}
 
-          <div className="node-canvas__minimap">
+          <div className="node-canvas__minimap" onMouseDown={handleMinimapMouseDown}>
             <div className="node-canvas__minimap-label mono">minimap</div>
+            {minimap && minimap.rects.map(r => (
+              <div
+                key={r.id}
+                className="node-canvas__minimap-node"
+                style={{ left: r.x, top: r.y, width: r.w, height: r.h, background: r.color }}
+              />
+            ))}
+            {minimapView && (
+              <div
+                className="node-canvas__minimap-view"
+                style={{ left: minimapView.x, top: minimapView.y, width: minimapView.w, height: minimapView.h }}
+              />
+            )}
           </div>
 
           {showSearchMenu && (
@@ -1026,8 +1298,11 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
             <ActionContextMenu
               position={actionMenuPos}
               selectedCount={selectedNodeIds.length}
-              onCopy={handleCopySelectedNodes}
+              onDuplicate={handleDuplicateSelectedNodes}
               onCreateCompound={handleCreateCompound}
+              onToggleBypass={handleToggleBypassSelected}
+              onDeleteNodes={handleDeleteSelectedNodes}
+              onDeselect={clearNodeSelection}
               onClose={() => setShowActionMenu(false)}
             />
           )}

@@ -28,6 +28,14 @@
   z-index: 10;
 }
 
+/* Marquee multi-selection — amber, to read differently from the single
+   cyan selection (which drives the Inspector). */
+.node-card--multi-selected {
+  border-color: var(--accent-amber, #ffaa00) !important;
+  box-shadow: 0 0 12px rgba(255, 170, 0, 0.35);
+  z-index: 10;
+}
+
 .node-card--preview-tap {
   box-shadow: 0 0 16px rgba(0, 229, 255, 0.4);
 }

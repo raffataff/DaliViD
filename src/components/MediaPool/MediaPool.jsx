@@ -1,23 +1,33 @@
-import { useState, useCallback, useMemo } from 'react'
+import { useState, useCallback, useMemo, useEffect } from 'react'
 import useTimelineStore from '../../store/useTimelineStore'
 import useGraphStore from '../../store/useGraphStore'
 import useAudioStore from '../../store/useAudioStore'
 import useAppStore from '../../store/useAppStore'
 import { copyFileToProjectFolder } from '../../utils/projectSerializer'
 import { COMPOUND_PRESETS } from '../../shaders/compoundPresets'
-import { setCameraStream } from '../../gl/cameraRegistry'
+import { setCameraStream, getCameraStream, removeCameraStream } from '../../gl/cameraRegistry'
 import { getAudioEngine } from '../../audio/AudioEngine'
 import { prepareImageDataURL, dataUrlBytes, formatBytes } from '../../utils/imageProcessing'
+import { addToast } from '../common/Toast'
+import {
+  startScreenCapture, startRecording, stopRecording, stopRecordingIfActive,
+  openRecordingSink, isRecording, getRecordingInfo, mp4Supported, tsStamp,
+} from '../../utils/screenRecorder'
 import './MediaPool.css'
 
 const TABS = [
   { id: 'videos', label: 'Videos' },
   { id: 'images', label: 'Images' },
   { id: 'cameras', label: 'Cameras' },
+  { id: 'screens', label: 'Screen' },
   { id: 'audio', label: 'Audio' },
   { id: 'effects', label: 'Effects' },
   { id: 'scopes', label: 'Scopes' },
 ]
+
+// Clip ids already warned about a large in-memory recording (module-level so we
+// don't mutate Zustand clip objects and warn at most once per recording).
+const _memWarned = new Set()
 
 export default function MediaPool() {
   const [activeTab, setActiveTab] = useState('videos')
@@ -25,6 +35,11 @@ export default function MediaPool() {
   const [importedAudio, setImportedAudio] = useState([])
   const [importedImages, setImportedImages] = useState([])
   const [cameras, setCameras] = useState([])
+  // Screen-capture options (apply to the NEXT capture) + recording UI state.
+  const [screenQuality, setScreenQuality] = useState(1080) // 0 = native
+  const [optimizeForText, setOptimizeForText] = useState(false)
+  const [screenFormat, setScreenFormat] = useState('webm')
+  const [, setRecordTick] = useState(0) // drives the recording timer/size readout
 
   const clips = useTimelineStore(s => s.clips)
   const addTrack = useTimelineStore(s => s.addTrack)
@@ -103,6 +118,15 @@ export default function MediaPool() {
           video.onloadedmetadata = resolve
           video.onerror = resolve
         })
+
+        // Recorded WebM (MediaRecorder) writes no duration header → duration is
+        // Infinity. Seek to the end to force the browser to compute the real
+        // duration, then rewind. (Standard workaround; harmless for normal files.)
+        if (video.duration === Infinity) {
+          video.currentTime = Number.MAX_SAFE_INTEGER
+          await new Promise(r => { video.ontimeupdate = () => { video.ontimeupdate = null; r() } })
+          video.currentTime = 0
+        }
 
         const entry = {
           id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
@@ -337,10 +361,177 @@ export default function MediaPool() {
     }
   }, [tracks, addTrack, addClip, initClipGraph])
 
+  // Live screen clips = screen clips with an active stream. Orphans = screen
+  // clips whose stream was lost (e.g. after project reload) — offered a Reconnect.
+  const screenClips = useMemo(
+    () => clips.filter(c => c.fileType === 'screen'),
+    [clips]
+  )
+
+  // Tick the recording readout (elapsed + size) twice a second while any screen
+  // clip is recording. Cheap and avoids re-rendering per MediaRecorder chunk.
+  useEffect(() => {
+    if (activeTab !== 'screens') return
+    const anyRecording = screenClips.some(c => isRecording(c.id))
+    if (!anyRecording) return
+    const id = setInterval(() => {
+      setRecordTick(t => t + 1)
+      // Warn once when an in-memory recording grows large (no disk sink).
+      for (const c of screenClips) {
+        const info = getRecordingInfo(c.id)
+        if (info?.sinkKind === 'memory' && info.bytes > 2 * 1024 ** 3 && !_memWarned.has(c.id)) {
+          _memWarned.add(c.id)
+          addToast({ message: 'Recording is large and held in memory — consider stopping soon.', type: 'warning', duration: 5000 })
+        }
+      }
+    }, 500)
+    return () => clearInterval(id)
+  }, [activeTab, screenClips])
+
+  // Capture a screen/window/tab as a live clip (mirror of handleSelectCamera).
+  const handleCaptureScreen = useCallback(async () => {
+    try {
+      const stream = await startScreenCapture({ maxHeight: screenQuality, optimizeForText })
+
+      const vt = stream.getVideoTracks()[0]
+      const settings = vt?.getSettings?.() || {}
+      const width = settings.width || 1920
+      const height = settings.height || 1080
+      const fps = settings.frameRate ? Math.round(settings.frameRate) : 30
+      const label = vt?.label || 'Screen Capture'
+
+      let videoTrack = tracks.find(t => t.type === 'video')
+      if (!videoTrack) videoTrack = { id: addTrack('video') }
+
+      const duration = 60 // live source: default trimmable length, same as camera
+      const clipId = addClip(videoTrack.id, {
+        filename: label,
+        fileType: 'screen',
+        timelineStart: 0, timelineEnd: duration,
+        sourceStart: 0, sourceEnd: duration,
+        width, height, fps, duration,
+      })
+
+      setCameraStream(clipId, stream) // shared live-stream registry
+      initClipGraph(clipId, label)
+
+      // Tab/system audio → reactive engine (same path the webcam mic uses).
+      if (stream.getAudioTracks().length > 0) {
+        await getAudioEngine().useExternalAudioStream(stream)
+      }
+
+      // Browser "Stop sharing" chrome → finalize any recording, then unregister.
+      vt.addEventListener('ended', async () => {
+        await stopRecordingIfActive(clipId)
+        removeCameraStream(clipId)
+        setRecordTick(t => t + 1)
+        addToast({ message: `Screen share "${label}" ended`, type: 'info' })
+      })
+    } catch (err) {
+      if (err?.name !== 'NotAllowedError') console.error('Screen capture failed:', err)
+      // NotAllowedError = user dismissed the picker — silent no-op.
+    }
+  }, [tracks, addTrack, addClip, initClipGraph, screenQuality, optimizeForText])
+
+  // Reconnect an orphaned screen clip (post-reload) to a fresh capture, keeping
+  // its effect graph / keyframes / timeline position.
+  const handleReconnectScreen = useCallback(async (clip) => {
+    try {
+      const stream = await startScreenCapture({ maxHeight: screenQuality, optimizeForText })
+      const vt = stream.getVideoTracks()[0]
+      setCameraStream(clip.id, stream)
+      if (stream.getAudioTracks().length > 0) {
+        await getAudioEngine().useExternalAudioStream(stream)
+      }
+      vt.addEventListener('ended', async () => {
+        await stopRecordingIfActive(clip.id)
+        removeCameraStream(clip.id)
+        setRecordTick(t => t + 1)
+      })
+      setRecordTick(t => t + 1)
+      addToast({ message: `Reconnected "${clip.filename}"`, type: 'success' })
+    } catch (err) {
+      if (err?.name !== 'NotAllowedError') console.error('Reconnect failed:', err)
+    }
+  }, [screenQuality, optimizeForText])
+
+  // Start/stop recording the source stream for a screen clip. The save picker
+  // must open inside this click handler (transient user activation).
+  const handleToggleRecord = useCallback(async (clip) => {
+    // Stop → finalize, then auto-import the file into the Videos tab.
+    if (isRecording(clip.id)) {
+      const result = await stopRecording(clip.id)
+      _memWarned.delete(clip.id)
+      setRecordTick(t => t + 1)
+      if (!result) return
+      const { file, url, durationSec, width, height, fps, sinkKind } = result
+      setImportedVideos(prev => [...prev.filter(v => v.filename !== file.name), {
+        id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+        filename: file.name, fileUrl: url, fileType: 'video',
+        width, height, fps,
+        duration: durationSec, // measured — never video metadata (WebM = Infinity)
+        size: file.size, file,
+      }])
+      // Keep the project self-contained if the file landed outside its media/ folder.
+      if (sinkKind !== 'project' && projectFolderHandle) {
+        try { await copyFileToProjectFolder(projectFolderHandle, file, 'media') }
+        catch (err) { console.warn('Could not copy recording into project folder:', err) }
+      }
+      addToast({ message: `Recording saved: ${file.name}`, type: 'success' })
+      return
+    }
+
+    // Start → build recorder, open the sink (picker), then start streaming.
+    const stream = getCameraStream(clip.id)
+    if (!stream) {
+      addToast({ message: 'No live stream — reconnect the screen first.', type: 'error' })
+      return
+    }
+    const handle = startRecording(clip.id, stream, {
+      format: screenFormat,
+      onError: (err) => {
+        console.error('Recording write error:', err)
+        addToast({ message: `Recording error: ${err?.message || err}`, type: 'error' })
+        stopRecordingIfActive(clip.id).then(() => setRecordTick(t => t + 1))
+      },
+    })
+    if (!handle.mimeType) {
+      addToast({ message: 'This browser can’t record the selected format.', type: 'error' })
+      stopRecordingIfActive(clip.id)
+      return
+    }
+    try {
+      const name = `screen_${tsStamp()}.${handle.ext}`
+      const sink = await openRecordingSink(name, handle.ext, projectFolderHandle, handle)
+      handle.sink = sink
+      handle.recorder.start(1000) // 1s timeslices → stream chunks to disk
+      if (sink.kind === 'project') {
+        addToast({ message: 'Recording to the project’s media folder.', type: 'info' })
+      }
+      setRecordTick(t => t + 1)
+    } catch (err) {
+      console.error('Failed to start recording:', err)
+      stopRecordingIfActive(clip.id)
+      addToast({ message: 'Could not start recording.', type: 'error' })
+    }
+  }, [screenFormat, projectFolderHandle])
+
+  // End a live screen share: stop any recording, drop the stream (clip freezes).
+  const handleEndShare = useCallback(async (clip) => {
+    await stopRecordingIfActive(clip.id)
+    removeCameraStream(clip.id)
+    setRecordTick(t => t + 1)
+  }, [])
+
   const formatSize = (bytes) => {
     if (bytes < 1024) return `${bytes} B`
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  }
+
+  const formatDuration = (sec) => {
+    const s = Math.max(0, Math.floor(sec))
+    return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
   }
 
   return (
@@ -487,6 +678,113 @@ export default function MediaPool() {
                 ))}
               </div>
             )}
+          </>
+        )}
+
+        {/* ── Screen Tab ── */}
+        {activeTab === 'screens' && (
+          <>
+            <button className="media-pool__import-btn" onClick={handleCaptureScreen}>
+              🖥 Capture Screen / Window / Tab
+            </button>
+
+            {/* Capture options — apply to the NEXT capture. */}
+            <div className="media-pool__screen-options">
+              <label className="media-pool__screen-opt">
+                <span>Quality</span>
+                <select
+                  value={screenQuality}
+                  onChange={(e) => setScreenQuality(Number(e.target.value))}
+                >
+                  <option value={720}>720p</option>
+                  <option value={1080}>1080p</option>
+                  <option value={1440}>1440p</option>
+                  <option value={0}>Native</option>
+                </select>
+              </label>
+              <label className="media-pool__screen-opt media-pool__screen-opt--check">
+                <input
+                  type="checkbox"
+                  checked={optimizeForText}
+                  onChange={(e) => setOptimizeForText(e.target.checked)}
+                />
+                <span>Optimize for text</span>
+              </label>
+            </div>
+
+            {screenClips.length === 0 ? (
+              <div className="media-pool__empty">
+                <p className="media-pool__empty-text">No screen captures</p>
+                <p className="media-pool__empty-hint">Capture a screen, window, or tab to add it to the timeline</p>
+              </div>
+            ) : (
+              <div className="media-pool__file-list">
+                {screenClips.map(clip => {
+                  const live = !!getCameraStream(clip.id)
+                  const recording = isRecording(clip.id)
+                  const info = recording ? getRecordingInfo(clip.id) : null
+                  return (
+                    <div key={clip.id} className="media-pool__file-item">
+                      <div className="media-pool__file-thumb" style={{ color: live ? 'var(--accent-cyan)' : 'var(--text-dim, #888)' }}>
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
+                          <rect x="2" y="4" width="20" height="13" rx="1.5" />
+                          <path d="M8 20h8M12 17v3" strokeLinecap="round" />
+                        </svg>
+                      </div>
+                      <div className="media-pool__file-info">
+                        <div className="media-pool__file-name">
+                          {live && <span className="media-pool__live-dot" title="Live" />}
+                          {clip.filename}
+                        </div>
+                        <div className="media-pool__file-meta mono">
+                          {clip.width}×{clip.height} @ {clip.fps}fps
+                          {recording && info && (
+                            <span className="media-pool__rec-stats">
+                              {' · '}<span className="media-pool__rec-dot" />
+                              {formatDuration(info.elapsedSec)} · {formatSize(info.bytes)}
+                            </span>
+                          )}
+                        </div>
+                        {live ? (
+                          <div className="media-pool__screen-controls">
+                            <button
+                              className={`media-pool__mini-btn ${recording ? 'media-pool__mini-btn--rec' : ''}`}
+                              onClick={() => handleToggleRecord(clip)}
+                            >
+                              {recording ? '■ Stop' : '● Record'}
+                            </button>
+                            <select
+                              value={screenFormat}
+                              disabled={recording}
+                              onChange={(e) => setScreenFormat(e.target.value)}
+                            >
+                              <option value="webm">WebM</option>
+                              <option value="mp4" disabled={!mp4Supported()}
+                                title={mp4Supported() ? '' : 'Not supported by this browser'}>
+                                MP4
+                              </option>
+                            </select>
+                            <button className="media-pool__mini-btn" onClick={() => handleEndShare(clip)}>
+                              End share
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="media-pool__screen-controls">
+                            <button className="media-pool__mini-btn" onClick={() => handleReconnectScreen(clip)}>
+                              Reconnect
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            <p className="media-pool__empty-hint" style={{ marginTop: 8 }}>
+              Tip: for a perfect offline export, record → the file auto-imports to Videos → drop it in
+              to replace the live clip.
+            </p>
           </>
         )}
 

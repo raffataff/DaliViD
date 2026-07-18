@@ -6,10 +6,10 @@ import { getNodeSource } from '../../shaders/shaderRegistry'
 import { prepareImageDataURL, dataUrlBytes, formatBytes } from '../../utils/imageProcessing'
 import './NodeCard.css'
 
-const NODE_COLORS = {
+export const NODE_COLORS = {
   'CLIP_SOURCE': '#44cc88', 'CLIP_OUTPUT': '#ff6644', 'VIDEO_INPUT': '#44cc88',
   'IMAGE_INPUT': '#44cc88',
-  'CAMERA_INPUT': '#44aaff', 'AUDIO_INPUT': '#ff00aa', 'AUDIO_SPLITTER': '#cc44ff',
+  'CAMERA_INPUT': '#44aaff', 'SCREEN_INPUT': '#44aaff', 'AUDIO_INPUT': '#ff00aa', 'AUDIO_SPLITTER': '#cc44ff',
   'AUDIO_VISUALIZER': '#ff00aa', 'OUTPUT': '#ff6644', 'EDGE_DETECTION': '#ff8844',
   'COLOR_INVERSION': '#ff44cc', 'GLITCH': '#ff3344', 'FEEDBACK': '#aa44ff',
   'KALEIDOSCOPE': '#44ccff', 'PIXEL_SORT': '#ff8844', 'CHROMATIC_ABERRATION': '#ff44aa',
@@ -156,21 +156,27 @@ const NodeCard = memo(function NodeCard({
   const paramInputs = inputs.filter(s => s.isParam)
   const compoundExposedParams = isCompound ? (node.exposedParams || []) : []
 
+  const dragMoved = useRef(false)
+
   const handleMouseDown = useCallback((e) => {
     if (e.target.closest('.socket') || e.target.closest('.node-card__slider') || e.target.closest('button') || e.target.closest('input') || e.target.closest('select')) return
     e.stopPropagation()
     if (e.altKey) e.preventDefault() // keep Alt from triggering the browser menu
     let dragNodeId = node.id
+    dragMoved.current = false
     if (e.shiftKey && onDetachNode) onDetachNode(node.id)
     if (e.altKey && onDuplicate) {
       const newId = onDuplicate(node.id)
       if (newId) dragNodeId = newId
-    } else {
-      onSelect?.(node.id)
+    } else if (!e.ctrlKey && !e.metaKey) {
+      // Ctrl+click toggles the node in/out of the multi-selection — that's
+      // handled on click (after we know it wasn't a Ctrl+drag wire-insert).
+      onSelect?.(node.id, e)
     }
     setIsDragging(true)
     dragStart.current = { x: e.clientX, y: e.clientY, nodeX: node.position.x, nodeY: node.position.y }
     const handleMouseMove = (e) => {
+      dragMoved.current = true
       const dx = (e.clientX - dragStart.current.x) / zoom
       const dy = (e.clientY - dragStart.current.y) / zoom
       // Pass the live event through so the canvas can do modifier-aware work
@@ -253,7 +259,13 @@ const NodeCard = memo(function NodeCard({
       ].filter(Boolean).join(' ')}
       style={{ left: node.position.x, top: node.position.y, borderLeftColor: isCompound ? (node.color || accentColor) : accentColor }}
       onMouseDown={handleMouseDown}
-      onClick={(e) => { e.stopPropagation(); onSelect?.(node.id) }}
+      onClick={(e) => {
+        e.stopPropagation()
+        // A drag's release also fires a click — don't re-select (or Ctrl-toggle)
+        // after the node was actually moved.
+        if (dragMoved.current) { dragMoved.current = false; return }
+        onSelect?.(node.id, e)
+      }}
       onDoubleClick={handleDoubleClick}
     >
       <div className="node-card__header">

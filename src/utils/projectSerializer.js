@@ -459,6 +459,11 @@ export async function restoreMediaFilesFromFolder(projectDirHandle, clips, updat
   const missing = []
   for (const clip of clips) {
     if (!clip.filename) continue
+    // Live-source clips (camera/screen) are backed by a MediaStream, not a file —
+    // they have no on-disk media to restore, so skip them (otherwise they wrongly
+    // land in the "missing media" warning list). Screen clips reconnect via the
+    // MediaPool Screen tab's Reconnect button instead.
+    if (clip.fileType === 'camera' || clip.fileType === 'screen') continue
     // If the fileUrl is missing (or is a stale blob URL from a previous session), restore it!
     const folderName = clip.fileType === 'audio' ? 'audio' : 'media'
     try {

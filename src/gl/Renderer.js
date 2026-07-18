@@ -19,7 +19,7 @@ import { evaluateKeyframes } from '../utils/keyframes.js'
 
 // Node types that are not effect passes (sources, outputs, audio routing). Used
 // to decide whether a graph actually has any effects worth running.
-const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE']
+const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE']
 
 // Passthrough fragment shader — just copies input texture
 const PASSTHROUGH_FS = `#version 300 es
@@ -770,17 +770,19 @@ export class Renderer {
   }
 
   /**
-   * Render one clip's contribution for this frame: (re)build its video/camera
-   * element, upload the current frame to a texture, draw it into the clip's input
-   * FBO, and run its per-clip effect graph. Returns the FBO holding the clip's
+   * Render one clip's contribution for this frame: (re)build its video/camera/
+   * screen element, upload the current frame to a texture, draw it into the clip's
+   * input FBO, and run its per-clip effect graph. Returns the FBO holding the clip's
    * output, or null when the clip has no frame ready yet (nothing to composite).
+   * `isLiveStream` is true for camera AND screen-capture clips — both are backed by
+   * a MediaStream in cameraRegistry (no fileUrl, no seeking/playback sync).
    */
-  _renderClipToFBO(track, clip, isCamera, graphState, standardState, playheadTime) {
+  _renderClipToFBO(track, clip, isLiveStream, graphState, standardState, playheadTime) {
     const gl = this.gl
     let videoEl = this._videoElements.get(clip.id)
 
-    if (isCamera) {
-      // Live camera: backed by a MediaStream (no fileUrl, no seeking/playback sync).
+    if (isLiveStream) {
+      // Live camera/screen: backed by a MediaStream (no fileUrl, no seeking/playback sync).
       const stream = getCameraStream(clip.id)
       if (!stream) return null
       if (videoEl && videoEl._cameraStream !== stream) {
@@ -888,6 +890,49 @@ export class Renderer {
   }
 
   /**
+   * Render an AUDIO clip's per-clip effect graph into an FBO so it can be
+   * composited into the master output, exactly like the isolated clip view does.
+   *
+   * Audio clips carry no video frame, so the graph runs over a BLANK input with
+   * `hasSource = 0` — generative / audio-reactive effects draw from scratch (the
+   * live audio uniforms are already in the store, driven by the AudioEngine).
+   *
+   * Returns the output FBO id, or null when the clip has no real effect nodes
+   * (a bare CLIP_SOURCE → OUTPUT graph produces nothing to show, so plain audio
+   * clips stay invisible and don't paint black over the video tracks).
+   */
+  _renderAudioClipVisualToFBO(clip, graphState, standardState, playheadTime) {
+    const gl = this.gl
+    const clipGraph = graphState.clipGraphs?.[clip.id]
+    if (!clipGraph || !clipGraph.nodes.some(n => !NON_EFFECT_TYPES.includes(n.type))) return null
+
+    // Blank input FBO (no video texture) — mirror the isolated audio path.
+    const inputFBOId = `clip_input_${clip.id}`
+    if (!this.fbos.getTexture(inputFBOId)) this.fbos.create(inputFBOId, this.width, this.height)
+    this._ensureDefaultFBO()
+    this.fbos.blit('__default_input', inputFBOId, this.width, this.height)
+
+    if (!this.compiledChains.has(clip.id) || this._needsRecompile) {
+      const result = compileGraph(gl, clipGraph)
+      this.compiledChains.set(clip.id, result)
+      if (result.errors.length > 0) {
+        console.error(`[DaliVid] Audio-clip graph compile errors for "${clip.name}":`, result.errors)
+      }
+    }
+
+    const { chain, edges } = this.compiledChains.get(clip.id)
+    if (chain.length === 0) return null
+
+    const outputFBOId = `clip_output_${clip.id}`
+    if (!this.fbos.getTexture(outputFBOId)) this.fbos.create(outputFBOId, this.width, this.height)
+
+    standardState.hasSource = 0 // no real source texture → generative effects self-display
+    const kfNodes = this._withKeyframes(buildNodeMap(clipGraph), clip.id, playheadTime - clip.timelineStart)
+    executeChain(this, chain, inputFBOId, outputFBOId, standardState, {}, kfNodes, edges, this.previewTapEnabled ? clipGraph.tapPointNodeId : null)
+    return outputFBOId
+  }
+
+  /**
    * Render the full multi-track compositing pipeline.
    */
   _renderFullPipeline(tracks, clips, graphState, standardState, playheadTime) {
@@ -960,13 +1005,13 @@ export class Renderer {
 
       for (let ci = 0; ci < activeClips.length; ci++) {
         const clip = activeClips[ci]
-        const isCamera = clip.fileType === 'camera'
-        // Non-camera clips must be a renderable video file (have a fileUrl).
-        if (!isCamera && (clip.fileType !== 'video' || !clip.fileUrl)) continue
+        const isLive = clip.fileType === 'camera' || clip.fileType === 'screen'
+        // Non-live clips must be a renderable video file (have a fileUrl).
+        if (!isLive && (clip.fileType !== 'video' || !clip.fileUrl)) continue
 
         activeClipIds.add(clip.id)
 
-        const clipResultFBOId = this._renderClipToFBO(track, clip, isCamera, graphState, standardState, playheadTime)
+        const clipResultFBOId = this._renderClipToFBO(track, clip, isLive, graphState, standardState, playheadTime)
         if (!clipResultFBOId) continue // no frame ready — nothing to composite
 
         // Composite this clip onto the accumulator. Effective blend mode: the
@@ -1052,6 +1097,38 @@ export class Renderer {
 
       const sourceTime = getClipSourceTime(clip, playheadTime)
       this._syncVideoPlayback(clip, audioEl, sourceTime, track.muted, this._clipAudioGain(clip, playheadTime))
+    }
+
+    // ── Audio-clip generative visuals ──
+    // An audio clip can carry an effect graph (generative / audio-reactive). It
+    // has no video frame, so it isn't part of the video-track compositing above,
+    // but its graph still renders — composite it here so it shows in master, not
+    // just in the isolated clip view. Audio visuals layer ON TOP of the video
+    // tracks, bottom-to-top by audio-track zOrder, using each clip's blend mode +
+    // opacity (+ fades). Only clips with real effect nodes contribute, so plain
+    // audio clips stay invisible.
+    const audioVisTracks = [...audioTracks].sort((a, b) => (a.zOrder || 0) - (b.zOrder || 0))
+    for (const track of audioVisTracks) {
+      if (soloTrack && track.id !== soloTrack.id) continue
+      for (const clip of getActiveClips(clips, track.id, playheadTime)) {
+        if (clip.fileType !== 'audio' || !clip.fileUrl) continue
+        const visFBOId = this._renderAudioClipVisualToFBO(clip, graphState, standardState, playheadTime)
+        if (!visFBOId) continue
+        activeClipIds.add(clip.id)
+
+        const blendName = (clip.blendMode && clip.blendMode !== 'Inherit') ? clip.blendMode : (track.blendMode || 'Normal')
+        const blendIdx = getBlendModeIndex(blendName)
+        const clipOpacity = clip.opacity == null ? 1 : clip.opacity
+        const trackOpacity = track.opacity == null ? 1 : track.opacity
+        let fade = 1
+        if (clip.fadeIn > 0) fade *= Math.max(0, Math.min(1, (playheadTime - clip.timelineStart) / clip.fadeIn))
+        if (clip.fadeOut > 0) fade *= Math.max(0, Math.min(1, (clip.timelineEnd - playheadTime) / clip.fadeOut))
+        const opacity = Math.max(0, Math.min(1, clipOpacity)) * Math.max(0, Math.min(1, trackOpacity)) * fade
+
+        this._compositeTrack(accumReadId, accumWriteId, visFBOId, blendIdx, opacity)
+        const swapId = accumReadId; accumReadId = accumWriteId; accumWriteId = swapId
+        hasContent = true
+      }
     }
 
     // ── Master Graph Execution ──

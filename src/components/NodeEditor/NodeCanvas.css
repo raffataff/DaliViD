@@ -17,7 +17,8 @@
   background-image: radial-gradient(circle, var(--dot-grid-dot) 1px, transparent 1px);
   background-size: 20px 20px;
   pointer-events: all;
-  cursor: grab;
+  /* Left-drag box-selects; Alt-drag / middle-drag pans */
+  cursor: crosshair;
 }
 
 /* ── Transform Surface ── */
@@ -133,7 +134,20 @@
   transition: opacity var(--duration-fast);
   overflow: hidden;
 }
-.node-canvas__minimap:hover { opacity: 0.7; }
+.node-canvas__minimap:hover { opacity: 0.9; }
+.node-canvas__minimap-node {
+  position: absolute;
+  border-radius: 1px;
+  opacity: 0.8;
+  pointer-events: none;
+}
+.node-canvas__minimap-view {
+  position: absolute;
+  border: 1px solid rgba(0, 229, 255, 0.7);
+  background: rgba(0, 229, 255, 0.08);
+  border-radius: 2px;
+  pointer-events: none;
+}
 .node-canvas__minimap-label {
   position: absolute;
   top: 4px;
@@ -242,6 +256,11 @@
 .node-canvas__menu-item:disabled:hover {
   background: none;
   color: var(--text-secondary);
+}
+.node-canvas__menu-item--danger { color: #ff5566; }
+.node-canvas__menu-item--danger:hover {
+  background: rgba(255, 85, 102, 0.12);
+  color: #ff5566;
 }
 
 /* ── Compound Node Card Styles ── */

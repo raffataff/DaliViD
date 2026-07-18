@@ -92,6 +92,21 @@ export function resolveAudioSourceName(value, renderer) {
 }
 
 /**
+ * Whether a per-stem analysis entry (audioStore.sources[name]) is carrying LIVE
+ * signal this frame. A stem's analyser only sees audio while its clip is playing
+ * under the playhead; once the clip stops (or the playhead parks off it) the
+ * entry PERSISTS but decays to zeros. Callers use this to fall back to the
+ * master (timeline) mix instead of driving visuals with an all-zero stem — the
+ * dead-air symptom of selecting a not-currently-playing song as an audio source.
+ */
+export function stemHasSignal(s) {
+  if (!s) return false
+  const b = s.smoothedBands
+  if (b) { for (let i = 0; i < b.length; i++) if (b[i] > 0.001) return true }
+  return (s.rms || 0) > 0.001 || (s.beat || 0) > 0.001
+}
+
+/**
  * The value a TRANSITION_PROGRESS node yields this frame.
  * A live transition (renderer sets standardState.transitionProgress during the
  * overlap composite) always wins. Otherwise the node's Preview params apply:
@@ -164,7 +179,7 @@ export function compileGraph(gl, graph) {
     // Source/input nodes — no shader here, just mark as passthrough. IMAGE_INPUT
     // is a source too, but unlike the others it produces its OWN texture (drawn
     // into a per-node FBO by the renderer's image pass), not the chain input.
-    if (['CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'EFFECT_INPUT', 'IMAGE_INPUT'].includes(node.type)) {
+    if (['CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'EFFECT_INPUT', 'IMAGE_INPUT'].includes(node.type)) {
       chain.push({ nodeId: node.id, type: node.type, program: null, uniformLocations: {}, params: node.params || {}, bypassed: node.bypassed || false, name: node.name, isSource: true, isImage: node.type === 'IMAGE_INPUT' })
       continue
     }
@@ -361,7 +376,9 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
       const feeder = inEdge && (nodeLookup?.[inEdge.fromNode] ?? byId[inEdge.fromNode])
       const name = feeder?.type === 'AUDIO_INPUT' ? resolveAudioSourceName(feeder.params?.audioSource, renderer) : null
       const s = name ? audioStoreState?.sources?.[name] : null
-      if (s) {
+      // Use the stem's own bands only while it's actually playing; otherwise keep
+      // the master mix so a selected-but-idle song doesn't zero out the drivers.
+      if (s && stemHasSignal(s)) {
         const b = s.smoothedBands || []
         vals = {
           sub_bass: b[0] || 0, bass: s.bass || 0, low_mid: b[2] || 0, mid: s.mid || 0,
@@ -788,7 +805,12 @@ export function resolveFloatConnections(renderer, nodesArg = null, edgesArg = nu
     const feeder = inEdge && graph.nodes.find(n => n.id === inEdge.fromNode)
     const name = feeder?.type === 'AUDIO_INPUT' ? resolveAudioSourceName(feeder.params?.audioSource, renderer) : null
     const s = name ? audioStore.sources?.[name] : null
-    if (!s) return SPLITTER_VALUES
+    // Fall back to the master (timeline) mix when no stem is selected OR the
+    // selected stem has no live signal (its clip isn't playing under the
+    // playhead). Previously only the `!s` case fell back, so a stem that had
+    // played once but was now idle stayed a truthy all-zero entry and drove the
+    // splitter to silence — the reported "nothing comes out" dead-air bug.
+    if (!s || !stemHasSignal(s)) return SPLITTER_VALUES
     const b = s.smoothedBands || []
     return {
       'sub_bass': b[0] || 0, 'bass': s.bass || 0,

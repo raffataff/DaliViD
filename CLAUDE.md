@@ -206,6 +206,25 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
   upstream AUDIO_INPUT's `audioSource` (index or string → `resolveAudioSourceName`) for both float
   wiring and audio-driver sockets; export analyses each referenced stem offline (raw, gain-free)
   for parity.
+- **Node-editor selection overhaul** — Box-select is now **plain left-drag on empty grid**
+  (Alt+drag / middle-drag pans; Ctrl+drag box still works; a <4px box acts as a plain
+  deselect-click); nodes highlight **live** during the drag (`node-card--multi-selected`, amber —
+  the class previously didn't exist in CSS, so marquee selection was invisible); the release-click
+  no longer instantly clears the selection/ActionContextMenu (`suppressCanvasClick` ref — the same
+  phantom click was also deselecting after every pan). Shift+drag box is **additive**
+  (`marquee.baseIds`); **Ctrl+click toggles** a node in/out of the multi-selection (handled on
+  click, not mousedown, so Ctrl+drag wire-insert doesn't toggle); **Ctrl+A selects all**
+  (marquee-eligible nodes); **dragging a multi-selected node moves the whole group** (cumulative
+  delta vs drag-start positions — correct because NodeCard captures `onMove` at mousedown);
+  Delete removes the whole multi-selection; Escape cancels an in-flight box. **Ctrl+C/Ctrl+V
+  clipboard** (module-level, survives graph switches; pastes layout anchored at cursor, remaps
+  internal edges, skips locked/structural nodes). ActionContextMenu: Duplicate (renamed from
+  Copy) / Create Compound / Bypass-Enable All / Delete / Deselect. **Minimap is live**: node
+  rects (NODE_COLORS) + viewport rect, click/drag to jump-pan. Card-height estimate extracted to
+  `estimateNodeHeight` (was triplicated across marquee/fit/insert). ShortcutsOverlay updated.
+  Note: locked nodes remain *movable* by design (lock guards structure — delete/marquee — not layout).
+- **CI** — `.github/workflows/ci.yml` runs `npm ci` → `npm run lint` (ESLint + shader smoke test)
+  → `npm run build` on push/PR.
 - **Node-editor manipulation upgrades** — (1) **Ctrl+drag a node over a wire auto-inserts it**
   (Blender-style): `NodeCanvas.findInsertCandidate` hit-tests every noodle's bezier against the
   dragged card's bbox (type-aware: node needs a matching input+output; prefers a free input;
@@ -226,10 +245,13 @@ Ideas surfaced but not yet built (roughly by value-to-effort).
   is unity-gain and no attenuation was found in code. Needs an A/B (exported MP4 audio vs the source
   file, same player/volume) to localize — AAC encode vs mixdown vs environment.
 
-- **Run the smoke test in CI.** A GitHub Actions job running `npm run lint` + `npm run build` on
-  push would make the smoke test actually catch regressions (in-session builds are unreliable).
-  Stretch: a headless-Chrome (Playwright) step that truly compiles every shader in a real WebGL2
-  context, turning the static check into full GLSL validation.
+- **Playwright step in CI (stretch).** CI now runs lint + build (`.github/workflows/ci.yml`); a
+  headless-Chrome (Playwright) step that compiles every shader in a real WebGL2 context would turn
+  the static smoke check into full GLSL validation, and an interaction test (marquee → menu →
+  compound) would cover the selection UX.
+- **Measure real card heights.** `estimateNodeHeight` is now the single shared estimate, but
+  expanded compounds / image nodes deviate from it — a DOM-measured height map (ResizeObserver on
+  cards) would make marquee/fit/insert/minimap exact.
 - **Keyframe animation is not wired to the renderer.** `useTimelineStore` holds `keyframes` and the
   serializer saves them, but nothing evaluates them at the playhead — the executor reads live params
   + audio bindings only, so animated params never take effect. Needs a per-frame pass that

@@ -52,6 +52,14 @@ const NODE_DEFS = {
     ],
     hasParamInputs: true,
   },
+  SCREEN_INPUT: {
+    inputs: [],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Video' },
+      { id: 'audio_out', type: 'audio', name: 'Audio' },
+    ],
+    hasParamInputs: true,
+  },
   // IMAGE_INPUT — a still image as a first-class texture source. Outputs a
   // texture peer to video/camera, so it can feed every downstream effect.
   // hasParamInputs exposes float sockets so transform params (scale, rotation,
