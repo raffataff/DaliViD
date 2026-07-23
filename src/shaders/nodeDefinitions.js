@@ -71,6 +71,17 @@ const NODE_DEFS = {
     ],
     hasParamInputs: true,
   },
+  // TEXT_INPUT — rendered text as a first-class texture source (peer to image).
+  // The string + styling live in params (raster'd on the CPU); the shader's
+  // @param sliders (scale/offset/rotation/reactive) surface as float sockets so
+  // the transform can be audio/MATH-modulated.
+  TEXT_INPUT: {
+    inputs: [],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Text' },
+    ],
+    hasParamInputs: true,
+  },
   AUDIO_INPUT: {
     inputs: [],
     outputs: [

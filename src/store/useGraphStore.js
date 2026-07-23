@@ -8,6 +8,7 @@ import { create } from 'zustand'
 import { createCompound, updateExposedParam, expandCompound } from '../utils/compoundUtils'
 import { STARTER_TRANSITION_COMPOUND } from '../shaders/compoundPresets'
 import { removeNodeImage } from '../gl/imageRegistry'
+import { removeText } from '../gl/textRegistry'
 import { emitNodeRemoved } from '../gl/nodeLifecycle'
 
 let nodeCounter = 0
@@ -99,6 +100,7 @@ const useGraphStore = create((set, get) => ({
     const activeGraph = graphLevel === 'master' ? get().masterGraph : get().clipGraphs[clipId]
     const removedNode = activeGraph?.nodes.find(n => n.id === nodeId) || null
     removeNodeImage(nodeId)
+    removeText(nodeId)
     emitNodeRemoved(removedNode)
     set((state) => {
       const graph = graphLevel === 'master' ? state.masterGraph : state.clipGraphs[clipId]

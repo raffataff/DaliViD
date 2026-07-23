@@ -8,7 +8,7 @@ import './NodeCard.css'
 
 export const NODE_COLORS = {
   'CLIP_SOURCE': '#44cc88', 'CLIP_OUTPUT': '#ff6644', 'VIDEO_INPUT': '#44cc88',
-  'IMAGE_INPUT': '#44cc88',
+  'IMAGE_INPUT': '#44cc88', 'TEXT_INPUT': '#ffcc44',
   'CAMERA_INPUT': '#44aaff', 'SCREEN_INPUT': '#44aaff', 'AUDIO_INPUT': '#ff00aa', 'AUDIO_SPLITTER': '#cc44ff',
   'AUDIO_VISUALIZER': '#ff00aa', 'OUTPUT': '#ff6644', 'EDGE_DETECTION': '#ff8844',
   'COLOR_INVERSION': '#ff44cc', 'GLITCH': '#ff3344', 'FEEDBACK': '#aa44ff',
@@ -199,6 +199,7 @@ const NodeCard = memo(function NodeCard({
 
   // ── Image source: load / replace the still image on this node ──
   const isImageNode = node.type === 'IMAGE_INPUT'
+  const isTextNode = node.type === 'TEXT_INPUT'
 
   const readImageFile = useCallback(async (file) => {
     if (!file || !file.type?.startsWith('image/')) return
@@ -349,6 +350,31 @@ const NodeCard = memo(function NodeCard({
               {node.params.imageName}
             </div>
           )}
+        </div>
+      )}
+
+      {isTextNode && (
+        <div
+          className="node-card__text-editor"
+          onMouseDown={(e) => e.stopPropagation()}
+          style={{ padding: '6px 8px', display: 'flex', flexDirection: 'column', gap: 4 }}
+        >
+          <textarea
+            className="node-card__text-input mono"
+            value={node.params?.text ?? ''}
+            placeholder="Type text…"
+            rows={2}
+            spellCheck={false}
+            onChange={(e) => onParamChange?.(node.id, 'text', e.target.value)}
+            style={{
+              width: '100%', resize: 'vertical', minHeight: 34, fontSize: 12,
+              background: '#0a0a0e', color: '#e8e8ef', border: '1px solid #2a2a35',
+              borderRadius: 3, padding: '4px 6px', lineHeight: 1.3,
+            }}
+          />
+          <div className="mono" style={{ fontSize: 9, color: '#888899' }}>
+            Style in the Inspector →
+          </div>
         </div>
       )}
 

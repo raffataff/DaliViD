@@ -8,10 +8,11 @@ import { createShaderProgram, uploadStandardUniforms, uploadUniforms, clearProgr
 import { TextureManager } from './TextureManager.js'
 import { FBOManager } from './FBOManager.js'
 import { BLEND_MODES_GLSL, getBlendModeIndex } from './BlendModes.glsl.js'
-import { compileGraph, executeChain, executeTransitionCompound, getActiveClip, getActiveClips, getClipSourceTime, resolveFloatConnections, buildNodeMap } from './clipGraphManager.js'
+import { compileGraph, executeChain, executeTransitionCompound, getActiveClip, getActiveClips, getClipSourceTime, resolveFloatConnections, buildNodeMap, normalizeParams } from './clipGraphManager.js'
 import { getAudioEngine } from '../audio/AudioEngine.js'
 import { getCameraStream, removeCameraStream } from './cameraRegistry.js'
-import { ensureNodeImage } from './imageRegistry.js'
+import { ensureNodeImage, removeNodeImage } from './imageRegistry.js'
+import { ensureText, removeText } from './textRegistry.js'
 import { onNodeRemoved } from './nodeLifecycle.js'
 import { getShaderSource } from '../shaders/shaderRegistry.js'
 import { buildTransitionShader, getTransitionDefaults } from '../shaders/transitionRegistry.js'
@@ -19,7 +20,7 @@ import { evaluateKeyframes } from '../utils/keyframes.js'
 
 // Node types that are not effect passes (sources, outputs, audio routing). Used
 // to decide whether a graph actually has any effects worth running.
-const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE']
+const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE', 'TEXT_INPUT']
 
 // Passthrough fragment shader — just copies input texture
 const PASSTHROUGH_FS = `#version 300 es
@@ -267,6 +268,11 @@ export class Renderer {
     // its @param sliders, so the controls always match what's rendered.
     const imgSrc = getShaderSource('IMAGE_INPUT')
     if (imgSrc) this.imageProgram = createShaderProgram(this.gl, imgSrc)
+
+    // Text source program — the TEXT_INPUT shader (transform + reactive). Same
+    // single-source-of-truth pattern as the image program.
+    const txtSrc = getShaderSource('TEXT_INPUT')
+    if (txtSrc) this.textProgram = createShaderProgram(this.gl, txtSrc)
   }
 
   /**
@@ -339,6 +345,59 @@ export class Renderer {
 
     uploadStandardUniforms(gl, locs, standardState)
     uploadUniforms(gl, locs, this.imageProgram.uniformTypes, params)
+
+    this.drawQuad()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  }
+
+  /**
+   * Render a TEXT source (TEXT_INPUT node OR a text timeline clip) into an FBO.
+   * Rasterizes the text to a canvas (cached in textRegistry, re-drawn only when a
+   * style/text/resolution change alters the signature), uploads it to a texture,
+   * then draws it through the text program (transform + audio-reactive) so it can
+   * feed downstream effect nodes exactly like an image/video source.
+   * @param {string} id — node id or clip id (keys the raster + texture)
+   * @param {string} fboId — destination FBO (already created/resized by caller)
+   * @param {object} standardState — standard uniform state for this frame
+   * @param {object} params — text + style params (+ u_txt_* transform uniforms)
+   */
+  renderTextNode(id, fboId, standardState, params) {
+    const gl = this.gl
+    if (!this.textProgram || !this.textProgram.program) return
+
+    // Start from a clean transparent FBO (empty text reads as nothing).
+    this.fbos.bind(fboId)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    // Rasterize at (super-sampled) render resolution so text is crisp in preview
+    // AND export. 2× oversampling gives smooth edges when the shader samples it
+    // back down; capped so the canvas edge never exceeds the GPU's max texture.
+    const maxTex = this.maxTextureSize || 2048
+    const ss = Math.max(1, Math.min(2, maxTex / Math.max(this.width, this.height)))
+    const rw = Math.max(1, Math.round(this.width * ss))
+    const rh = Math.max(1, Math.round(this.height * ss))
+    const entry = ensureText(id, params, rw, rh)
+    const texId = `txt_${id}`
+    let tex = this.textures.getTexture(texId)
+    if (!tex || entry.uploadedSignature !== entry.signature) {
+      // Re-create on any change: the canvas size tracks the output resolution.
+      if (tex) this.textures.delete(texId)
+      this.textures.create(texId, entry.canvas.width, entry.canvas.height)
+      this.textures.uploadVideoFrame(texId, entry.canvas) // handles HTMLCanvasElement
+      entry.uploadedSignature = entry.signature
+      tex = this.textures.getTexture(texId)
+    }
+
+    gl.useProgram(this.textProgram.program)
+    const locs = this.textProgram.uniformLocations
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    if (locs.u_image != null) gl.uniform1i(locs.u_image, 0)
+
+    uploadStandardUniforms(gl, locs, standardState)
+    uploadUniforms(gl, locs, this.textProgram.uniformTypes, params)
 
     this.drawQuad()
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
@@ -779,6 +838,21 @@ export class Renderer {
    */
   _renderClipToFBO(track, clip, isLiveStream, graphState, standardState, playheadTime) {
     const gl = this.gl
+    const inputFBOId = `clip_input_${clip.id}`
+
+    // ── Generator clips (text / image) ──
+    // No media element — the source frame is synthesized straight into the clip's
+    // input FBO, then the shared per-clip graph tail runs exactly as for video.
+    if (clip.fileType === 'image' || clip.fileType === 'text') {
+      if (!this.fbos.getTexture(inputFBOId)) this.fbos.create(inputFBOId, this.width, this.height)
+      if (clip.fileType === 'image') {
+        this.renderImageNode(clip.id, inputFBOId, standardState, normalizeParams(clip.params || {}))
+      } else {
+        this.renderTextNode(clip.id, inputFBOId, standardState, clip.params || {})
+      }
+      return this._runClipGraph(clip, inputFBOId, graphState, standardState, playheadTime)
+    }
+
     let videoEl = this._videoElements.get(clip.id)
 
     if (isLiveStream) {
@@ -844,7 +918,6 @@ export class Renderer {
       videoEl._lastUploadedTime = videoEl.currentTime
     }
 
-    const inputFBOId = `clip_input_${clip.id}`
     if (!this.fbos.getTexture(inputFBOId)) {
       this.fbos.create(inputFBOId, this.width, this.height)
     }
@@ -859,7 +932,17 @@ export class Renderer {
     if (loc != null) gl.uniform1i(loc, 0)
     this.drawQuad()
 
-    // Execute the clip's per-clip effect graph, if any.
+    return this._runClipGraph(clip, inputFBOId, graphState, standardState, playheadTime)
+  }
+
+  /**
+   * Shared per-clip effect-graph tail: given the clip's source frame already in
+   * `inputFBOId`, run its graph (if any) and return the FBO holding the result
+   * (the graph output, or the input FBO when the clip has no effect nodes). Used
+   * by every clip kind — video, live stream, image and text.
+   */
+  _runClipGraph(clip, inputFBOId, graphState, standardState, playheadTime) {
+    const gl = this.gl
     const clipGraph = graphState.clipGraphs?.[clip.id]
     let clipResultFBOId = inputFBOId
 
@@ -878,7 +961,7 @@ export class Renderer {
         if (!this.fbos.getTexture(outputFBOId)) {
           this.fbos.create(outputFBOId, this.width, this.height)
         }
-        standardState.hasSource = 1 // real video frame feeds this clip graph
+        standardState.hasSource = 1 // a real source frame feeds this clip graph
         // Keyframed params are clip-relative in time, so keys survive clip moves.
         const kfNodes = this._withKeyframes(buildNodeMap(clipGraph), clip.id, playheadTime - clip.timelineStart)
         executeChain(this, chain, inputFBOId, outputFBOId, standardState, {}, kfNodes, edges, this.previewTapEnabled ? clipGraph.tapPointNodeId : null)
@@ -1006,8 +1089,10 @@ export class Renderer {
       for (let ci = 0; ci < activeClips.length; ci++) {
         const clip = activeClips[ci]
         const isLive = clip.fileType === 'camera' || clip.fileType === 'screen'
-        // Non-live clips must be a renderable video file (have a fileUrl).
-        if (!isLive && (clip.fileType !== 'video' || !clip.fileUrl)) continue
+        // Generator clips (text/image) synthesize their own frame — no fileUrl.
+        const isGenerator = clip.fileType === 'image' || clip.fileType === 'text'
+        // Non-live, non-generator clips must be a renderable video file (fileUrl).
+        if (!isLive && !isGenerator && (clip.fileType !== 'video' || !clip.fileUrl)) continue
 
         activeClipIds.add(clip.id)
 
@@ -1151,9 +1236,10 @@ export class Renderer {
         const effectNodes = this.masterChain.chain.filter(n =>
           n.program && !n.bypassed && !n.isSource && !n.isOutput
         )
-        // An IMAGE_INPUT source produces pixels with no effect program, so the
-        // chain must run even with zero effect nodes (image → OUTPUT).
-        const hasImageSource = this.masterChain.chain.some(n => n.isImage)
+        // An IMAGE_INPUT / TEXT_INPUT source produces pixels with no effect
+        // program, so the chain must run even with zero effect nodes (source →
+        // OUTPUT).
+        const hasImageSource = this.masterChain.chain.some(n => n.isImage || n.isText)
 
         if (effectNodes.length > 0 || hasImageSource) {
           // No video composited this frame → generative effects should self-display.
@@ -1192,6 +1278,23 @@ export class Renderer {
         }
       }
     }
+
+    // Cleanup for generator clips (text/image): they back no media element, so
+    // they never pass through the loop above. Track the ones we've rendered and
+    // free a generator's resources once it leaves the timeline.
+    if (!this._generatorClips) this._generatorClips = new Set()
+    for (const c of clips) {
+      if (c.fileType === 'image' || c.fileType === 'text') this._generatorClips.add(c.id)
+    }
+    if (this._generatorClips.size > 0) {
+      const liveIds = new Set(clips.map(c => c.id))
+      for (const id of [...this._generatorClips]) {
+        if (!liveIds.has(id)) {
+          this.releaseClipResources(id, graphState)
+          this._generatorClips.delete(id)
+        }
+      }
+    }
   }
 
   /**
@@ -1203,6 +1306,12 @@ export class Renderer {
     this.textures.delete(`clip_${clipId}`)
     this.fbos.delete(`clip_input_${clipId}`)
     this.fbos.delete(`clip_output_${clipId}`)
+
+    // Generator clips (text/image) key their source raster/texture by clip id.
+    this.textures.delete(`img_${clipId}`)
+    this.textures.delete(`txt_${clipId}`)
+    removeNodeImage(clipId)
+    removeText(clipId)
 
     // Node-transition FBOs are namespaced `…tr~<clipId>~…` (see
     // _compositeNodeTransition); enumerate-and-match frees them without needing
@@ -1241,6 +1350,8 @@ export class Renderer {
       this.fbos.deletePingPong(`__npp_${scope}${n.id}`)  // DAG feedback ping-pong
       this.fbos.delete(`__img_${scope}${n.id}`)          // IMAGE_INPUT source FBO
       this.textures.delete(`img_${n.id}`)                // decoded image texture (id-keyed)
+      this.fbos.delete(`__txt_${scope}${n.id}`)          // TEXT_INPUT source FBO
+      this.textures.delete(`txt_${n.id}`)                // rasterized text texture (id-keyed)
       // Legacy buffers from the pre-unification executors — harmless if absent.
       this.fbos.deletePingPong(`__fb_${n.id}`)
       this.fbos.deletePingPong(`__fb_sub_${n.id}`)
@@ -1458,77 +1569,85 @@ export class Renderer {
     const clip = clips.find(c => c.id === clipId)
     if (!clip) return
 
-    let videoEl = this._videoElements.get(clipId)
-    if (videoEl && videoEl._fileUrl !== clip.fileUrl) {
-      this._videoElements.delete(clipId)
-      videoEl = null
-    }
-    if (!videoEl) {
-      videoEl = document.createElement(clip.fileType === 'audio' ? 'audio' : 'video')
-      videoEl.src = clip.fileUrl
-      videoEl._fileUrl = clip.fileUrl
-      videoEl.muted = true // isolated mode defaults to muted
-      videoEl.loop = false
-      videoEl.crossOrigin = 'anonymous'
-      videoEl.playsInline = true
-      videoEl.autoplay = false
-      videoEl.preload = 'auto'
-      this._videoElements.set(clipId, videoEl)
-    }
-
-    // Connect to audio engine dynamically when context becomes active
-    const audioEngine = getAudioEngine()
-    if (audioEngine.ctx && videoEl._connectedToAudioEngine !== audioEngine.ctx) {
-      audioEngine.connectMediaElement(videoEl)
-      videoEl._connectedToAudioEngine = audioEngine.ctx
-    }
-
-    // Sync playback
     const appState = this._getAppStore ? this._getAppStore() : {}
     const playheadTime = appState.playheadTime || 0
-    const sourceTime = getClipSourceTime(clip, playheadTime)
-    this._syncVideoPlayback(clip, videoEl, sourceTime, true) // Muted in isolated mode
-
-    // Pause other video elements that are not the current isolated clip
-    for (const [id, el] of this._videoElements) {
-      if (id !== clipId) {
-        if (!el.paused) el.pause()
-      }
-    }
-
-    const texId = `clip_${clipId}`
-    const hasTexture = !!this.textures.getTexture(texId)
-
-    if (videoEl.readyState < 2 && !hasTexture && clip.fileType !== 'audio') return
-
-    // Upload video frame or use cached texture if seeking
-    if (!hasTexture && clip.fileType !== 'audio') {
-      this.textures.create(texId, videoEl.videoWidth || 1920, videoEl.videoHeight || 1080)
-    }
-    if (clip.fileType !== 'audio' && videoEl.readyState >= 2 && (!hasTexture || videoEl.currentTime !== videoEl._lastUploadedTime)) {
-      this.textures.uploadVideoFrame(texId, videoEl)
-      videoEl._lastUploadedTime = videoEl.currentTime
-    }
-
-    // Render to input FBO
     const inputFBOId = `clip_input_${clipId}`
     if (!this.fbos.getTexture(inputFBOId)) {
       this.fbos.create(inputFBOId, this.width, this.height)
     }
 
-    if (clip.fileType === 'audio') {
-      // Audio-only clip: use the default blank FBO as input so visualizers have a texture
-      this._ensureDefaultFBO()
-      this.fbos.blit('__default_input', inputFBOId, this.width, this.height)
+    if (clip.fileType === 'image' || clip.fileType === 'text') {
+      // Generator source (no media element): synthesize straight into the input
+      // FBO so the clip graph — and this isolated editor view — see it directly.
+      if (clip.fileType === 'image') this.renderImageNode(clipId, inputFBOId, standardState, normalizeParams(clip.params || {}))
+      else this.renderTextNode(clipId, inputFBOId, standardState, clip.params || {})
+      // Pause any playing media while editing a generator clip.
+      for (const [, el] of this._videoElements) { if (!el.paused) el.pause() }
     } else {
-      this.fbos.bind(inputFBOId)
-      gl.viewport(0, 0, this.width, this.height)
-      gl.useProgram(this.passthroughProgram.program)
-      gl.activeTexture(gl.TEXTURE0)
-      gl.bindTexture(gl.TEXTURE_2D, this.textures.getTexture(texId))
-      const loc = this.passthroughProgram.uniformLocations.u_texture
-      if (loc != null) gl.uniform1i(loc, 0)
-      this.drawQuad()
+      let videoEl = this._videoElements.get(clipId)
+      if (videoEl && videoEl._fileUrl !== clip.fileUrl) {
+        this._videoElements.delete(clipId)
+        videoEl = null
+      }
+      if (!videoEl) {
+        videoEl = document.createElement(clip.fileType === 'audio' ? 'audio' : 'video')
+        videoEl.src = clip.fileUrl
+        videoEl._fileUrl = clip.fileUrl
+        videoEl.muted = true // isolated mode defaults to muted
+        videoEl.loop = false
+        videoEl.crossOrigin = 'anonymous'
+        videoEl.playsInline = true
+        videoEl.autoplay = false
+        videoEl.preload = 'auto'
+        this._videoElements.set(clipId, videoEl)
+      }
+
+      // Connect to audio engine dynamically when context becomes active
+      const audioEngine = getAudioEngine()
+      if (audioEngine.ctx && videoEl._connectedToAudioEngine !== audioEngine.ctx) {
+        audioEngine.connectMediaElement(videoEl)
+        videoEl._connectedToAudioEngine = audioEngine.ctx
+      }
+
+      // Sync playback
+      const sourceTime = getClipSourceTime(clip, playheadTime)
+      this._syncVideoPlayback(clip, videoEl, sourceTime, true) // Muted in isolated mode
+
+      // Pause other video elements that are not the current isolated clip
+      for (const [id, el] of this._videoElements) {
+        if (id !== clipId) {
+          if (!el.paused) el.pause()
+        }
+      }
+
+      const texId = `clip_${clipId}`
+      const hasTexture = !!this.textures.getTexture(texId)
+
+      if (videoEl.readyState < 2 && !hasTexture && clip.fileType !== 'audio') return
+
+      // Upload video frame or use cached texture if seeking
+      if (!hasTexture && clip.fileType !== 'audio') {
+        this.textures.create(texId, videoEl.videoWidth || 1920, videoEl.videoHeight || 1080)
+      }
+      if (clip.fileType !== 'audio' && videoEl.readyState >= 2 && (!hasTexture || videoEl.currentTime !== videoEl._lastUploadedTime)) {
+        this.textures.uploadVideoFrame(texId, videoEl)
+        videoEl._lastUploadedTime = videoEl.currentTime
+      }
+
+      if (clip.fileType === 'audio') {
+        // Audio-only clip: use the default blank FBO as input so visualizers have a texture
+        this._ensureDefaultFBO()
+        this.fbos.blit('__default_input', inputFBOId, this.width, this.height)
+      } else {
+        this.fbos.bind(inputFBOId)
+        gl.viewport(0, 0, this.width, this.height)
+        gl.useProgram(this.passthroughProgram.program)
+        gl.activeTexture(gl.TEXTURE0)
+        gl.bindTexture(gl.TEXTURE_2D, this.textures.getTexture(texId))
+        const loc = this.passthroughProgram.uniformLocations.u_texture
+        if (loc != null) gl.uniform1i(loc, 0)
+        this.drawQuad()
+      }
     }
 
     // Execute clip graph

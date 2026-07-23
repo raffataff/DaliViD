@@ -133,7 +133,7 @@ function resolveTransitionProgress(src, standardState, liveNodes = null, nodeLoo
  * Hex color strings ("#rrggbb") are converted to a normalized vec3 so they
  * don't reach gl.uniform3f as a string (which produces NaN).
  */
-function normalizeParams(params) {
+export function normalizeParams(params) {
   const out = {}
   if (!params) return out
   for (const key in params) {
@@ -177,10 +177,11 @@ export function compileGraph(gl, graph) {
     if (!node) continue
 
     // Source/input nodes — no shader here, just mark as passthrough. IMAGE_INPUT
-    // is a source too, but unlike the others it produces its OWN texture (drawn
-    // into a per-node FBO by the renderer's image pass), not the chain input.
-    if (['CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'EFFECT_INPUT', 'IMAGE_INPUT'].includes(node.type)) {
-      chain.push({ nodeId: node.id, type: node.type, program: null, uniformLocations: {}, params: node.params || {}, bypassed: node.bypassed || false, name: node.name, isSource: true, isImage: node.type === 'IMAGE_INPUT' })
+    // and TEXT_INPUT are sources too, but unlike the others they produce their OWN
+    // texture (drawn into a per-node FBO by the renderer's image/text pass), not
+    // the chain input.
+    if (['CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'EFFECT_INPUT', 'IMAGE_INPUT', 'TEXT_INPUT'].includes(node.type)) {
+      chain.push({ nodeId: node.id, type: node.type, program: null, uniformLocations: {}, params: node.params || {}, bypassed: node.bypassed || false, name: node.name, isSource: true, isImage: node.type === 'IMAGE_INPUT', isText: node.type === 'TEXT_INPUT' })
       continue
     }
 
@@ -406,6 +407,8 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
   const nFBO = (nodeId) => `__n_${scopeId}${nodeId}`
   // The FBO an IMAGE_INPUT source draws into (its own image, not the chain input).
   const imageFBO = (nodeId) => `__img_${scopeId}${nodeId}`
+  // The FBO a TEXT_INPUT source draws into (its own rasterized text).
+  const textFBO = (nodeId) => `__txt_${scopeId}${nodeId}`
 
   // ── Image source pre-pass ──
   // IMAGE_INPUT nodes are skipped in the main loop (they're sources), so render
@@ -422,6 +425,20 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     renderer.renderImageNode(n.nodeId, fboId, standardState, cp)
   }
 
+  // ── Text source pre-pass ── (mirror of the image pre-pass)
+  // NOTE: text params are NOT run through normalizeParams — its canvas fields
+  // (color / bgColor / …) are hex strings the rasterizer needs verbatim, and the
+  // TEXT shader has no color uniform. Float overrides (scale/offset/…) still apply.
+  for (const n of chain) {
+    if (!n.isText) continue
+    const fboId = ensureFBO(textFBO(n.nodeId))
+    const liveParams = liveNodes?.[n.nodeId]?.params ?? n.params
+    const cp = { ...(liveParams || {}) }
+    const ov = floatOverrides[n.nodeId]
+    if (ov) Object.assign(cp, ov)
+    renderer.renderTextNode(n.nodeId, fboId, standardState, cp)
+  }
+
   // The FBO produced by a node, following bypass/compile-error passthrough.
   // fromSocket identifies WHICH output is wanted — relevant for multi-output
   // producers (compounds expose output_<i>); regular nodes have a single output.
@@ -430,6 +447,7 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     guard.add(nodeId)
     const src = byId[nodeId]
     if (src && src.isImage) return imageFBO(nodeId)
+    if (src && src.isText) return textFBO(nodeId)
     if (!src || src.isSource) {
       // Inside a compound, an EFFECT_INPUT terminal maps to the FBO wired to the
       // matching outer input socket (terminalInputs). Otherwise a source resolves

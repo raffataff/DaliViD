@@ -9,6 +9,7 @@ const NODE_CATALOG = [
     items: [
       { type: 'VIDEO_INPUT', name: 'Video Input', sourceOnly: true },
       { type: 'IMAGE_INPUT', name: 'Image Input', sourceOnly: true },
+      { type: 'TEXT_INPUT', name: 'Text Input', sourceOnly: true },
       { type: 'CAMERA_INPUT', name: 'Camera Input', sourceOnly: true },
       { type: 'SCREEN_INPUT', name: 'Screen Input', sourceOnly: true },
       { type: 'OUTPUT', name: 'Output' },

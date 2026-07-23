@@ -879,6 +879,60 @@ void main() {
 }
 `)
 
+// ── Text Input ──
+// The rasterized text canvas is bound to u_image (unit 0) by the Renderer's text
+// pass (see renderTextNode). This shader places/scales/rotates that raster on the
+// canvas and adds always-live audio reactivity (bass swell + beat punch) with no
+// wiring. Everything outside the (transformed) raster stays transparent so the
+// text composites cleanly over lower layers. Peer to the IMAGE_INPUT shader.
+registerShader('TEXT_INPUT', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_image;        // rasterized text (RGBA), bound by the renderer
+uniform vec2 u_resolution;        // output canvas size
+uniform float u_audio_bands[8];   // always-live FFT bands
+uniform float u_beat;             // always-live beat trigger
+// @param name="Scale" min=0.1 max=4.0 default=1.0 step=0.01
+uniform float u_txt_scale;
+// @param name="Offset X" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_offset_x;
+// @param name="Offset Y" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_offset_y;
+// @param name="Rotation" min=-3.1416 max=3.1416 default=0.0 step=0.01
+uniform float u_txt_rot;
+// @param name="Bass Zoom" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bass_zoom;
+// @param name="Beat Punch" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_beat_punch;
+out vec4 fragColor;
+
+void main() {
+  vec2 c = v_uv - 0.5;
+
+  // Aspect-correct so rotation doesn't shear a non-square canvas.
+  float aspect = u_resolution.x / max(u_resolution.y, 1.0);
+  c.x *= aspect;
+
+  // Always-live reactive zoom: bass swells, beat punches.
+  float bass = u_audio_bands[1];
+  float zoom = u_txt_scale * (1.0 + bass * u_bass_zoom * 1.5 + u_beat * u_beat_punch * 0.5);
+  c /= max(zoom, 0.001);
+
+  float ca = cos(u_txt_rot), sa = sin(u_txt_rot);
+  c = mat2(ca, -sa, sa, ca) * c;
+
+  c.x /= aspect;
+  c += vec2(u_offset_x, -u_offset_y) * 0.5;
+  vec2 suv = c + 0.5;
+
+  if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
+    fragColor = vec4(0.0);        // transparent outside the raster
+  } else {
+    fragColor = texture(u_image, suv);
+  }
+}
+`)
+
 // ── Camera Input (passthrough — camera texture uploaded externally) ──
 registerShader('CAMERA_INPUT', `#version 300 es
 precision highp float;

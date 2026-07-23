@@ -12,6 +12,7 @@ import useAppStore from '../../store/useAppStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import { topologicalSort, findOrphaned } from '../../utils/topSort'
 import { parseParams, getDefaultParams } from '../../utils/paramParser'
+import { DEFAULT_TEXT_PARAMS } from '../../utils/textRenderer'
 import { getShaderSource } from '../../shaders/shaderRegistry'
 import { instantiatePreset, instantiateUserCompound } from '../../shaders/compoundPresets'
 import { generateCombinedShader } from '../../shaders/shaderGenerator'
@@ -532,10 +533,12 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     const shaderCode = getShaderSource(nodeType.type)
     const paramConfigs = shaderCode ? parseParams(shaderCode) : []
     const defaultParams = getDefaultParams(paramConfigs)
+    // TEXT_INPUT also needs its canvas text/style defaults (not shader @params).
+    const params = nodeType.type === 'TEXT_INPUT' ? { ...DEFAULT_TEXT_PARAMS, ...defaultParams } : defaultParams
 
     const newId = addNode(graphLevel, graphClipId, {
       type: nodeType.type, name: nodeType.name,
-      position: { x, y }, params: defaultParams,
+      position: { x, y }, params,
       shaderCode: nodeType.type === 'CUSTOM' ? shaderCode : null,
     })
     autoWireAudioDrivers(nodeType.type, newId)
@@ -585,6 +588,10 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       const shaderCode = getShaderSource(payload.nodeType)
       const paramConfigs = shaderCode ? parseParams(shaderCode) : []
       const defaultParams = getDefaultParams(paramConfigs)
+      // TEXT_INPUT also needs its canvas text/style defaults (not shader @params).
+      if (payload.nodeType === 'TEXT_INPUT') {
+        for (const k in DEFAULT_TEXT_PARAMS) if (!(k in defaultParams)) defaultParams[k] = DEFAULT_TEXT_PARAMS[k]
+      }
       // An image card dropped from the Media Pool carries its data URL — preload
       // it onto the new IMAGE_INPUT node so it renders immediately.
       if (payload.imageSrc) {

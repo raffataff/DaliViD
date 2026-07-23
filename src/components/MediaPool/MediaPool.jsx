@@ -8,6 +8,7 @@ import { COMPOUND_PRESETS } from '../../shaders/compoundPresets'
 import { setCameraStream, getCameraStream, removeCameraStream } from '../../gl/cameraRegistry'
 import { getAudioEngine } from '../../audio/AudioEngine'
 import { prepareImageDataURL, dataUrlBytes, formatBytes } from '../../utils/imageProcessing'
+import { makeTextClipParams, TEXT_PRESETS, DEFAULT_GENERATOR_DURATION } from '../../utils/generatorClips'
 import { addToast } from '../common/Toast'
 import {
   startScreenCapture, startRecording, stopRecording, stopRecordingIfActive,
@@ -18,6 +19,7 @@ import './MediaPool.css'
 const TABS = [
   { id: 'videos', label: 'Videos' },
   { id: 'images', label: 'Images' },
+  { id: 'text', label: 'Text' },
   { id: 'cameras', label: 'Cameras' },
   { id: 'screens', label: 'Screen' },
   { id: 'audio', label: 'Audio' },
@@ -284,6 +286,25 @@ export default function MediaPool() {
     }
     input.click()
   }, [])
+
+  // Add a text clip at the playhead on a video track (creating one if needed),
+  // then select it so the Inspector opens for styling.
+  const handleAddText = useCallback((presetParams) => {
+    const app = useAppStore.getState()
+    const playhead = app.playheadTime || 0
+    let videoTrack = tracks.find(t => t.type === 'video')
+    if (!videoTrack) videoTrack = { id: addTrack('video') }
+    const params = makeTextClipParams(presetParams || {})
+    const filename = (params.text || 'Text').split('\n')[0].slice(0, 24) || 'Text'
+    const clipId = addClip(videoTrack.id, {
+      filename, fileType: 'text',
+      timelineStart: playhead, timelineEnd: playhead + DEFAULT_GENERATOR_DURATION,
+      sourceStart: 0, sourceEnd: DEFAULT_GENERATOR_DURATION,
+      params,
+    })
+    initClipGraph(clipId, filename, 'text')
+    app.selectClip?.(clipId)
+  }, [tracks, addTrack, addClip, initClipGraph])
 
   // Detect cameras. Request permission first so device labels are populated
   // (enumerateDevices returns blank labels until camera access is granted).
@@ -616,12 +637,13 @@ export default function MediaPool() {
                     key={img.id}
                     className="media-pool__file-item media-pool__file-item--interactive"
                     draggable="true"
-                    title="Drag onto the Node Editor to create an Image source node"
+                    title="Drag onto the Timeline to add an image clip, or onto the Node Editor for an Image source node"
                     onDragStart={(e) => {
                       e.dataTransfer.setData('application/dalivid-drag', JSON.stringify({
-                        kind: 'node',
+                        kind: 'node',        // Node Editor → IMAGE_INPUT node
+                        clipType: 'image',   // Timeline → image clip
                         nodeType: 'IMAGE_INPUT',
-                        name: 'Image',
+                        name: img.filename || 'Image',
                         imageSrc: img.dataUrl,
                         imageName: img.filename,
                       }))
@@ -642,6 +664,42 @@ export default function MediaPool() {
                 ))}
               </div>
             )}
+          </>
+        )}
+
+        {/* ── Text Tab ── */}
+        {activeTab === 'text' && (
+          <>
+            <button className="media-pool__import-btn" onClick={() => handleAddText()}>
+              + Add Text
+            </button>
+            <p className="media-pool__empty-hint" style={{ margin: '0 0 8px' }}>
+              Adds a text clip at the playhead. Drag a style below onto the Timeline to place it, then edit in the Inspector.
+            </p>
+            <div className="media-pool__effects-grid">
+              {TEXT_PRESETS.map(preset => (
+                <div
+                  key={preset.id}
+                  className="media-pool__effect-card"
+                  style={{ borderColor: '#ffcc44' }}
+                  draggable="true"
+                  title="Drag onto the Timeline to add this text style, or click to add it at the playhead"
+                  onClick={() => handleAddText(preset.params)}
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData('application/dalivid-drag', JSON.stringify({
+                      kind: 'timelineClip',
+                      clipType: 'text',
+                      name: preset.name,
+                      params: preset.params,
+                    }))
+                    e.dataTransfer.effectAllowed = 'copy'
+                  }}
+                >
+                  <div className="media-pool__effect-icon" style={{ color: '#ffcc44', fontWeight: 700 }}>T</div>
+                  <div className="media-pool__effect-name">{preset.name}</div>
+                </div>
+              ))}
+            </div>
           </>
         )}
 
@@ -926,6 +984,7 @@ function ScopesBars() {
 
 const EFFECT_PRESETS = [
   { type: 'IMAGE_INPUT', name: 'Image', color: '#44cc88', icon: '◳' },
+  { type: 'TEXT_INPUT', name: 'Text', color: '#ffcc44', icon: 'T' },
   { type: 'EDGE_DETECTION', name: 'Edge Detection', color: '#ff8844', icon: '◈' },
   { type: 'COLOR_INVERSION', name: 'Color / HSV', color: '#ff44cc', icon: '◐' },
   { type: 'GLITCH', name: 'Glitch', color: '#ff3344', icon: '▦' },

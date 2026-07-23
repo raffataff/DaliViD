@@ -3,6 +3,8 @@ import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import { parseParams } from '../../utils/paramParser'
+import { prepareImageDataURL } from '../../utils/imageProcessing'
+import { TEXT_FONTS } from '../../utils/textRenderer'
 import { getNodeSource } from '../../shaders/shaderRegistry'
 import { BLEND_MODE_NAMES } from '../../gl/BlendModes.glsl.js'
 import { TRANSITION_TYPES, getTransitionLabel, getTransitionParams, getTransitionDefaults } from '../../shaders/transitionRegistry.js'
@@ -181,6 +183,16 @@ function NodeInspector({ nodeId, graphLevel, clipId }) {
       </div>
       {getNodeSource(node) != null && !node.locked && (
         <button className="inspector__btn inspector__btn--primary" onClick={() => openMonaco(nodeId)} style={{ marginTop: 8 }}>Edit Shader Code</button>
+      )}
+      {node.type === 'TEXT_INPUT' && (
+        <>
+          <div className="inspector__section-header" style={{ marginTop: 16 }}>Text</div>
+          <TextStyleEditor
+            params={node.params || {}}
+            onChange={(key, value) => setNodeParam(graphLevel, clipId, nodeId, key, value)}
+            includeTransform={false}
+          />
+        </>
       )}
       {paramConfigs.length > 0 && (
         <>
@@ -422,6 +434,126 @@ function CompoundInnerParamRow({ innerNodeId, param, value, compoundNode, graphL
   )
 }
 
+// ── Reusable field rows for the text/image editors ──
+function FieldNum({ label, value, def, min, max, step, onChange }) {
+  const v = value == null ? def : value
+  const decimals = step < 1 ? 2 : 0
+  return (
+    <div className="inspector__field">
+      <label className="inspector__label">{label}</label>
+      <div className="inspector__slider">
+        <input type="range" min={min} max={max} step={step} value={v} onChange={(e) => onChange(parseFloat(e.target.value))} />
+        <span className="inspector__slider-value">{Number(v).toFixed(decimals)}</span>
+      </div>
+    </div>
+  )
+}
+function FieldColor({ label, value, def, onChange }) {
+  return (
+    <div className="inspector__field">
+      <label className="inspector__label">{label}</label>
+      <input type="color" value={value || def || '#000000'} onChange={(e) => onChange(e.target.value)}
+        style={{ width: 44, height: 22, padding: 0, border: '1px solid var(--border, #2a2a35)', background: 'transparent', borderRadius: 3, cursor: 'pointer' }} />
+    </div>
+  )
+}
+function FieldSelect({ label, value, options, onChange }) {
+  return (
+    <div className="inspector__field">
+      <label className="inspector__label">{label}</label>
+      <select className="inspector__select" value={value} onChange={(e) => onChange(e.target.value)}>
+        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+    </div>
+  )
+}
+function FieldCheck({ label, value, onChange }) {
+  return (
+    <div className="inspector__field">
+      <label className="inspector__label">{label}</label>
+      <label className="inspector__toggle">
+        <input type="checkbox" checked={!!value} onChange={(e) => onChange(e.target.checked)} />
+        <span className="inspector__toggle-slider" />
+      </label>
+    </div>
+  )
+}
+
+// Text style editor — shared by text clips and TEXT_INPUT nodes. `includeTransform`
+// adds the shader-uniform transform/reactive controls (clips only; on a node those
+// already show as @param sliders in the Parameters section).
+function TextStyleEditor({ params, onChange, includeTransform = true }) {
+  const p = params || {}
+  const WEIGHTS = [['Light', '300'], ['Regular', '400'], ['Medium', '500'], ['Semibold', '600'], ['Bold', '700'], ['Heavy', '800'], ['Black', '900']]
+  return (
+    <>
+      <div className="inspector__field" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+        <label className="inspector__label" style={{ marginBottom: 4 }}>Text</label>
+        <textarea rows={2} value={p.text ?? ''} spellCheck={false} onChange={(e) => onChange('text', e.target.value)}
+          style={{ resize: 'vertical', width: '100%', background: '#0a0a0e', color: '#e8e8ef', border: '1px solid #2a2a35', borderRadius: 3, padding: '4px 6px', fontSize: 12 }} />
+      </div>
+      <FieldSelect label="Font" value={p.fontFamily ?? TEXT_FONTS[0].value} options={TEXT_FONTS.map(f => ({ label: f.label, value: f.value }))} onChange={(v) => onChange('fontFamily', v)} />
+      <FieldNum label="Size" value={p.fontSize} def={96} min={8} max={400} step={1} onChange={(v) => onChange('fontSize', v)} />
+      <FieldSelect label="Weight" value={String(p.fontWeight ?? '700')} options={WEIGHTS.map(([label, value]) => ({ label, value }))} onChange={(v) => onChange('fontWeight', v)} />
+      <FieldCheck label="Italic" value={p.italic} onChange={(v) => onChange('italic', v)} />
+      <FieldColor label="Color" value={p.color} def="#ffffff" onChange={(v) => onChange('color', v)} />
+      <FieldSelect label="Align" value={p.align ?? 'center'} options={[{ label: 'Left', value: 'left' }, { label: 'Center', value: 'center' }, { label: 'Right', value: 'right' }]} onChange={(v) => onChange('align', v)} />
+      <FieldNum label="Position X" value={p.posX} def={0.5} min={0} max={1} step={0.01} onChange={(v) => onChange('posX', v)} />
+      <FieldNum label="Position Y" value={p.posY} def={0.5} min={0} max={1} step={0.01} onChange={(v) => onChange('posY', v)} />
+      <FieldNum label="Wrap Width" value={p.maxWidth} def={0.85} min={0.1} max={1} step={0.01} onChange={(v) => onChange('maxWidth', v)} />
+      <FieldNum label="Line Height" value={p.lineHeight} def={1.2} min={0.8} max={2.5} step={0.05} onChange={(v) => onChange('lineHeight', v)} />
+      <FieldNum label="Letter Spacing" value={p.letterSpacing} def={0} min={-10} max={40} step={0.5} onChange={(v) => onChange('letterSpacing', v)} />
+      <div className="inspector__section-header" style={{ marginTop: 10 }}>Background Box</div>
+      <FieldColor label="BG Color" value={p.bgColor} def="#000000" onChange={(v) => onChange('bgColor', v)} />
+      <FieldNum label="BG Opacity" value={p.bgOpacity} def={0} min={0} max={1} step={0.01} onChange={(v) => onChange('bgOpacity', v)} />
+      <FieldNum label="Padding" value={p.padding} def={18} min={0} max={120} step={1} onChange={(v) => onChange('padding', v)} />
+      <div className="inspector__section-header" style={{ marginTop: 10 }}>Outline &amp; Shadow</div>
+      <FieldColor label="Stroke" value={p.strokeColor} def="#000000" onChange={(v) => onChange('strokeColor', v)} />
+      <FieldNum label="Stroke Width" value={p.strokeWidth} def={0} min={0} max={40} step={0.5} onChange={(v) => onChange('strokeWidth', v)} />
+      <FieldColor label="Shadow" value={p.shadowColor} def="#000000" onChange={(v) => onChange('shadowColor', v)} />
+      <FieldNum label="Shadow Blur" value={p.shadowBlur} def={0} min={0} max={60} step={0.5} onChange={(v) => onChange('shadowBlur', v)} />
+      <FieldNum label="Shadow X" value={p.shadowX} def={0} min={-40} max={40} step={0.5} onChange={(v) => onChange('shadowX', v)} />
+      <FieldNum label="Shadow Y" value={p.shadowY} def={0} min={-40} max={40} step={0.5} onChange={(v) => onChange('shadowY', v)} />
+      {includeTransform && (
+        <>
+          <div className="inspector__section-header" style={{ marginTop: 10 }}>Transform &amp; Reactive</div>
+          <FieldNum label="Scale" value={p.u_txt_scale} def={1} min={0.1} max={4} step={0.01} onChange={(v) => onChange('u_txt_scale', v)} />
+          <FieldNum label="Offset X" value={p.u_offset_x} def={0} min={-1} max={1} step={0.01} onChange={(v) => onChange('u_offset_x', v)} />
+          <FieldNum label="Offset Y" value={p.u_offset_y} def={0} min={-1} max={1} step={0.01} onChange={(v) => onChange('u_offset_y', v)} />
+          <FieldNum label="Rotation" value={p.u_txt_rot} def={0} min={-3.1416} max={3.1416} step={0.01} onChange={(v) => onChange('u_txt_rot', v)} />
+          <FieldNum label="Bass Zoom" value={p.u_bass_zoom} def={0} min={0} max={1} step={0.01} onChange={(v) => onChange('u_bass_zoom', v)} />
+          <FieldNum label="Beat Punch" value={p.u_beat_punch} def={0} min={0} max={1} step={0.01} onChange={(v) => onChange('u_beat_punch', v)} />
+        </>
+      )}
+    </>
+  )
+}
+
+// Image style editor — for image clips (fit/transform/reactive + replace). Image
+// nodes edit the same values via their @param sliders + on-card loader.
+function ImageStyleEditor({ params, onChange, onReplaceImage }) {
+  const p = params || {}
+  return (
+    <>
+      {onReplaceImage && (
+        <button className="inspector__btn" style={{ marginBottom: 8 }} onClick={onReplaceImage}>
+          {p.imageSrc ? 'Replace Image' : 'Load Image'}
+        </button>
+      )}
+      <FieldSelect label="Fit" value={String(p.u_fit ?? 0)}
+        options={[{ label: 'Cover', value: '0' }, { label: 'Contain', value: '1' }, { label: 'Stretch', value: '2' }, { label: 'Tile', value: '3' }]}
+        onChange={(v) => onChange('u_fit', parseInt(v, 10))} />
+      <FieldNum label="Scale" value={p.u_img_scale} def={1} min={0.1} max={4} step={0.01} onChange={(v) => onChange('u_img_scale', v)} />
+      <FieldNum label="Offset X" value={p.u_offset_x} def={0} min={-1} max={1} step={0.01} onChange={(v) => onChange('u_offset_x', v)} />
+      <FieldNum label="Offset Y" value={p.u_offset_y} def={0} min={-1} max={1} step={0.01} onChange={(v) => onChange('u_offset_y', v)} />
+      <FieldNum label="Rotation" value={p.u_img_rot} def={0} min={-3.1416} max={3.1416} step={0.01} onChange={(v) => onChange('u_img_rot', v)} />
+      <FieldColor label="Background" value={p.u_bg_color} def="#000000" onChange={(v) => onChange('u_bg_color', v)} />
+      <FieldNum label="Bass Zoom" value={p.u_bass_zoom} def={0} min={0} max={1} step={0.01} onChange={(v) => onChange('u_bass_zoom', v)} />
+      <FieldNum label="Beat Punch" value={p.u_beat_punch} def={0} min={0} max={1} step={0.01} onChange={(v) => onChange('u_beat_punch', v)} />
+    </>
+  )
+}
+
 function ClipInspector({ clipId }) {
   const clips = useTimelineStore(s => s.clips)
   const updateClip = useTimelineStore(s => s.updateClip)
@@ -431,6 +563,29 @@ function ClipInspector({ clipId }) {
   if (!clip) return <div className="inspector__empty">No clip selected</div>
 
   const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen'
+
+  // Merge one generator param into the clip, keeping the rest.
+  const setParam = (key, value) => updateClip(clipId, { params: { ...clip.params, [key]: value } })
+  // For a text clip, keep the timeline label in sync with the first line.
+  const setTextParam = (key, value) => {
+    const patch = { params: { ...clip.params, [key]: value } }
+    if (key === 'text') patch.filename = (value || 'Text').split('\n')[0].slice(0, 24) || 'Text'
+    updateClip(clipId, patch)
+  }
+  const replaceImage = () => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'image/*'
+    input.onchange = async (e) => {
+      const file = e.target.files?.[0]
+      if (!file) return
+      try {
+        const { dataUrl } = await prepareImageDataURL(file)
+        updateClip(clipId, { params: { ...clip.params, imageSrc: dataUrl, imageName: file.name }, filename: file.name })
+      } catch (err) { console.error('[DaliVid] Failed to load image:', err) }
+    }
+    input.click()
+  }
 
   // Node-graph transitions: any library compound with ≥ 2 image inputs.
   const transitionCompounds = compoundLibrary.filter(isTransitionCompound)
@@ -460,6 +615,20 @@ function ClipInspector({ clipId }) {
       <div className="inspector__field"><label className="inspector__label">Blend Mode</label><BlendModeSelect allowInherit value={clip.blendMode || 'Inherit'} onChange={(v) => updateClip(clipId, { blendMode: v })} /></div>
       <div className="inspector__field"><label className="inspector__label">Fade In</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeIn || 0} onChange={(e) => updateClip(clipId, { fadeIn: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeIn || 0).toFixed(2)}s</span></div></div>
       <div className="inspector__field"><label className="inspector__label">Fade Out</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeOut || 0} onChange={(e) => updateClip(clipId, { fadeOut: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeOut || 0).toFixed(2)}s</span></div></div>
+
+      {clip.fileType === 'text' && (
+        <>
+          <div className="inspector__section-header" style={{ marginTop: 12 }}>Text</div>
+          <TextStyleEditor params={clip.params || {}} onChange={setTextParam} includeTransform />
+        </>
+      )}
+
+      {clip.fileType === 'image' && (
+        <>
+          <div className="inspector__section-header" style={{ marginTop: 12 }}>Image</div>
+          <ImageStyleEditor params={clip.params || {}} onChange={setParam} onReplaceImage={replaceImage} />
+        </>
+      )}
 
       {(clip.fileType === 'video' || clip.fileType === 'audio') && (
         <>

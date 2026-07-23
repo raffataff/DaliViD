@@ -74,6 +74,10 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
           ? { type: c.transition.type, params: { ...(c.transition.params || {}) } }
           : null,
         transform: { ...c.transform },
+        // Generator clips (text/image) carry their content + style here (text
+        // string, image data URL, fit/transform). Self-contained — no external
+        // file, so text/image clips survive save/load with no re-import.
+        params: c.params ? { ...c.params } : {},
         metadata: { ...c.metadata },
         hasEffects: c.hasEffects,
         // Note: fileUrl (blob URL) is NOT saved — user must re-import files
@@ -464,6 +468,9 @@ export async function restoreMediaFilesFromFolder(projectDirHandle, clips, updat
     // land in the "missing media" warning list). Screen clips reconnect via the
     // MediaPool Screen tab's Reconnect button instead.
     if (clip.fileType === 'camera' || clip.fileType === 'screen') continue
+    // Generator clips (text/image) are self-contained in params (no on-disk
+    // media) — nothing to relink.
+    if (clip.fileType === 'text' || clip.fileType === 'image') continue
     // If the fileUrl is missing (or is a stale blob URL from a previous session), restore it!
     const folderName = clip.fileType === 'audio' ? 'audio' : 'media'
     try {

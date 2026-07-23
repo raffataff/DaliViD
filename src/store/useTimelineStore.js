@@ -134,7 +134,10 @@ const useTimelineStore = create((set, get) => ({
     const clip = {
       filename: clipData.filename || 'Untitled',
       fileUrl: clipData.fileUrl || null,
-      fileType: clipData.fileType || 'video', // 'video' | 'audio' | 'camera' | 'screen'
+      fileType: clipData.fileType || 'video', // 'video' | 'audio' | 'camera' | 'screen' | 'image' | 'text'
+      // Generator clips (text/image) keep their content + style here (text string,
+      // image data URL, fit/transform). Empty for media-backed clips.
+      params: clipData.params || {},
       timelineStart: clipData.timelineStart || 0,
       timelineEnd: clipData.timelineEnd || 10,
       sourceStart: clipData.sourceStart || 0,

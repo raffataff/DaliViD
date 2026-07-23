@@ -4,6 +4,7 @@ import useTimelineStore from '../../store/useTimelineStore'
 import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import { IconChevronDown, IconPlus, IconLock } from '../common/Icons'
+import { makeImageClipParams, makeTextClipParams, DEFAULT_GENERATOR_DURATION } from '../../utils/generatorClips'
 import './Timeline.css'
 
 /**
@@ -23,6 +24,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const moveClip = useTimelineStore(s => s.moveClip)
   const trimClip = useTimelineStore(s => s.trimClip)
   const updateClip = useTimelineStore(s => s.updateClip)
+  const addClip = useTimelineStore(s => s.addClip)
   const splitClip = useTimelineStore(s => s.splitClip)
   const removeClip = useTimelineStore(s => s.removeClip)
   const timelineZoom = useTimelineStore(s => s.timelineZoom)
@@ -60,6 +62,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const selectedClipId = useAppStore(s => s.selectedClipId)
   const enterClipGraph = useAppStore(s => s.enterClipGraph)
   const clipGraphs = useGraphStore(s => s.clipGraphs)
+  const initClipGraph = useGraphStore(s => s.initClipGraph)
 
   const pxPerSec = 80 * timelineZoom
   const TRACK_HEADER_W = 160
@@ -275,10 +278,11 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
         const trackId = trackEl.getAttribute('data-track-id')
         const trackType = trackEl.getAttribute('data-track-type')
 
-        // Helper to check clip compatibility (video/camera/screen on video tracks, audio on audio tracks)
-        const isCompatible = (clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen')
-          ? trackType === 'video'
-          : (clip.fileType === 'audio' ? trackType === 'audio' : false)
+        // Clip compatibility: visual clips (video/camera/screen/image/text) live on
+        // video tracks; audio clips on audio tracks.
+        const isCompatible = (clip.fileType === 'audio')
+          ? trackType === 'audio'
+          : trackType === 'video'
 
         if (trackId && isCompatible) {
           targetTrackId = trackId
@@ -299,6 +303,55 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
   }, [pxPerSec, selectClip, moveClip, collectSnapPoints, snapClipStart])
+
+  // ── Drag & drop generator clips (text / image) onto a video track ──
+  const handleTrackDragOver = useCallback((e) => {
+    if (e.dataTransfer.types.includes('application/dalivid-drag')) {
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'copy'
+    }
+  }, [])
+
+  const handleTrackDrop = useCallback((e, track) => {
+    const raw = e.dataTransfer.getData('application/dalivid-drag')
+    if (!raw) return
+    let payload
+    try { payload = JSON.parse(raw) } catch { return }
+
+    // A drop makes a generator CLIP. Media-Pool image cards and text-preset cards
+    // both land here; node-graph drags (kind:'node' with no image) are ignored.
+    const clipType = payload.clipType
+      || (payload.imageSrc ? 'image' : null)
+      || (payload.nodeType === 'IMAGE_INPUT' ? 'image' : null)
+      || (payload.nodeType === 'TEXT_INPUT' ? 'text' : null)
+    if ((clipType !== 'image' && clipType !== 'text') || track.type !== 'video') return
+
+    e.preventDefault()
+    e.stopPropagation()
+
+    // Drop time from the cursor x within the (scrolled) clip lane.
+    const rect = e.currentTarget.getBoundingClientRect()
+    const start = Math.max(0, (e.clientX - rect.left + timelineScrollLeft) / pxPerSec)
+    const duration = DEFAULT_GENERATOR_DURATION
+
+    let filename, params
+    if (clipType === 'image') {
+      filename = payload.imageName || payload.name || 'Image'
+      params = makeImageClipParams({ imageSrc: payload.imageSrc || null, imageName: filename })
+    } else {
+      params = makeTextClipParams(payload.params || {})
+      filename = (params.text || 'Text').split('\n')[0].slice(0, 24) || 'Text'
+    }
+
+    const clipId = addClip(track.id, {
+      filename, fileType: clipType,
+      timelineStart: start, timelineEnd: start + duration,
+      sourceStart: 0, sourceEnd: duration,
+      params,
+    })
+    initClipGraph(clipId, filename, clipType)
+    selectClip(clipId)
+  }, [pxPerSec, timelineScrollLeft, addClip, initClipGraph, selectClip])
 
   // Trim handle drag (left or right edge). Edge snaps to targets; Shift disables.
   const handleTrimMouseDown = useCallback((e, clip, edge) => {
@@ -705,6 +758,8 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                   {/* Track Clip Region */}
                   <div
                     className="timeline__track-clips"
+                    onDragOver={handleTrackDragOver}
+                    onDrop={(e) => handleTrackDrop(e, track)}
                   >
                     <div style={{ transform: `translateX(-${timelineScrollLeft}px)`, position: 'relative', height: '100%' }}>
                       {trackClips.map(clip => {
@@ -712,9 +767,11 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                         const width = (clip.timelineEnd - clip.timelineStart) * pxPerSec
                         const hasGraph = clipGraphs[clip.id] && clipGraphs[clip.id].nodes.length > 2
                         const isTrimming = trimming?.clipId === clip.id
-                        // Fade overlays / handles are video-only: the compositor's
-                        // opacity ramp doesn't touch audio playback (yet).
+                        // Fade overlays / handles show for any composited visual
+                        // clip (video/camera/screen + text/image generators); the
+                        // compositor's opacity ramp applies to all of them.
                         const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen'
+                        const supportsFades = isVideoClip || clip.fileType === 'image' || clip.fileType === 'text'
                         const fadeInW = Math.min(width, (clip.fadeIn || 0) * pxPerSec)
                         const fadeOutW = Math.min(width, (clip.fadeOut || 0) * pxPerSec)
                         return (
@@ -743,8 +800,18 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                               className="timeline__clip-trim timeline__clip-trim--right"
                               onMouseDown={(e) => handleTrimMouseDown(e, clip, 'right')}
                             />
+                            {/* Image clips show a faded thumbnail behind the label. */}
+                            {clip.fileType === 'image' && clip.params?.imageSrc && (
+                              <img
+                                className="timeline__clip-thumb"
+                                src={clip.params.imageSrc}
+                                alt=""
+                                draggable={false}
+                                style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: 0.35, pointerEvents: 'none', borderRadius: 'inherit' }}
+                              />
+                            )}
                             {/* Fade ramps: shaded wedge = attenuated region, diagonal = the opacity ramp */}
-                            {isVideoClip && fadeInW > 1 && (
+                            {supportsFades && fadeInW > 1 && (
                               <svg
                                 className="timeline__clip-fade"
                                 style={{ left: 0, width: fadeInW }}
@@ -755,7 +822,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                                 <line x1="0" y1="1" x2="1" y2="0" vectorEffect="non-scaling-stroke" />
                               </svg>
                             )}
-                            {isVideoClip && fadeOutW > 1 && (
+                            {supportsFades && fadeOutW > 1 && (
                               <svg
                                 className="timeline__clip-fade"
                                 style={{ right: 0, width: fadeOutW }}
@@ -767,7 +834,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                               </svg>
                             )}
                             {/* Fade handles (visible on hover/selection) */}
-                            {isVideoClip && width > 24 && (
+                            {supportsFades && width > 24 && (
                               <>
                                 <div
                                   className="timeline__clip-fade-handle"
