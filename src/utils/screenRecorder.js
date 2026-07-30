@@ -177,22 +177,19 @@ export async function stopRecordingIfActive(clipId) {
  * from the Record button's click handler (before recorder.start), not from
  * MediaRecorder.onstop where activation has expired.
  *
- * Fallback chain: picker → project media/ folder → in-memory (anchor download).
+ * Fallback chain: picker → in-memory (anchor download). The picker writes to a
+ * single file the user names, which is why it survived the removal of folder
+ * linking — it grants no read access and nothing is persisted between sessions.
  */
-export async function openRecordingSink(name, ext, projectFolderHandle, handle) {
+export async function openRecordingSink(name, ext, handle) {
   const accept = ext === 'mp4' ? { 'video/mp4': ['.mp4'] } : { 'video/webm': ['.webm'] }
   const mimeType = handle?.mimeType || (ext === 'mp4' ? 'video/mp4' : 'video/webm')
 
-  // 1. Picker (primary) — pre-set inside the project's media/ folder when possible.
+  // 1. Picker (primary).
   if (typeof window !== 'undefined' && window.showSaveFilePicker) {
     try {
-      let startIn = 'videos'
-      if (projectFolderHandle) {
-        try { startIn = await projectFolderHandle.getDirectoryHandle('media', { create: true }) }
-        catch { startIn = 'videos' }
-      }
       const fh = await window.showSaveFilePicker({
-        suggestedName: name, startIn,
+        suggestedName: name, startIn: 'videos',
         types: [{ description: 'Video', accept }],
       })
       const writable = await fh.createWritable()
@@ -207,23 +204,7 @@ export async function openRecordingSink(name, ext, projectFolderHandle, handle) 
     }
   }
 
-  // 2. Project folder direct-write (no user activation needed — granted at link).
-  if (projectFolderHandle) {
-    try {
-      const dir = await projectFolderHandle.getDirectoryHandle('media', { create: true })
-      const fh = await dir.getFileHandle(name, { create: true })
-      const writable = await fh.createWritable()
-      return {
-        kind: 'project',
-        write: (blob) => writable.write(blob),
-        close: async () => { await writable.close(); return fh.getFile() },
-      }
-    } catch (err) {
-      console.warn('Project-folder sink unavailable:', err)
-    }
-  }
-
-  // 3. In-memory fallback — assemble a Blob and trigger an anchor download.
+  // 2. In-memory fallback — assemble a Blob and trigger an anchor download.
   return {
     kind: 'memory',
     write: (blob) => { handle.memChunks.push(blob) },

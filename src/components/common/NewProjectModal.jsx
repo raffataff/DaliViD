@@ -2,55 +2,27 @@ import { useState, useCallback } from 'react'
 import useAppStore from '../../store/useAppStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import useGraphStore from '../../store/useGraphStore'
-import { IconClose, IconFolder } from './Icons'
+import { IconClose } from './Icons'
 import { addToast } from './Toast'
-import { 
-  verifyDirectoryPermission, 
-  saveProjectFolderHandle, 
-  saveProjectToFolder 
-} from '../../utils/projectSerializer'
 import './NewProjectModal.css'
 
 export default function NewProjectModal() {
   const isOpen = useAppStore(s => s.newProjectModalOpen)
   const setOpen = useAppStore(s => s.setNewProjectModalOpen)
-  const setProjectFolder = useAppStore(s => s.setProjectFolder)
-  const disconnectProjectFolder = useAppStore(s => s.disconnectProjectFolder)
 
   const [projectName, setProjectName] = useState('Untitled Project')
   const [fps, setFps] = useState(30)
   const [resolutionStr, setResolutionStr] = useState('1920x1080')
-  const [folderHandle, setFolderHandle] = useState(null)
 
   const handleClose = useCallback(() => {
     setOpen(false)
     // Reset state for next time
     setProjectName('Untitled Project')
-    setFolderHandle(null)
   }, [setOpen])
 
-  const handleSelectFolder = async () => {
-    try {
-      const handle = await window.showDirectoryPicker({ mode: 'readwrite' })
-      if (handle) {
-        const hasPermission = await verifyDirectoryPermission(handle, true)
-        if (hasPermission) {
-          setFolderHandle(handle)
-        } else {
-          addToast({ message: 'Permission denied for selected folder', type: 'error' })
-        }
-      }
-    } catch (err) {
-      if (err.name !== 'AbortError') {
-        console.error(err)
-        addToast({ message: 'Failed to select folder', type: 'error' })
-      }
-    }
-  }
-
+  // Projects live in browser storage and are exported via "Save Project File".
+  // DaliViD asks for no disk access at all to create one.
   const handleCreateProject = async () => {
-    if (!folderHandle) return
-
     try {
       const [widthStr, heightStr] = resolutionStr.split('x')
       const width = parseInt(widthStr, 10)
@@ -91,26 +63,12 @@ export default function NewProjectModal() {
         topologyVersion: useGraphStore.getState().topologyVersion + 1,
       })
 
-      // Ensure previous folder is cleanly disconnected
-      disconnectProjectFolder()
+      addToast({
+        message: `Project "${projectName}" created. Use "Save Project File" to keep a copy on disk.`,
+        type: 'success',
+        duration: 7000,
+      })
 
-      // Link new folder to app store
-      setProjectFolder(folderHandle, folderHandle.name)
-      await saveProjectFolderHandle(projectId, folderHandle)
-
-      // Initialize folder structure and save the initial project.json
-      await folderHandle.getDirectoryHandle('media', { create: true })
-      await folderHandle.getDirectoryHandle('audio', { create: true })
-      await folderHandle.getDirectoryHandle('renders', { create: true })
-      
-      await saveProjectToFolder(
-        folderHandle, 
-        useAppStore.getState, 
-        useGraphStore.getState, 
-        useTimelineStore.getState
-      )
-
-      addToast({ message: `Project "${projectName}" created successfully!`, type: 'success' })
       handleClose()
     } catch (err) {
       console.error('Failed to create project:', err)
@@ -164,29 +122,10 @@ export default function NewProjectModal() {
           </div>
 
           <div className="new-project-modal__folder-section">
-            <div className="new-project-modal__field">
-              <label>Workspace Folder (Required)</label>
-              {!folderHandle ? (
-                <button className="new-project-modal__folder-btn" onClick={handleSelectFolder}>
-                  <IconFolder /> Select Local Folder
-                </button>
-              ) : (
-                <div className="new-project-modal__folder-display">
-                  <IconFolder /> <strong>{folderHandle.name}</strong>
-                  <button 
-                    className="new-project-modal__close" 
-                    style={{ marginLeft: 'auto' }}
-                    onClick={() => setFolderHandle(null)}
-                    title="Change Folder"
-                  >
-                    <IconClose size={12} />
-                  </button>
-                </div>
-              )}
-              <span className="text-muted" style={{ fontSize: '11px', marginTop: '4px' }}>
-                All imported media and renders will be automatically organized here.
-              </span>
-            </div>
+            <span className="text-muted" style={{ fontSize: '11px' }}>
+              Your project is kept in this browser as you work. Use <strong>Save Project File</strong>
+              {' '}to download a copy you can keep, back up or move to another machine.
+            </span>
           </div>
         </div>
 
@@ -194,8 +133,8 @@ export default function NewProjectModal() {
           <button className="new-project-modal__cancel-btn" onClick={handleClose}>
             Cancel
           </button>
-          <button 
-            className={`new-project-modal__create-btn ${folderHandle ? 'new-project-modal__create-btn--active' : ''}`}
+          <button
+            className="new-project-modal__create-btn new-project-modal__create-btn--active"
             onClick={handleCreateProject}
           >
             Create Project

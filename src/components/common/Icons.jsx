@@ -226,7 +226,7 @@ export function IconMute({ size = 12 }) {
 export function IconSolo({ size = 12 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 12 12" fill="none">
-      <text x="2" y="9.5" fontSize="9" fontWeight="700" fill="currentColor" fontFamily="DM Sans, sans-serif">S</text>
+      <text x="2" y="9.5" fontSize="9" fontWeight="700" fill="currentColor" fontFamily="DM Sans Variable, DM Sans, sans-serif">S</text>
     </svg>
   )
 }

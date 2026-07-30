@@ -5,6 +5,8 @@ import useTimelineStore from '../../store/useTimelineStore'
 import useAudioStore from '../../store/useAudioStore'
 import { Renderer } from '../../gl/Renderer'
 import { getAudioEngine } from '../../audio/AudioEngine'
+import ShapeHandles from './ShapeHandles'
+import { aspectLabel } from '../../utils/aspectPresets'
 import './PreviewCanvas.css'
 
 /**
@@ -28,6 +30,7 @@ export default function PreviewCanvas() {
   const resolution = useAppStore(s => s.resolution)
   const graphLevel = useAppStore(s => s.graphLevel)
   const isPlaying = useAppStore(s => s.isPlaying)
+  const masterBars = useAppStore(s => s.masterBars)
 
   // The canvas backing store renders at the full PROJECT resolution so the
   // preview matches the export pixel-for-pixel and never changes with panel
@@ -221,11 +224,21 @@ export default function PreviewCanvas() {
         />
         </div>
 
+        {/* On-canvas transform gizmo for the selected shape (node or clip). Sits
+            outside the pan/zoom wrapper and derives its geometry from the
+            canvas's live rect, so it tracks the view without re-deriving it. */}
+        <ShapeHandles containerRef={containerRef} canvasRef={canvasRef} zoom={zoom} pan={pan} />
+
         {/* Overlay Indicators */}
         <div className="preview__overlay-top-left">
           <span className={`preview__context-label ${contextClass}`}>
             {contextLabel}
           </span>
+          {masterBars?.enabled && (
+            <span className="preview__context-label preview__context-label--bars">
+              BARS {aspectLabel(masterBars.aspect)}
+            </span>
+          )}
         </div>
 
         <div className="preview__overlay-bottom-right">

@@ -4,14 +4,14 @@ import useGraphStore from '../../store/useGraphStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import {
   saveProject, importProjectFromJSON, deserializeProject,
-  saveProjectToFolder, loadProjectFromFolder, restoreMediaFilesFromFolder,
-  verifyDirectoryPermission, saveProjectFolderHandle, loadProjectFolderHandle
+  exportProjectAsJSON, pickMediaFiles, relinkMediaFromFiles, getExpectedMediaFilenames
 } from '../../utils/projectSerializer'
 import { addToast } from '../common/Toast'
+import { ASPECT_PRESETS, aspectLabel } from '../../utils/aspectPresets'
 import {
   IconPlay, IconPause, IconSkipStart, IconSkipEnd,
   IconStepBack, IconStepForward,
-  IconSave, IconFolder, IconImportVideo,
+  IconSave, IconImportVideo,
   IconExport, IconLoop, IconAudioReactive, IconNewProject
 } from '../common/Icons'
 import './Toolbar.css'
@@ -31,11 +31,10 @@ export default function Toolbar() {
   const autosaveState = useAppStore(s => s.autosaveState)
   const setExportModalOpen = useAppStore(s => s.setExportModalOpen)
   const resolution = useAppStore(s => s.resolution)
+  const masterBars = useAppStore(s => s.masterBars)
+  const toggleMasterBars = useAppStore(s => s.toggleMasterBars)
+  const setMasterBars = useAppStore(s => s.setMasterBars)
 
-  const projectFolderHandle = useAppStore(s => s.projectFolderHandle)
-  const projectFolderName = useAppStore(s => s.projectFolderName)
-  const projectFolderPermission = useAppStore(s => s.projectFolderPermission)
-  const disconnectProjectFolder = useAppStore(s => s.disconnectProjectFolder)
   const projectName = useAppStore(s => s.projectName)
 
   const [renderFps, setRenderFps] = useState(0)
@@ -59,29 +58,88 @@ export default function Toolbar() {
     return () => cancelAnimationFrame(animId)
   }, [])
 
+  // Quick save → browser storage only. Durable copies come from "Save Project
+  // File"; this is the fast, no-dialog path used by Ctrl+S and autosave.
   const handleSaveProject = useCallback(async () => {
     const appState = useAppStore.getState()
-    const folderHandle = appState.projectFolderHandle
     try {
       appState.markSaving()
-      if (folderHandle) {
-        const hasPermission = await verifyDirectoryPermission(folderHandle, true)
-        if (hasPermission) {
-          await saveProjectToFolder(folderHandle, useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
-          await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
-          appState.markSaved()
-          addToast({ message: 'Project saved to folder', type: 'success' })
-        } else {
-          addToast({ message: 'Permission denied to save in folder', type: 'error' })
-        }
-      } else {
-        await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
-        appState.markSaved()
-        addToast({ message: 'Project saved to browser cache. Link a folder for full save.', type: 'info' })
-      }
+      await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
+      appState.markSaved()
+      addToast({ message: 'Saved to this browser. Use "Save Project File" for a copy on disk.', type: 'info' })
     } catch (err) {
       console.error(err)
       addToast({ message: 'Failed to save project', type: 'error' })
+    }
+  }, [])
+
+  // Download the whole edit as a single .dalivid.json. The zero-authority save
+  // path: no directory handle, no persisted grant, nothing the app can read back
+  // on its own. Video/audio bytes aren't included (images are, as data URLs), so
+  // opening it again goes through the relink prompt below.
+  const handleSaveProjectFile = useCallback(async () => {
+    try {
+      const appState = useAppStore.getState()
+      // The Save As dialog goes FIRST: showSaveFilePicker needs transient user
+      // activation, and awaiting the IndexedDB write before it can outlive that
+      // window (which would silently demote us to a Downloads-folder dump).
+      const how = await exportProjectAsJSON(
+        useAppStore.getState, useGraphStore.getState, useTimelineStore.getState
+      )
+      if (how === 'cancelled') return
+
+      appState.markSaving()
+      // Keep the browser-cache copy in step so the autosave dot isn't lying
+      // about the state of the project the user just wrote to disk.
+      await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
+      appState.markSaved()
+      // Records that a durable copy now exists — drives the unload warning.
+      appState.markProjectExported()
+      addToast({
+        message: how === 'picker' ? 'Project file saved' : 'Project file downloaded',
+        type: 'success',
+      })
+    } catch (err) {
+      console.error(err)
+      addToast({ message: 'Failed to save project file', type: 'error' })
+    }
+  }, [])
+
+  // After a JSON import, offer to relink media by filename. Runs as a separate
+  // user gesture (a file input) so the import itself needs no disk access.
+  const relinkImportedMedia = useCallback(async () => {
+    const expected = getExpectedMediaFilenames(useTimelineStore.getState().clips)
+    if (expected.length === 0) {
+      addToast({ message: 'No file-backed media in this project — nothing to relink.', type: 'info' })
+      return
+    }
+
+    addToast({
+      message: `Select the ${expected.length} media file${expected.length > 1 ? 's' : ''} for this project: ${expected.slice(0, 3).join(', ')}${expected.length > 3 ? '…' : ''}`,
+      type: 'info',
+      duration: 7000,
+    })
+
+    const files = await pickMediaFiles()
+    if (!files || files.length === 0) {
+      addToast({ message: 'Media not relinked — clips will be offline until you re-import them.', type: 'warning', duration: 8000 })
+      return
+    }
+
+    const { restoredCount, missing } = relinkMediaFromFiles(
+      files,
+      useTimelineStore.getState().clips,
+      useTimelineStore.getState().updateClip
+    )
+
+    if (missing.length > 0) {
+      addToast({
+        message: `Relinked ${restoredCount} clip${restoredCount === 1 ? '' : 's'}. Still missing: ${missing.join(', ')}`,
+        type: 'warning',
+        duration: 9000,
+      })
+    } else {
+      addToast({ message: `Relinked ${restoredCount} clip${restoredCount === 1 ? '' : 's'}`, type: 'success' })
     }
   }, [])
 
@@ -91,94 +149,12 @@ export default function Toolbar() {
     try {
       deserializeProject(data, useAppStore.getState)
       addToast({ message: `Project "${data.project?.name || 'Loaded'}" imported`, type: 'success' })
+      await relinkImportedMedia()
     } catch (err) {
       console.error(err)
       addToast({ message: 'Failed to load project', type: 'error' })
     }
-  }, [])
-
-  const handleLoadFromFolder = useCallback(async () => {
-    if (!('showDirectoryPicker' in window)) {
-      addToast({ message: 'File System Access API not supported', type: 'error' })
-      return
-    }
-    try {
-      const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' })
-      const data = await loadProjectFromFolder(dirHandle)
-      if (!data) {
-        addToast({ message: 'No project.json found in folder', type: 'error' })
-        return
-      }
-      deserializeProject(data, useAppStore.getState)
-      const timeline = useTimelineStore.getState()
-      let missing = []
-      if (timeline.clips?.length > 0) {
-        const result = await restoreMediaFilesFromFolder(dirHandle, timeline.clips, useTimelineStore.getState().updateClip)
-        missing = result?.missing || []
-      }
-      useAppStore.getState().setProjectFolder(dirHandle, dirHandle.name)
-      await saveProjectFolderHandle(useAppStore.getState().projectId, dirHandle)
-      if (missing.length > 0) {
-        addToast({
-          message: `Loaded, but ${missing.length} media file${missing.length > 1 ? 's' : ''} weren't found in the folder. Re-import ${missing.length > 1 ? 'them' : 'it'} to relink, then save.`,
-          type: 'warning',
-          duration: 9000,
-        })
-      } else {
-        addToast({ message: `Project loaded from "${dirHandle.name}"`, type: 'success' })
-      }
-    } catch (err) {
-      if (err.name !== 'AbortError') {
-        console.error(err)
-        addToast({ message: 'Failed to load project from folder', type: 'error' })
-      }
-    }
-  }, [])
-
-  const handleConnectFolder = useCallback(async () => {
-    if (!('showDirectoryPicker' in window)) {
-      addToast({ message: 'File System Access API not supported', type: 'error' })
-      return
-    }
-    try {
-      const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' })
-      const hasPermission = await verifyDirectoryPermission(dirHandle, true)
-      if (!hasPermission) {
-        addToast({ message: 'Permission denied', type: 'error' })
-        return
-      }
-      useAppStore.getState().setProjectFolder(dirHandle, dirHandle.name)
-      await saveProjectFolderHandle(useAppStore.getState().projectId, dirHandle)
-      addToast({ message: `Linked to folder "${dirHandle.name}"`, type: 'success' })
-    } catch (err) {
-      if (err.name !== 'AbortError') {
-        console.error(err)
-        addToast({ message: 'Failed to connect folder', type: 'error' })
-      }
-    }
-  }, [])
-
-  const handleReconnectFolder = useCallback(async () => {
-    const appState = useAppStore.getState()
-    try {
-      const dirHandle = await loadProjectFolderHandle(appState.projectId)
-      if (!dirHandle) {
-        addToast({ message: 'Saved folder handle not found. Link a new folder.', type: 'error' })
-        return
-      }
-      const hasPermission = await verifyDirectoryPermission(dirHandle, true)
-      if (hasPermission) {
-        useAppStore.getState().setProjectFolder(dirHandle, dirHandle.name)
-        addToast({ message: `Re-connected to "${dirHandle.name}"`, type: 'success' })
-      } else {
-        useAppStore.getState().setProjectFolderPermission('denied')
-        addToast({ message: 'Permission denied. Click to retry.', type: 'error' })
-      }
-    } catch (err) {
-      console.error(err)
-      addToast({ message: 'Failed to re-connect folder', type: 'error' })
-    }
-  }, [])
+  }, [relinkImportedMedia])
 
   const handleExportFrame = useCallback(() => {
     const previewCanvas = document.querySelector('#preview-canvas canvas')
@@ -198,6 +174,8 @@ export default function Toolbar() {
       addToast({ message: 'Failed to export frame', type: 'error' })
     }
   }, [])
+
+  const barsEnabled = !!masterBars?.enabled
 
   // Resolution label
   const resLabel = resolution.height <= 480 ? '480p' :
@@ -223,40 +201,25 @@ export default function Toolbar() {
           onClick={handleSaveProject}>
           <IconSave />
         </button>
-        <button className="toolbar__btn" data-tooltip="Load Project from Folder"
-          onClick={handleLoadFromFolder}>
-          <IconFolder />
+        <button className="toolbar__btn toolbar__btn--small" data-tooltip="Save Project File — downloads the whole edit, no disk access needed"
+          onClick={handleSaveProjectFile}>
+          <IconSave />
+          <span style={{ fontSize: '10px' }}>.json</span>
         </button>
-        <button className="toolbar__btn toolbar__btn--small" data-tooltip="Import JSON file"
+        <button className="toolbar__btn toolbar__btn--small" data-tooltip="Open Project File — pick a .dalivid.json, then relink its media"
           onClick={handleLoadProject}>
           <IconImportVideo />
           <span style={{ fontSize: '10px' }}>.json</span>
+        </button>
+        <button className="toolbar__btn toolbar__btn--small" data-tooltip="Relink Media — re-attach video/audio files to this project's clips"
+          onClick={relinkImportedMedia}>
+          <IconImportVideo />
+          <span style={{ fontSize: '10px' }}>link</span>
         </button>
 
         <div className="toolbar__divider" />
 
         <ToolbarProjectName name={projectName} />
-
-        <div className="toolbar__divider" />
-
-        {projectFolderHandle ? (
-          projectFolderPermission === 'granted' ? (
-            <div className="toolbar__folder-badge toolbar__folder-badge--active" data-tooltip={`Connected to folder: ${projectFolderName}`}>
-              <span className="dot dot--green"></span>
-              <span className="text" style={{ maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{projectFolderName}</span>
-              <button className="toolbar__folder-disconnect" onClick={disconnectProjectFolder} title="Disconnect Folder">×</button>
-            </div>
-          ) : (
-            <button className="toolbar__btn toolbar__btn--warning animate-pulse" onClick={handleReconnectFolder} data-tooltip="Click to Re-connect Project Folder">
-              <span className="dot dot--orange"></span>
-              <span>Re-connect Folder</span>
-            </button>
-          )
-        ) : (
-          <button className="toolbar__btn toolbar__btn--cyan" onClick={handleConnectFolder} data-tooltip="Link a local folder to auto-save and auto-restore media across sessions">
-            <span>Link Folder</span>
-          </button>
-        )}
       </div>
 
       {/* ── Center Section — Playback ── */}
@@ -319,6 +282,35 @@ export default function Toolbar() {
           <IconExport size={14} />
           <span>Export</span>
         </button>
+
+        {/* Widescreen bars: one click to frame the whole output (preview + export).
+            The aspect picker only appears once bars are on, so the toolbar stays
+            quiet by default; full controls live in Inspector → Project. */}
+        <button
+          className={`toolbar__toggle-btn ${barsEnabled ? 'toolbar__toggle-btn--active' : ''}`}
+          onClick={toggleMasterBars}
+          data-tooltip={barsEnabled
+            ? `Widescreen bars ON (${aspectLabel(masterBars?.aspect)}) — click to remove`
+            : 'Add widescreen bars (letterbox the output)'}
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <rect x="1" y="1" width="12" height="12" rx="1.5" />
+            <rect x="1" y="1.5" width="12" height="3" fill="currentColor" stroke="none" opacity="0.85" />
+            <rect x="1" y="9.5" width="12" height="3" fill="currentColor" stroke="none" opacity="0.85" />
+          </svg>
+        </button>
+        {barsEnabled && (
+          <select
+            className="toolbar__speed-select"
+            value={String(masterBars?.aspect ?? 2.39)}
+            onChange={(e) => setMasterBars({ aspect: parseFloat(e.target.value) })}
+            data-tooltip="Delivery aspect ratio"
+          >
+            {ASPECT_PRESETS.map(a => (
+              <option key={a.label} value={String(a.value)}>{a.short}</option>
+            ))}
+          </select>
+        )}
 
         <button
           className={`toolbar__toggle-btn ${audioReactiveEnabled ? 'toolbar__toggle-btn--active toolbar__toggle-btn--cyan' : ''}`}

@@ -334,17 +334,55 @@
   border-color: var(--accent-cyan, #00e5ff);
 }
 
-/* Select */
+/* Select
+   `appearance: none` drops the OS arrow so the closed control matches the rest
+   of the card chrome; the chevron is a data-URI SVG (allowed by `img-src data:`
+   in the production CSP). The popup list itself is styled globally in
+   index.css — a native popup can't be styled from here. */
 .node-card__select {
   flex: 1;
-  font-size: 12px;
-  background: rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: #2bff00;
-  border-radius: 3px;
-  padding: 2px 4px;
-  cursor: pointer;
   min-width: 50px;
+  max-width: 100%;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 500;
+  background-color: rgba(0, 0, 0, 0.35);
+  /* inline SVG chevron, --text-muted (#888899) */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M0.5 0.75 L4 4.25 L7.5 0.75' fill='none' stroke='%23888899' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--text-primary, #e8e8f0);
+  border-radius: 3px;
+  /* right padding leaves room for the chevron */
+  padding: 3px 20px 3px 6px;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  /* long option labels truncate instead of blowing out the card width */
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: background-color 0.12s, border-color 0.12s, color 0.12s;
+}
+
+.node-card__select:hover:not(:disabled) {
+  background-color: rgba(0, 0, 0, 0.5);
+  border-color: rgba(255, 255, 255, 0.24);
+  color: #fff;
+}
+
+.node-card__select:focus-visible {
+  border-color: var(--accent-cyan, #00e5ff);
+  box-shadow: 0 0 0 1px var(--accent-cyan-glow, rgba(0, 229, 255, 0.3));
+  outline: none;
+}
+
+.node-card__select:disabled {
+  color: var(--text-disabled, #555566);
+  cursor: default;
+  opacity: 0.6;
 }
 
 /* Color Input */

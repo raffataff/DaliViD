@@ -1,4 +1,4 @@
-exported song with image feed through nodes. exported mp4 only showed static frame. audio sounded much quieter than imported audio clip
+need a Time parameter exposed somewhere, as this would negate a lot of keyframing
 
 need way of removeing clips from media pool
 

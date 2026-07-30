@@ -5,6 +5,13 @@ on:
     branches: [main, master]
   pull_request:
 
+# Least privilege for GITHUB_TOKEN. CI only reads the tree — it never pushes,
+# comments or publishes — so a compromised dependency running during `npm ci`
+# or the build cannot use the ambient token to write to the repo. Without this
+# block the token's scope follows the repo default, which is often read+write.
+permissions:
+  contents: read
+
 jobs:
   lint-and-build:
     runs-on: ubuntu-latest

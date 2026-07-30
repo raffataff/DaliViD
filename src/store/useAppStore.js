@@ -15,10 +15,21 @@ const useAppStore = create(
     resolution: { width: 1920, height: 1080 },
     colorSpace: 'sRGB',
 
-    // ── Project Folder Workspace (FileSystem Access API) ──
-    projectFolderHandle: null,
-    projectFolderName: null,
-    projectFolderPermission: 'prompt', // 'granted' | 'prompt' | 'denied'
+    // ── Delivery: widescreen bars ──
+    // Applied as the LAST pass of the master pipeline (Renderer._presentToScreen),
+    // so it shows in the preview and is baked into exports. `aspect` is the target
+    // ratio (2.39 = scope); bars are horizontal when the target is wider than the
+    // project, vertical when narrower. For per-graph control use the LETTERBOX
+    // node — both share one shader.
+    masterBars: {
+      enabled: false,
+      aspect: 2.39,
+      color: '#000000',
+      opacity: 1,
+      feather: 0,
+      offset: 0,
+      zoom: 0,
+    },
 
     // ── Playback State ──
     isPlaying: false,
@@ -66,6 +77,10 @@ const useAppStore = create(
     // ── Autosave ──
     autosaveState: 'saved', // 'saved' | 'unsaved' | 'saving'
     lastSaveTime: null,
+    // When the project was last downloaded as a .dalivid.json. Autosave only
+    // reaches IndexedDB, which the browser is free to evict, so this is what
+    // tells us whether a copy of the work exists anywhere durable.
+    lastExportTime: null,
 
     // ── Audio Reactive ──
     audioReactiveEnabled: true,
@@ -80,24 +95,6 @@ const useAppStore = create(
     editMode: 'overwrite', // 'overwrite' | 'insert'
 
     // ── Actions ──
-    setProjectFolder: (handle, name) => set({
-      projectFolderHandle: handle,
-      projectFolderName: name,
-      projectFolderPermission: 'granted',
-      autosaveState: 'unsaved',
-    }),
-
-    setProjectFolderPermission: (permission) => set({
-      projectFolderPermission: permission,
-    }),
-
-    disconnectProjectFolder: () => set({
-      projectFolderHandle: null,
-      projectFolderName: null,
-      projectFolderPermission: 'prompt',
-      autosaveState: 'unsaved',
-    }),
-
     setProjectName: (name) => set({ projectName: name, autosaveState: 'unsaved' }),
 
     setProjectSettings: (settings) => set({
@@ -111,6 +108,16 @@ const useAppStore = create(
     }),
 
     setFps: (fps) => set({ fps, autosaveState: 'unsaved' }),
+
+    // Widescreen bars — patch-merge so callers only pass what changed.
+    setMasterBars: (patch) => set((state) => ({
+      masterBars: { ...state.masterBars, ...patch },
+      autosaveState: 'unsaved',
+    })),
+    toggleMasterBars: () => set((state) => ({
+      masterBars: { ...state.masterBars, enabled: !state.masterBars.enabled },
+      autosaveState: 'unsaved',
+    })),
 
     // Playback
     play: () => set({ isPlaying: true }),
@@ -216,6 +223,7 @@ const useAppStore = create(
     markUnsaved: () => set({ autosaveState: 'unsaved' }),
     markSaving: () => set({ autosaveState: 'saving' }),
     markSaved: () => set({ autosaveState: 'saved', lastSaveTime: Date.now() }),
+    markProjectExported: () => set({ lastExportTime: Date.now() }),
 
     // Audio
     toggleAudioReactive: () => set((state) => ({

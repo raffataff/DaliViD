@@ -17,10 +17,14 @@ import { onNodeRemoved } from './nodeLifecycle.js'
 import { getShaderSource } from '../shaders/shaderRegistry.js'
 import { buildTransitionShader, getTransitionDefaults } from '../shaders/transitionRegistry.js'
 import { evaluateKeyframes } from '../utils/keyframes.js'
+import { hexToVec3 } from '../utils/paramParser.js'
 
 // Node types that are not effect passes (sources, outputs, audio routing). Used
 // to decide whether a graph actually has any effects worth running.
-const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE', 'TEXT_INPUT']
+// NOTE: the self-drawing sources — IMAGE_INPUT, TEXT_INPUT, SHAPE_INPUT — are
+// deliberately NOT listed: they produce pixels with no effect program, so a graph
+// containing only (say) a shape → OUTPUT still has something to render.
+const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE', 'TIME']
 
 // Passthrough fragment shader — just copies input texture
 const PASSTHROUGH_FS = `#version 300 es
@@ -273,6 +277,17 @@ export class Renderer {
     // single-source-of-truth pattern as the image program.
     const txtSrc = getShaderSource('TEXT_INPUT')
     if (txtSrc) this.textProgram = createShaderProgram(this.gl, txtSrc)
+
+    // Shape source program — the SHAPE_INPUT SDF shader. Same pattern again; no
+    // texture is involved, the shape is evaluated per-pixel.
+    const shpSrc = getShaderSource('SHAPE_INPUT')
+    if (shpSrc) this.shapeProgram = createShaderProgram(this.gl, shpSrc)
+
+    // Master widescreen bars — the LETTERBOX node's own shader, driven with an
+    // explicit custom ratio. Reusing it means the project-level toggle and the
+    // in-graph node produce pixel-identical bars.
+    const lbSrc = getShaderSource('LETTERBOX')
+    if (lbSrc) this.barsProgram = createShaderProgram(this.gl, lbSrc)
   }
 
   /**
@@ -401,6 +416,81 @@ export class Renderer {
 
     this.drawQuad()
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  }
+
+  /**
+   * Render a SHAPE source (SHAPE_INPUT node OR a shape timeline clip) into an FBO.
+   * Pure GPU: there is nothing to decode or upload — the SDF shader draws the
+   * shape straight into the target FBO, so it costs one full-screen pass and is
+   * resolution-independent in preview and export alike.
+   * @param {string} fboId — destination FBO (already created/resized by caller)
+   * @param {object} standardState — standard uniform state for this frame
+   * @param {object} params — normalized shape params (u_shp_*, colors as vec3)
+   */
+  renderShapeNode(fboId, standardState, params) {
+    const gl = this.gl
+    if (!this.shapeProgram || !this.shapeProgram.program) return
+
+    // Transparent start: everything the shape doesn't cover must composite as
+    // "nothing", not black.
+    this.fbos.bind(fboId)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    gl.useProgram(this.shapeProgram.program)
+    const locs = this.shapeProgram.uniformLocations
+    uploadStandardUniforms(gl, locs, standardState)
+    uploadUniforms(gl, locs, this.shapeProgram.uniformTypes, params)
+
+    this.drawQuad()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  }
+
+  /**
+   * The project's widescreen-bars settings, or null when bars are off / unusable.
+   * Read fresh each frame so toggling in the Toolbar or Inspector is immediate.
+   */
+  _masterBars() {
+    const bars = this._getAppStore?.()?.masterBars
+    if (!bars || !bars.enabled) return null
+    if (!this.barsProgram || !this.barsProgram.program) return null
+    return bars
+  }
+
+  /**
+   * Present a finished frame to the screen: straight blit normally, or through
+   * the letterbox pass when project widescreen bars are enabled. Export reads the
+   * same canvas, so bars are baked into exports with no extra plumbing.
+   * @param {string} fboId — FBO holding the finished frame
+   * @param {object|null} bars — result of _masterBars() for this frame
+   */
+  _presentToScreen(fboId, bars) {
+    if (!bars) { this._blitToScreen(fboId); return }
+
+    const gl = this.gl
+    const locs = this.barsProgram.uniformLocations
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.useProgram(this.barsProgram.program)
+
+    this.fbos.bindTexture(fboId, 0)
+    if (locs.u_texture != null) gl.uniform1i(locs.u_texture, 0)
+    if (locs.u_resolution != null) gl.uniform2f(locs.u_resolution, this.width, this.height)
+    // Drive the shader's "custom ratio" branch so the preset list in the node's
+    // dropdown and the project setting stay independent.
+    if (locs.u_lb_aspect != null) gl.uniform1i(locs.u_lb_aspect, 0)
+    if (locs.u_lb_custom != null) gl.uniform1f(locs.u_lb_custom, Math.max(0.02, bars.aspect || 2.39))
+    if (locs.u_lb_color != null) {
+      const c = hexToVec3(bars.color || '#000000')
+      gl.uniform3f(locs.u_lb_color, c[0], c[1], c[2])
+    }
+    if (locs.u_lb_opacity != null) gl.uniform1f(locs.u_lb_opacity, bars.opacity == null ? 1 : bars.opacity)
+    if (locs.u_lb_feather != null) gl.uniform1f(locs.u_lb_feather, bars.feather || 0)
+    if (locs.u_lb_offset != null) gl.uniform1f(locs.u_lb_offset, bars.offset || 0)
+    if (locs.u_lb_zoom != null) gl.uniform1f(locs.u_lb_zoom, bars.zoom || 0)
+
+    this.drawQuad()
   }
 
   /**
@@ -701,7 +791,10 @@ export class Renderer {
     // High-performance direct DOM updates for modulated parameters to bypass React re-renders
     const displayElements = document.querySelectorAll('[data-node-param-display]')
     if (displayElements.length > 0) {
-      const floatOverrides = resolveFloatConnections(this)
+      // This pass reads the graph OPEN IN THE EDITOR, so the clip window is
+      // cleared: buildTimeCtx then derives it from that graph's clip rather than
+      // from whichever clip happened to render last.
+      const floatOverrides = resolveFloatConnections(this, null, null, { ...standardState, clipTime: null, clipDuration: null })
       displayElements.forEach(el => {
         const nid = el.getAttribute('data-node-id')
         const paramName = el.getAttribute('data-node-param-display')
@@ -840,13 +933,15 @@ export class Renderer {
     const gl = this.gl
     const inputFBOId = `clip_input_${clip.id}`
 
-    // ── Generator clips (text / image) ──
+    // ── Generator clips (text / image / shape) ──
     // No media element — the source frame is synthesized straight into the clip's
     // input FBO, then the shared per-clip graph tail runs exactly as for video.
-    if (clip.fileType === 'image' || clip.fileType === 'text') {
+    if (clip.fileType === 'image' || clip.fileType === 'text' || clip.fileType === 'shape') {
       if (!this.fbos.getTexture(inputFBOId)) this.fbos.create(inputFBOId, this.width, this.height)
       if (clip.fileType === 'image') {
         this.renderImageNode(clip.id, inputFBOId, standardState, normalizeParams(clip.params || {}))
+      } else if (clip.fileType === 'shape') {
+        this.renderShapeNode(inputFBOId, standardState, normalizeParams(clip.params || {}))
       } else {
         this.renderTextNode(clip.id, inputFBOId, standardState, clip.params || {})
       }
@@ -962,6 +1057,10 @@ export class Renderer {
           this.fbos.create(outputFBOId, this.width, this.height)
         }
         standardState.hasSource = 1 // a real source frame feeds this clip graph
+        // Clip-local time context for TIME nodes (Clip Time / Clip Progress), set
+        // per clip like hasSource. Cleared before the master pass so a master TIME
+        // node never inherits the last clip's window.
+        this._setClipTimeContext(standardState, clip, playheadTime)
         // Keyframed params are clip-relative in time, so keys survive clip moves.
         const kfNodes = this._withKeyframes(buildNodeMap(clipGraph), clip.id, playheadTime - clip.timelineStart)
         executeChain(this, chain, inputFBOId, outputFBOId, standardState, {}, kfNodes, edges, this.previewTapEnabled ? clipGraph.tapPointNodeId : null)
@@ -970,6 +1069,22 @@ export class Renderer {
     }
 
     return clipResultFBOId
+  }
+
+  /**
+   * Stamp a clip's local time window onto the per-frame standard state, so TIME
+   * nodes inside that clip's graph can resolve "Clip Time" (seconds from the
+   * clip's first frame) and "Clip Progress" (0 → 1 across the clip). Pass
+   * `clip = null` for the master graph, where both degenerate to the playhead.
+   */
+  _setClipTimeContext(standardState, clip, playheadTime) {
+    if (!clip) {
+      standardState.clipTime = null
+      standardState.clipDuration = null
+      return
+    }
+    standardState.clipTime = playheadTime - clip.timelineStart
+    standardState.clipDuration = Math.max(0, clip.timelineEnd - clip.timelineStart)
   }
 
   /**
@@ -1010,6 +1125,7 @@ export class Renderer {
     if (!this.fbos.getTexture(outputFBOId)) this.fbos.create(outputFBOId, this.width, this.height)
 
     standardState.hasSource = 0 // no real source texture → generative effects self-display
+    this._setClipTimeContext(standardState, clip, playheadTime)
     const kfNodes = this._withKeyframes(buildNodeMap(clipGraph), clip.id, playheadTime - clip.timelineStart)
     executeChain(this, chain, inputFBOId, outputFBOId, standardState, {}, kfNodes, edges, this.previewTapEnabled ? clipGraph.tapPointNodeId : null)
     return outputFBOId
@@ -1089,8 +1205,8 @@ export class Renderer {
       for (let ci = 0; ci < activeClips.length; ci++) {
         const clip = activeClips[ci]
         const isLive = clip.fileType === 'camera' || clip.fileType === 'screen'
-        // Generator clips (text/image) synthesize their own frame — no fileUrl.
-        const isGenerator = clip.fileType === 'image' || clip.fileType === 'text'
+        // Generator clips (text/image/shape) synthesize their own frame — no fileUrl.
+        const isGenerator = clip.fileType === 'image' || clip.fileType === 'text' || clip.fileType === 'shape'
         // Non-live, non-generator clips must be a renderable video file (fileUrl).
         if (!isLive && !isGenerator && (clip.fileType !== 'video' || !clip.fileUrl)) continue
 
@@ -1225,6 +1341,17 @@ export class Renderer {
       const masterGraph = graphState.masterGraph
       const hasEffects = masterGraph && masterGraph.nodes.some(n => !NON_EFFECT_TYPES.includes(n.type))
 
+      // Project widescreen bars are the very last pass, applied to the finished
+      // frame. With bars on, the master chain renders into an FBO instead of
+      // straight to the screen so the letterbox pass has something to read.
+      const bars = this._masterBars()
+      let presentFBOId = null
+      if (bars) {
+        presentFBOId = '__master_present'
+        if (!this.fbos.getTexture(presentFBOId)) this.fbos.create(presentFBOId, this.width, this.height)
+        else this.fbos.resize(presentFBOId, this.width, this.height)
+      }
+
       if (hasEffects) {
         if (!this.masterChain || this._needsRecompile) {
             this.masterChain = compileGraph(gl, masterGraph)
@@ -1236,21 +1363,24 @@ export class Renderer {
         const effectNodes = this.masterChain.chain.filter(n =>
           n.program && !n.bypassed && !n.isSource && !n.isOutput
         )
-        // An IMAGE_INPUT / TEXT_INPUT source produces pixels with no effect
-        // program, so the chain must run even with zero effect nodes (source →
-        // OUTPUT).
-        const hasImageSource = this.masterChain.chain.some(n => n.isImage || n.isText)
+        // A self-drawing source (IMAGE / TEXT / SHAPE) produces pixels with no
+        // effect program, so the chain must run even with zero effect nodes
+        // (source → OUTPUT).
+        const hasGeneratorSource = this.masterChain.chain.some(n => n.isImage || n.isText || n.isShape)
 
-        if (effectNodes.length > 0 || hasImageSource) {
+        if (effectNodes.length > 0 || hasGeneratorSource) {
           // No video composited this frame → generative effects should self-display.
           standardState.hasSource = hasContent ? 1 : 0
+          // Master graph has no clip window — a TIME node here reads the timeline.
+          this._setClipTimeContext(standardState, null, playheadTime)
           const kfMaster = this._withKeyframes(buildNodeMap(masterGraph), 'master', playheadTime)
-          executeChain(this, this.masterChain.chain, masterInputFBOId, null, standardState, {}, kfMaster, this.masterChain.edges, this.previewTapEnabled ? masterGraph.tapPointNodeId : null)
+          executeChain(this, this.masterChain.chain, masterInputFBOId, presentFBOId, standardState, {}, kfMaster, this.masterChain.edges, this.previewTapEnabled ? masterGraph.tapPointNodeId : null)
+          if (bars) this._presentToScreen(presentFBOId, bars)
         } else {
-          if (hasContent) this._blitToScreen(masterInputFBOId)
+          if (hasContent) this._presentToScreen(masterInputFBOId, bars)
         }
       } else {
-        if (hasContent) this._blitToScreen(masterInputFBOId)
+        if (hasContent) this._presentToScreen(masterInputFBOId, bars)
       }
     }
 
@@ -1284,7 +1414,7 @@ export class Renderer {
     // free a generator's resources once it leaves the timeline.
     if (!this._generatorClips) this._generatorClips = new Set()
     for (const c of clips) {
-      if (c.fileType === 'image' || c.fileType === 'text') this._generatorClips.add(c.id)
+      if (c.fileType === 'image' || c.fileType === 'text' || c.fileType === 'shape') this._generatorClips.add(c.id)
     }
     if (this._generatorClips.size > 0) {
       const liveIds = new Set(clips.map(c => c.id))
@@ -1352,6 +1482,7 @@ export class Renderer {
       this.textures.delete(`img_${n.id}`)                // decoded image texture (id-keyed)
       this.fbos.delete(`__txt_${scope}${n.id}`)          // TEXT_INPUT source FBO
       this.textures.delete(`txt_${n.id}`)                // rasterized text texture (id-keyed)
+      this.fbos.delete(`__shp_${scope}${n.id}`)          // SHAPE_INPUT source FBO (no texture)
       // Legacy buffers from the pre-unification executors — harmless if absent.
       this.fbos.deletePingPong(`__fb_${n.id}`)
       this.fbos.deletePingPong(`__fb_sub_${n.id}`)
@@ -1518,6 +1649,10 @@ export class Renderer {
       }
     }
 
+    // The incoming clip owns the transition, so a TIME node inside it reads that
+    // clip's window (progress is available separately via TRANSITION_PROGRESS).
+    this._setClipTimeContext(standardState, clip, standardState.playhead ?? 0)
+
     // Inner FBOs are namespaced per clip so two clips using the same library
     // transition never collide (freed in releaseClipResources).
     const resultFBO = executeTransitionCompound(
@@ -1576,10 +1711,11 @@ export class Renderer {
       this.fbos.create(inputFBOId, this.width, this.height)
     }
 
-    if (clip.fileType === 'image' || clip.fileType === 'text') {
+    if (clip.fileType === 'image' || clip.fileType === 'text' || clip.fileType === 'shape') {
       // Generator source (no media element): synthesize straight into the input
       // FBO so the clip graph — and this isolated editor view — see it directly.
       if (clip.fileType === 'image') this.renderImageNode(clipId, inputFBOId, standardState, normalizeParams(clip.params || {}))
+      else if (clip.fileType === 'shape') this.renderShapeNode(inputFBOId, standardState, normalizeParams(clip.params || {}))
       else this.renderTextNode(clipId, inputFBOId, standardState, clip.params || {})
       // Pause any playing media while editing a generator clip.
       for (const [, el] of this._videoElements) { if (!el.paused) el.pause() }
@@ -1661,6 +1797,7 @@ export class Renderer {
       const { chain, edges } = this.compiledChains.get(clipId)
       // Audio-only clips have no real source texture → let generative effects show.
       standardState.hasSource = clip.fileType === 'audio' ? 0 : 1
+      this._setClipTimeContext(standardState, clip, playheadTime)
       const clipTap = this.previewTapEnabled ? clipGraph.tapPointNodeId : null
 
       // "Through master" preview: render the (tapped) clip result to an FBO, then

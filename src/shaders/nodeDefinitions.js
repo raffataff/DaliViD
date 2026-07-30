@@ -82,6 +82,19 @@ const NODE_DEFS = {
     ],
     hasParamInputs: true,
   },
+  // SHAPE_INPUT — a procedural SDF shape as a first-class texture source (peer to
+  // image/text). No media to upload: the shader draws the shape, so every control
+  // is a plain @param and therefore gets a float socket — position, size,
+  // rotation, corner radius, colors and reactivity can all be driven by audio
+  // bands, MATH/ENVELOPE nodes or keyframes. Transparent outside the shape, so it
+  // composites over lower layers and doubles as a mask/displacement source.
+  SHAPE_INPUT: {
+    inputs: [],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Shape' },
+    ],
+    hasParamInputs: true,
+  },
   AUDIO_INPUT: {
     inputs: [],
     outputs: [
@@ -208,6 +221,19 @@ const NODE_DEFS = {
       { id: 'progress', type: 'float', name: 'Progress' },
     ],
     hasParamInputs: false,
+  },
+  // TIME — CPU-side float source (no GLSL shader): an LFO / ramp generator that
+  // replaces most keyframing. `value` is the shaped wave remapped into Min…Max,
+  // `seconds` is the raw time of the chosen source (feed it to MATH for custom
+  // curves). hasParamInputs is true so rate/phase/min/max/pulse width get float
+  // sockets — an audio band or ENVELOPE can modulate the LFO itself.
+  TIME: {
+    inputs: [],
+    outputs: [
+      { id: 'value', type: 'float', name: 'Value' },
+      { id: 'seconds', type: 'float', name: 'Seconds' },
+    ],
+    hasParamInputs: true,
   },
   // DISPLACEMENT has texture + displacement map inputs
   DISPLACEMENT: {

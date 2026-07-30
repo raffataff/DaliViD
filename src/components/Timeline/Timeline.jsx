@@ -4,7 +4,7 @@ import useTimelineStore from '../../store/useTimelineStore'
 import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import { IconChevronDown, IconPlus, IconLock } from '../common/Icons'
-import { makeImageClipParams, makeTextClipParams, DEFAULT_GENERATOR_DURATION } from '../../utils/generatorClips'
+import { makeImageClipParams, makeTextClipParams, makeShapeClipParams, DEFAULT_GENERATOR_DURATION } from '../../utils/generatorClips'
 import './Timeline.css'
 
 /**
@@ -32,6 +32,8 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const timelineScrollLeft = useTimelineStore(s => s.timelineScrollLeft)
   const setTimelineScrollLeft = useTimelineStore(s => s.setTimelineScrollLeft)
   const keyframes = useTimelineStore(s => s.keyframes)
+  const moveClipKeyframes = useTimelineStore(s => s.moveClipKeyframes)
+  const removeClipKeyframesAtMs = useTimelineStore(s => s.removeClipKeyframesAtMs)
   const inPointStore = useTimelineStore(s => s.inPoint)
   const outPointStore = useTimelineStore(s => s.outPoint)
   const setInPoint = useTimelineStore(s => s.setInPoint)
@@ -318,13 +320,15 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     let payload
     try { payload = JSON.parse(raw) } catch { return }
 
-    // A drop makes a generator CLIP. Media-Pool image cards and text-preset cards
-    // both land here; node-graph drags (kind:'node' with no image) are ignored.
+    // A drop makes a generator CLIP. Media-Pool image cards and text/shape preset
+    // cards all land here; node-graph drags (kind:'node' with no generator type)
+    // are ignored.
     const clipType = payload.clipType
       || (payload.imageSrc ? 'image' : null)
       || (payload.nodeType === 'IMAGE_INPUT' ? 'image' : null)
       || (payload.nodeType === 'TEXT_INPUT' ? 'text' : null)
-    if ((clipType !== 'image' && clipType !== 'text') || track.type !== 'video') return
+      || (payload.nodeType === 'SHAPE_INPUT' ? 'shape' : null)
+    if (!['image', 'text', 'shape'].includes(clipType) || track.type !== 'video') return
 
     e.preventDefault()
     e.stopPropagation()
@@ -338,6 +342,9 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     if (clipType === 'image') {
       filename = payload.imageName || payload.name || 'Image'
       params = makeImageClipParams({ imageSrc: payload.imageSrc || null, imageName: filename })
+    } else if (clipType === 'shape') {
+      filename = payload.name || 'Shape'
+      params = makeShapeClipParams(payload.params || {})
     } else {
       params = makeTextClipParams(payload.params || {})
       filename = (params.text || 'Text').split('\n')[0].slice(0, 24) || 'Text'
@@ -479,6 +486,42 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
   }, [pxPerSec, removeMarker, updateMarker, collectSnapPoints, applySnap])
+
+  // Keyframe-marker drag. Diamonds are clip-relative and merged per ms column,
+  // so a drag shifts the whole column (all params/nodes keyed at that time).
+  // Times are clip-relative but snapping targets are absolute, so convert
+  // through the clip origin. Alt+click deletes the column (marker convention).
+  const [draggingKf, setDraggingKf] = useState(null) // { clipId, ms }
+  const handleKeyframeMouseDown = useCallback((e, clip, ms) => {
+    e.stopPropagation()
+    e.preventDefault()
+    if (e.altKey) {
+      removeClipKeyframesAtMs(clip.id, ms)
+      return
+    }
+    const startX = e.clientX
+    const originalRel = ms / 1000
+    const duration = clip.timelineEnd - clip.timelineStart
+    const snapPoints = collectSnapPoints(clip.id)
+    let currentMs = ms // the column moves under us; re-match it each step
+
+    const onMove = (me) => {
+      const dt = (me.clientX - startX) / pxPerSec
+      const abs = applySnap(clip.timelineStart + originalRel + dt, snapPoints, me.shiftKey)
+      const rel = Math.max(0, Math.min(duration, abs - clip.timelineStart))
+      moveClipKeyframes(clip.id, currentMs, rel)
+      currentMs = Math.round(rel * 1000)
+      setDraggingKf({ clipId: clip.id, ms: currentMs }) // highlight follows the column
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      setDraggingKf(null)
+    }
+    setDraggingKf({ clipId: clip.id, ms })
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [pxPerSec, collectSnapPoints, applySnap, moveClipKeyframes, removeClipKeyframesAtMs])
 
   const handleMarkerRename = useCallback((marker) => {
     const label = window.prompt('Marker label:', marker.label || '')
@@ -708,6 +751,13 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
             </div>
           </div>
 
+          {/* ── Keyframe lane (selected node) ── */}
+          <KeyframeLane
+            pxPerSec={pxPerSec}
+            timelineScrollLeft={timelineScrollLeft}
+            applySnap={applySnap}
+            collectSnapPoints={collectSnapPoints}
+          />
 
           {/* ── Tracks ── */}
           <div className="timeline__tracks-area" ref={tracksAreaRef}>
@@ -771,7 +821,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                         // clip (video/camera/screen + text/image generators); the
                         // compositor's opacity ramp applies to all of them.
                         const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen'
-                        const supportsFades = isVideoClip || clip.fileType === 'image' || clip.fileType === 'text'
+                        const supportsFades = isVideoClip || clip.fileType === 'image' || clip.fileType === 'text' || clip.fileType === 'shape'
                         const fadeInW = Math.min(width, (clip.fadeIn || 0) * pxPerSec)
                         const fadeOutW = Math.min(width, (clip.fadeOut || 0) * pxPerSec)
                         return (
@@ -879,9 +929,10 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                                 )].map(ms => (
                                   <div
                                     key={ms}
-                                    className="timeline__keyframe"
+                                    className={`timeline__keyframe ${draggingKf?.clipId === clip.id && draggingKf?.ms === ms ? 'timeline__keyframe--dragging' : ''}`}
                                     style={{ left: (ms / 1000) * pxPerSec, bottom: 3 }}
-                                    title={`Keyframe @ ${(ms / 1000).toFixed(2)}s (clip time)`}
+                                    title={`Keyframe @ ${(ms / 1000).toFixed(2)}s (clip time) — drag to move, Shift bypasses snap, Alt+click to delete`}
+                                    onMouseDown={(e) => handleKeyframeMouseDown(e, clip, ms)}
                                   />
                                 ))}
                               </div>
@@ -972,5 +1023,129 @@ function TimelinePlayheadLine({ pxPerSec, timelineScrollLeft, trackHeaderWidth }
       className="timeline__playhead-line"
       style={{ left: `${trackHeaderWidth + playheadX - timelineScrollLeft}px` }}
     />
+  )
+}
+
+/**
+ * Keyframe lane — shows the SELECTED node's keyframes as one draggable diamond
+ * per key, grouped by param (one row each). Works for both master-graph
+ * (absolute time) and clip-graph (clip-relative, offset by the clip's start)
+ * params, so master keyframes are finally visible/editable. Per-key drag
+ * (snap-aware, Shift bypasses), Alt+click deletes a single key, and right-click
+ * opens Clear-keyframe options. (No Delete-key handler here on purpose: the node
+ * editor's global Delete listener would also fire and remove the selected node.)
+ */
+function KeyframeLane({ pxPerSec, timelineScrollLeft, applySnap, collectSnapPoints }) {
+  const selectedNodeId = useAppStore(s => s.selectedNodeId)
+  const graphLevel = useAppStore(s => s.graphLevel)
+  const graphClipId = useAppStore(s => s.graphClipId)
+  const keyframes = useTimelineStore(s => s.keyframes)
+  const clips = useTimelineStore(s => s.clips)
+  const moveKeyframe = useTimelineStore(s => s.moveKeyframe)
+  const removeKeyframe = useTimelineStore(s => s.removeKeyframe)
+  const clearParamKeyframes = useTimelineStore(s => s.clearParamKeyframes)
+  const clearNodeKeyframes = useTimelineStore(s => s.clearNodeKeyframes)
+  const masterGraph = useGraphStore(s => s.masterGraph)
+  const clipGraphs = useGraphStore(s => s.clipGraphs)
+
+  const [selectedKey, setSelectedKey] = useState(null) // { paramName, time }
+  const [menu, setMenu] = useState(null) // { x, y, paramName, time }
+
+  const clipKey = graphLevel === 'master' ? 'master' : graphClipId
+  const baseClip = graphLevel === 'master' ? null : clips.find(c => c.id === clipKey)
+  const base = baseClip ? baseClip.timelineStart : 0
+  const duration = baseClip ? (baseClip.timelineEnd - baseClip.timelineStart) : Infinity
+  const tracks = selectedNodeId
+    ? keyframes.filter(k => k.clipId === clipKey && k.nodeId === selectedNodeId)
+    : []
+  const graph = graphLevel === 'master' ? masterGraph : clipGraphs[clipKey]
+  const node = graph?.nodes.find(n => n.id === selectedNodeId)
+  const nodeName = node?.name || node?.type || 'Node'
+
+  // Nothing to show unless a node is selected (and, for clips, the clip exists).
+  if (!selectedNodeId || (graphLevel !== 'master' && !baseClip)) return null
+
+  const startDrag = (e, paramName, time) => {
+    e.stopPropagation()
+    e.preventDefault()
+    if (e.altKey) { removeKeyframe(clipKey, selectedNodeId, paramName, time); return }
+    setSelectedKey({ paramName, time })
+    const startX = e.clientX
+    const snapPoints = collectSnapPoints()
+    let curTime = time
+    const onMove = (me) => {
+      const dt = (me.clientX - startX) / pxPerSec
+      const absSnapped = applySnap(base + time + dt, snapPoints, me.shiftKey)
+      let rel = absSnapped - base
+      rel = Math.max(0, duration === Infinity ? rel : Math.min(duration, rel))
+      moveKeyframe(clipKey, selectedNodeId, paramName, curTime, rel)
+      curTime = rel
+      setSelectedKey({ paramName, time: rel })
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }
+
+  const openMenu = (e, paramName, time) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setSelectedKey({ paramName, time })
+    setMenu({ x: e.clientX, y: e.clientY, paramName, time })
+  }
+
+  return (
+    <div className="timeline__kf-lane">
+      <div className="timeline__kf-lane-header" title={`Keyframes for ${nodeName}`}>
+        <span className="timeline__kf-lane-title">◆ {nodeName}</span>
+      </div>
+      <div className="timeline__kf-lane-body">
+        {tracks.length === 0 ? (
+          <div className="timeline__kf-lane-empty">
+            No keyframes on this node — add one with the ◆ button in the Inspector
+          </div>
+        ) : (
+          tracks.map(tr => (
+            <div className="timeline__kf-row" key={tr.paramName}>
+              <span className="timeline__kf-row-label">{tr.paramName}</span>
+              {tr.keys.map(key => {
+                const isSel = selectedKey?.paramName === tr.paramName &&
+                  Math.abs(selectedKey.time - key.time) < 1e-4
+                return (
+                  <div
+                    key={key.time}
+                    className={`timeline__kf-key ${isSel ? 'timeline__kf-key--selected' : ''}`}
+                    style={{ left: (base + key.time) * pxPerSec - timelineScrollLeft }}
+                    title={`${tr.paramName} = ${Number(key.value).toFixed(3)} @ ${(base + key.time).toFixed(2)}s — drag to move (Shift = no snap), Alt+click to delete, right-click for options`}
+                    onMouseDown={(e) => startDrag(e, tr.paramName, key.time)}
+                    onContextMenu={(e) => openMenu(e, tr.paramName, key.time)}
+                  />
+                )
+              })}
+            </div>
+          ))
+        )}
+      </div>
+
+      {menu && (
+        <>
+          <div className="timeline__kf-menu-overlay" onMouseDown={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null) }} />
+          <div className="timeline__kf-menu" style={{ left: menu.x, top: menu.y }}>
+            <button onMouseDown={(e) => e.stopPropagation()} onClick={() => { removeKeyframe(clipKey, selectedNodeId, menu.paramName, menu.time); setMenu(null); setSelectedKey(null) }}>
+              Delete keyframe
+            </button>
+            <button onMouseDown={(e) => e.stopPropagation()} onClick={() => { clearParamKeyframes(clipKey, selectedNodeId, menu.paramName); setMenu(null); setSelectedKey(null) }}>
+              Clear “{menu.paramName}” keyframes
+            </button>
+            <button onMouseDown={(e) => e.stopPropagation()} onClick={() => { clearNodeKeyframes(clipKey, selectedNodeId); setMenu(null); setSelectedKey(null) }}>
+              Clear all keyframes on {nodeName}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
   )
 }

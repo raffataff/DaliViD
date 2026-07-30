@@ -121,6 +121,97 @@
 .preview__context-label--compound {
   color: var(--accent-magenta);
 }
+.preview__context-label--bars {
+  color: #aab4c0;
+  letter-spacing: 0.5px;
+}
+
+/* ── Shape transform gizmo ──
+   Full-panel SVG that ignores pointer events; only the handles (and the drag
+   body) opt back in, so panning/zooming the preview keeps working around it. */
+.preview__shape-gizmo {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 12;
+  overflow: visible;
+}
+
+.shape-gizmo__box {
+  fill: none;
+  stroke: var(--accent-cyan);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.9;
+}
+
+.shape-gizmo__body {
+  fill: transparent;
+  pointer-events: all;
+  cursor: move;
+}
+
+.shape-gizmo__handle {
+  fill: var(--bg-base, #0e0e12);
+  stroke: var(--accent-cyan);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  pointer-events: all;
+}
+.shape-gizmo__handle:hover {
+  fill: var(--accent-cyan);
+}
+
+.shape-gizmo__stem {
+  stroke: var(--accent-cyan);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.7;
+}
+
+.shape-gizmo__rotate {
+  fill: var(--bg-base, #0e0e12);
+  stroke: var(--accent-amber, #ffb340);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  pointer-events: all;
+  cursor: grab;
+}
+.shape-gizmo__rotate:hover {
+  fill: var(--accent-amber, #ffb340);
+}
+
+.shape-gizmo__guide {
+  stroke: var(--accent-magenta, #ff00aa);
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.8;
+}
+
+.preview__shape-gizmo-label {
+  position: absolute;
+  top: var(--space-sm);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: 10px;
+  color: var(--accent-cyan);
+  background: rgba(0, 0, 0, 0.65);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  pointer-events: none;
+  z-index: 13;
+  white-space: nowrap;
+}
+.preview__shape-gizmo-readout {
+  color: var(--text-primary, #e8e8ef);
+}
 
 .preview__zoom-level {
   font-size: 10px;
