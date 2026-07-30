@@ -1,0 +1,26 @@
+# Dependency updates.
+#
+# A malicious or compromised npm package lands in the production bundle and runs
+# in the same origin as the user's camera, media and folder handles — identical
+# blast radius to a hosting compromise, but far more likely. Weekly PRs keep the
+# window short; grouping keeps the noise survivable.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Patch/minor bumps are the routine ones — one PR instead of a dozen.
+      routine:
+        update-types:
+          - minor
+          - patch
+
+  # Actions are executable code in the build path too; unpinned tags can move
+  # under you, so keep them current as well.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

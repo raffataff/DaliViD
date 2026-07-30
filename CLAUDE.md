@@ -50,23 +50,30 @@ section rather than reading whole).
 - `src/store/{useAppStore,useTimelineStore,useAudioStore}.js` — app/timeline/audio state.
 - `src/shaders/compoundPresets.js` — preset effect chains + `instantiatePreset` / `instantiateUserCompound`.
 - `src/utils/{paramParser,topSort,projectSerializer,compoundUtils,audioDrivers}.js` — support utils.
+- `src/utils/generatorClips.js` — generator-clip param builders + starter presets
+  (`TEXT_PRESETS`, `SHAPE_PRESETS`, `make{Image,Text,Shape}ClipParams`).
+- `src/utils/aspectPresets.js` — delivery aspect list + `aspectLabel()` for the widescreen bars UI.
 - `src/components/NodeEditor/*` — node UI (`NodeCanvas`, `NodeCard`, `Socket`, `Noodle`,
   `NodeSearchMenu`, `MonacoDrawer`). `MediaPool`, `Inspector`, `Preview`, `Timeline`, `Toolbar` elsewhere.
+- `src/components/Preview/ShapeHandles.jsx` — on-canvas move/scale/rotate gizmo for the selected
+  shape (node or clip); geometry derived from the canvas rect, so it tracks preview pan/zoom.
 
 ## Key conventions (non-obvious — read before editing the pipeline)
 
-- **Source nodes** (`VIDEO_INPUT`, `CAMERA_INPUT`, `IMAGE_INPUT`) are flagged `isSource` in the
-  compiled chain and produce a texture FBO that `resolveProducer` routes downstream — they do
-  **not** run an effect shader pass. (`VIDEO`/`CAMERA` pass the composited timeline frame;
-  `IMAGE` renders its own image — see below.)
+- **Source nodes** (`VIDEO_INPUT`, `CAMERA_INPUT`, `IMAGE_INPUT`, `TEXT_INPUT`, `SHAPE_INPUT`) are
+  flagged `isSource` in the compiled chain and produce a texture FBO that `resolveProducer` routes
+  downstream — they do **not** run an effect shader pass. (`VIDEO`/`CAMERA` pass the composited
+  timeline frame; `IMAGE`/`TEXT`/`SHAPE` render their own pixels in a pre-pass — see below.)
 - **Two-tier audio model:**
   - Always-live (uploaded by `uploadStandardUniforms`): `u_audio_bands[8]`, `u_audio_rms`, `u_beat`.
   - **Gated** drivers: `u_bass`, `u_mid`, `u_treble`, `u_sub_bass`, `u_low_mid`, `u_high_mid`,
     `u_presence`, `u_rms` are `0.0` unless the `AUDIO_SPLITTER`'s matching band output is wired
     into a node's `audio_drivers` socket. They're auto-declared into effect shaders via
     `injectAudioDrivers`, so shaders use them with no `uniform` line.
-- `NON_EFFECT_TYPES` in `Renderer.js` gates whether a graph "has effects". `IMAGE_INPUT` is
-  deliberately **not** in it, so an image-only master graph still renders.
+- `NON_EFFECT_TYPES` in `Renderer.js` gates whether a graph "has effects". The self-drawing sources
+  (`IMAGE_INPUT`, `TEXT_INPUT`, `SHAPE_INPUT`) are deliberately **not** in it, so an image-, text-
+  or shape-only master graph still renders. (`TEXT_INPUT` used to be listed, which silently killed
+  text-only master graphs — removed.)
 - Two-input effects already exist: `MIX_BLEND` and `DISPLACEMENT` (image-as-displacement-map is
   the classic multi-image technique).
 - Live, non-serializable sources are tracked in tiny registries keyed by id:
@@ -104,6 +111,44 @@ section rather than reading whole).
   those bands from the graph's Audio Splitter on drop.
 - `NodeSearchMenu` is an accordion (collapsible categories) and includes a Presets category.
 
+## Shape source node + widescreen bars (added feature)
+
+- **`SHAPE_INPUT`** is a procedural SDF shape source, peer to image/text — nothing to upload, the
+  shader evaluates the shape per pixel, so it's resolution-independent and free to animate.
+  8 shapes (`u_shp_type`: Rectangle, Ellipse, Triangle, Polygon, Star, Ring, Capsule, Cross) plus
+  size / position / rotation / corner radius / sides / inner ratio / thickness / feather /
+  fill+stroke+background colors / spin / bass-scale / beat-punch. `Renderer.renderShapeNode` draws
+  it into `__shp_<nodeId>` in a pre-pass inside `executeGraphDAG` (mirror of the image pre-pass),
+  freed by `releaseNodeResources`.
+- **Everything is a `@param`**, which is the point: `hasParamInputs` gives every control a float
+  socket, so position/size/rotation/colors can be driven by splitter bands, `MATH`/`ENVELOPE` or
+  keyframes, and the transparent background means a shape doubles as a mask / displacement input.
+- **Shape coordinate convention** (shader and gizmo must agree): *frame units* — `1.0` == the frame
+  HEIGHT on both axes (x is aspect-corrected), `u_shp_x/u_shp_y` are ±1 at the frame edges with **y up**,
+  and `u_shp_rot` is **counter-clockwise-positive on screen** (so the SVG gizmo uses `rotate(-deg)`).
+- **Shape clips**: `clip.fileType === 'shape'` is a third generator kind alongside text/image —
+  `_renderClipToFBO` / `_renderClipGraphIsolated` synthesize the frame straight into
+  `clip_input_<id>`; params live in `clip.params` (serialized, fully self-contained).
+- UI: Media Pool "Shapes" tab (click = add at playhead, drag → Timeline clip or Node-Editor node,
+  the drag payload's `params` patch is applied on drop), an on-card quick shape switcher in
+  `NodeCard`, and an Inspector "Shape" section for clips that is **generated from the shader's
+  `@param` configs** (add a `@param` → it appears everywhere, no UI edit).
+- **On-canvas handles** (`Preview/ShapeHandles.jsx`): shows for a selected `SHAPE_INPUT` node (in
+  the graph being viewed, top level only — compound interiors aren't addressable by `setNodeParam`)
+  or a selected shape clip. Drag body = move (snaps to center/thirds, Shift = axis lock, Alt =
+  no snap), corners/edges = resize about the center in the shape's rotated frame (Shift = uniform),
+  ○ handle = rotate (Shift = 15°). It measures the canvas rect on zoom/pan/resize instead of every
+  frame, and only the handles take pointer events so preview panning still works.
+- **`LETTERBOX` node** crops to a delivery ratio and fills the rest with bars (aspect preset or
+  custom ratio, bar color/opacity, feather, offset, zoom-to-fill).
+- **Project widescreen bars** reuse that exact shader: `useAppStore.masterBars`
+  (`{enabled, aspect, color, opacity, feather, offset, zoom}`, serialized under `project`) drives
+  `Renderer._presentToScreen`, the **last** pass of `_renderFullPipeline` — with bars on, the master
+  chain renders into `__master_present` and the letterbox pass blits it to the canvas, so bars show
+  in the preview and bake into exports (both export paths read the canvas). Isolated clip view is
+  deliberately **not** barred. UI: Toolbar toggle + aspect select, full controls in Inspector →
+  Project, a "BARS 2.39" badge on the preview.
+
 ## Code style
 
 - Match existing style: ES modules, hooks, concise comments explaining *why*.
@@ -111,6 +156,24 @@ section rather than reading whole).
 - No new deps without reason; keep single-file artifacts/components consistent with the repo.
 
 ## Recently completed
+
+- **Media Pool right-click menu (delete / add to timeline / add to master graph)** — new shared
+  `src/components/common/ContextMenu.jsx` (+ `.css`): portal-rendered so a scrolling panel can't
+  clip it, position clamped from the measured rect, closes on outside mousedown / Escape / wheel /
+  blur / resize. `MediaPool` opens it from Videos, Images, Audio and Screen cards with per-kind
+  items — **Add to Timeline** (clip at the playhead on an auto-created track, with `initClipGraph`;
+  images become generator clips via `makeImageClipParams`), **Add to Master Graph** (adds
+  `VIDEO_INPUT` / `AUDIO_INPUT` (with `audioSource` = the stem filename) / `IMAGE_INPUT` (imageSrc
+  preloaded) / `SCREEN_INPUT` below the existing nodes, then `exitClipGraph()` + `selectNode` so the
+  user actually sees it), and **Delete**.
+  - Delete has to remove every *source* of a card, because the tabs are **derived**: videos/audio
+    by filename, images keyed by data URL scanned out of clips + every graph. So it removes the
+    matching clips (and their graphs, via the new `useGraphStore.removeClipGraph`) and, for images,
+    top-level `IMAGE_INPUT` nodes. Compound interiors aren't addressable by `removeNode`, so nested
+    uses are counted and reported in a toast — the card legitimately survives.
+  - When anything is in use, the menu **replaces itself with a confirm step** (no modal, no native
+    `confirm()`) naming the exact clip/node counts. Blob URLs are deliberately **not** revoked:
+    the delete is undoable via the history snapshot and a revoked URL would restore as dead media.
 
 Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing.js`,
 `Renderer.renderImageNode`), plus the four original backlog items:
@@ -174,6 +237,31 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
 - **Per-clip audio** — `clip.audioMuted`/`volume` (Inspector "Audio" section, ♪× badge); audio
   follows fades and transition-crossfades (`Renderer._clipAudioGain` + `_audioGains` per frame);
   the export mixdown applies the same envelopes via per-clip GainNode value curves.
+- **TIME node (LFO / ramp — the keyframe replacement)** — shaderless CPU float source, peer to
+  MATH/ENVELOPE, evaluated in `resolveFloatConnections`. Two outputs: `value` (wave shaped and
+  remapped into Min…Max) and `seconds` (raw source time, for MATH). 4 sources × 9 waves:
+  - **Sources** — `Playhead` (default), `Clip Time`, `Clip Progress`, `Free Run`. The first three are
+    **deterministic** (functions of timeline position), so scrubbing shows the real animation and an
+    export is identical to the preview; `Free Run` is the render clock (keeps moving while paused).
+    **`Clip Progress` + `Saw Up` + rate 1 == a keyframe pair across the clip** (Min at the first
+    frame → Max at the last) that follows the clip when it's moved, trimmed or retimed.
+  - **Waves** — Sine (cosine form, so it starts at Min and rises), Triangle, Saw Up/Down, Square
+    (duty = Pulse Width), Bounce, Random Hold, Smooth Random, Linear (unbounded — continuous
+    rotation). Optional `Smooth` S-curve; `Beat Sync` makes a cycle N beats of the project BPM
+    (`useAppStore.bpm`/`beatOffset`). Random waves hash the cycle index, so they're frame-stable.
+  - `hasParamInputs: true` → every control gets a float socket, so a band/ENVELOPE can modulate the
+    LFO itself (bass → rate). Clip-local time reaches the evaluator via `standardState.clipTime`/
+    `clipDuration`, stamped per exec site by `Renderer._setClipTimeContext` (like `hasSource`) and
+    cleared (`null`) for the master pass. Float overrides already reach the image/text/shape
+    pre-passes, so a TIME node animates a shape's position/rotation with no keys.
+  - `resolveFloatConnections` now resolves MATH/ENVELOPE/**TIME** as one dependency-ordered fixpoint
+    (`DEFERRED_FLOAT_TYPES` + `producerPending`), which also fixes MATH → MATH reading a
+    one-frame-stale value when the nodes sat in an unlucky order in the graph array.
+  - **`src/shaders/dataNodeParams.js` is new and is now the single source of truth for the
+    shaderless nodes' param configs** (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME). The same three
+    lists were previously hardcoded in `NodeCanvas`, `Inspector` and `compoundUtils` and had already
+    drifted; all three read the table now, so these nodes also gained Inspector controls (with
+    keyframe diamonds) and compound param exposure for free.
 - **ENVELOPE node** — CPU float follower (attack/release/threshold/gain), evaluated in
   `resolveFloatConnections` with per-node state (export-safe dt via `_timeOverride`).
 - **Float wiring works in every executing graph** — `resolveFloatConnections(renderer, nodes,
@@ -237,9 +325,90 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
   geometry were 60px off), wheel zoom now zooms around the cursor, and Fit-to-Window (F) actually
   frames the graph's nodes instead of resetting to origin.
 
+- **Deployment hardening + folder access is now opt-in** — three related changes, driven by the
+  fact that a static host compromise (or a CDN compromise) puts attacker JS in the same origin as
+  the user's camera, media and folder handles:
+  - **Monaco is bundled, not CDN-loaded.** `@monaco-editor/react` was falling back to its default
+    loader and pulling ~5MB off `cdn.jsdelivr.net` at runtime — third-party code executing in our
+    origin, with no breach required. `src/monacoSetup.js` calls `loader.config({ monaco })` against
+    the already-installed `monaco-editor` package and registers only the base editor worker (GLSL is
+    a Monarch grammar with no language service). `MonacoDrawer` imports it **dynamically** on first
+    open, so the editor stays a lazy chunk and startup cost is unchanged.
+  - **CSP on the production build.** `vite.config.js` gained a build-only (`apply: 'build'`) plugin
+    injecting a `<meta http-equiv="Content-Security-Policy">`; dev is untouched so HMR still works.
+    `connect-src 'self' blob: data:` is the load-bearing directive — the app never legitimately
+    talks to another origin, so injected script has nowhere to send anything. `style-src` needs
+    `'unsafe-inline'` (Monaco injects theme styles); `frame-ancestors` is omitted because it is
+    ignored in meta CSP and GitHub Pages cannot set headers.
+  - **Fonts are self-hosted.** `src/index.css` pulled DM Sans + JetBrains Mono from
+    `fonts.googleapis.com` — a third-party origin in the critical path, a render-blocking round
+    trip and a per-visit IP leak. Now `@fontsource-variable/{dm-sans,jetbrains-mono}` imported in
+    `main.jsx` ahead of `index.css`. Note the family names gain a **" Variable"** suffix, so
+    `--font-ui`/`--font-code` (and the two hard-coded stacks in `MonacoDrawer`/`Icons`) list
+    `'DM Sans Variable'` / `'JetBrains Mono Variable'` first with the bare names as fallback.
+  - **Folder linking REMOVED outright (supersedes the opt-in step below).** DaliViD now calls
+    `showDirectoryPicker` nowhere. Gone: `projectFolderHandle/Name/Permission` + their actions
+    (`useAppStore`), `saveProjectToFolder` / `loadProjectFromFolder` / `restoreMediaFilesFromFolder`
+    / `verifyDirectoryPermission` / `copyFileToProjectFolder` / `save+loadProjectFolderHandle`
+    (`projectSerializer`), the Toolbar's Link/Re-connect/Open-from-folder UI and folder badge, the
+    NewProjectModal folder section, MediaPool's copy-to-folder on import/record, and
+    `FolderAccessModal`. `openRecordingSink` lost its `projectFolderHandle` argument — its
+    signature is now `(name, ext, handle)`.
+    - **`showSaveFilePicker` in `screenRecorder.js` is deliberately kept**: it writes one
+      user-named file, grants no read access, and persists nothing.
+    - **Persistence model is now: IndexedDB while you work + an explicit `.dalivid.json` download.**
+      Because IndexedDB is evictable, `App.jsx` calls `requestPersistentStorage()`
+      (`navigator.storage.persist()`) on mount and registers a `beforeunload` warning that fires
+      when `lastSaveTime > lastExportTime` and the project has content — i.e. edits exist that were
+      never downloaded. `useAppStore.lastExportTime` / `markProjectExported()` back that check and
+      are set by the Toolbar's "Save Project File".
+    - **Migration:** `purgeStoredFolderHandles()` runs on mount and deletes any `project_folder_*`
+      keys from earlier versions — a persisted handle is a standing readwrite grant the user can no
+      longer see or revoke from inside the app.
+    - Autosave is silent now (`handleSaveProject(silent)`), since without a folder every 2-second
+      autosave would otherwise raise a toast.
+  - **Folder linking demoted to opt-in** *(historical — superseded by the removal above)*. `showDirectoryPicker({ mode: 'readwrite' })` grants
+    recursive read+write over the chosen tree, and the handle was persisted to IndexedDB
+    (`project_folder_<id>`). It is now behind `FolderAccessModal` (shared one-time opt-in flag
+    `dalivid_folder_optin` in localStorage) from both the Toolbar and NewProjectModal, and
+    **NewProjectModal no longer requires a folder** — projects can be created with zero disk access.
+    The low-authority path is now first-class: `exportProjectAsJSON` (which existed but had **no
+    call site**) is wired to a "Save Project File" button, and `relinkMediaFromFiles` /
+    `pickMediaFiles` / `getExpectedMediaFilenames` (projectSerializer) relink clips by filename from
+    a one-shot multi-file input on import, with a standalone "Relink Media" toolbar button as the
+    guaranteed user-gesture path. One blob URL per file, not per clip (splits share sources).
+
 ## Backlog / potential improvements
 
+- **Verify the TIME node in `npm run dev`** — also written with the sandbox down (no lint/build run).
+  Checks: drop a TIME node, wire `value` → a slider socket and confirm the param animates and the
+  card readout shows ⚡; `Clip Progress` + `Saw Up` ramps exactly once across a clip and re-times
+  when the clip is trimmed; scrubbing the playhead moves the value (deterministic sources) while
+  `Free Run` keeps going when paused; a short export matches the preview frame-for-frame; and a
+  save/load round-trip keeps the node's params (they're plain `node.params`, so this should be free).
+- **Verify the shape/bars work in `npm run dev`** — it was written while the Cowork Linux sandbox
+  was down, so `npm run lint` (ESLint + shader smoke test) and `npm run build` have not been run
+  against it. Highest-value checks: both new shaders compile in a real WebGL2 context
+  (`SHAPE_INPUT`, `LETTERBOX`), the gizmo's mapping matches the shader (drag a shape to the frame
+  edge → `u_shp_x ≈ ±1`, rotate handle turns the shape the same way it turns), and a save/load
+  round-trip keeps `masterBars` + shape-clip params.
+
 Ideas surfaced but not yet built (roughly by value-to-effort).
+
+- **ACCEPTED RISK: `npm audit` reports DOMPurify advisories via `monaco-editor` (do not "fix").**
+  `monaco-editor` ≥ 0.54 depends on `dompurify` ≤ 3.4.11, which carries three open sanitizer-bypass
+  advisories (GHSA-c2j3-45gr-mqc4, GHSA-cmwh-pvxp-8882, GHSA-vxr8-fq34-vvx9). **There is no forward
+  fix**: `npm audit fix --force` "resolves" it by *downgrading* to `monaco-editor@0.53.0`. Do not run
+  it. We are pinned to 0.56.0, which already cleared 14 of the original 17 advisories.
+  - **Why it's safe to sit on:** DOMPurify is only reached via `sanitize()` when Monaco renders
+    markdown into hover tooltips / suggestion docs. DaliViD registers no hover or completion
+    provider — GLSL is a bare Monarch grammar (`GLSLTokenizer.js`) — so no attacker-controlled
+    string reaches that call. The production CSP (`script-src 'self'`, no `'unsafe-inline'`) also
+    blocks execution of anything a bypass might smuggle through.
+  - **Expiry condition — revisit if ANY of these become true:** (1) `dompurify` > 3.4.11 ships and
+    Monaco picks it up (Dependabot will raise the PR — take it); (2) we add a language service,
+    hover provider, completion docs, or otherwise render markdown in the editor, which makes the
+    path reachable; (3) the CSP is relaxed to allow inline script.
 
 - **Exported audio is quieter (unconfirmed).** The offline mixdown (`ExportModal.renderTimelineAudio`)
   is unity-gain and no attenuation was found in code. Needs an A/B (exported MP4 audio vs the source
@@ -252,7 +421,11 @@ Ideas surfaced but not yet built (roughly by value-to-effort).
 - **Measure real card heights.** `estimateNodeHeight` is now the single shared estimate, but
   expanded compounds / image nodes deviate from it — a DOM-measured height map (ResizeObserver on
   cards) would make marquee/fit/insert/minimap exact.
-- **Keyframe animation is not wired to the renderer.** `useTimelineStore` holds `keyframes` and the
-  serializer saves them, but nothing evaluates them at the playhead — the executor reads live params
-  + audio bindings only, so animated params never take effect. Needs a per-frame pass that
-  interpolates each keyframed param (with easing) and overrides the node's value before execution.
+- **Conditional param visibility.** The @param/dataNodeParams UI has no "show this control only
+  when …", so TIME shows Beats/Cycle with Beat Sync off and Pulse Width on non-square waves (SHAPE
+  has the same issue with sides / inner ratio). A `showIf: { param, equals }` field honoured by the
+  three renderers would clean up the tall cards.
+- **Live output readout for float source nodes.** `data-node-param-display` only updates *input*
+  params, so a TIME/MATH/ENVELOPE card can't show what it's currently outputting. Exposing the
+  resolved `floatValues` (not just the per-consumer overrides) would let each card display its own
+  value — useful when tuning an LFO against the music.

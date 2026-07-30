@@ -3,13 +3,15 @@ import useTimelineStore from '../../store/useTimelineStore'
 import useGraphStore from '../../store/useGraphStore'
 import useAudioStore from '../../store/useAudioStore'
 import useAppStore from '../../store/useAppStore'
-import { copyFileToProjectFolder } from '../../utils/projectSerializer'
 import { COMPOUND_PRESETS } from '../../shaders/compoundPresets'
 import { setCameraStream, getCameraStream, removeCameraStream } from '../../gl/cameraRegistry'
 import { getAudioEngine } from '../../audio/AudioEngine'
 import { prepareImageDataURL, dataUrlBytes, formatBytes } from '../../utils/imageProcessing'
-import { makeTextClipParams, TEXT_PRESETS, DEFAULT_GENERATOR_DURATION } from '../../utils/generatorClips'
+import { makeTextClipParams, makeShapeClipParams, makeImageClipParams, TEXT_PRESETS, SHAPE_PRESETS, DEFAULT_GENERATOR_DURATION } from '../../utils/generatorClips'
+import { getShaderSource } from '../../shaders/shaderRegistry'
+import { parseParams, getDefaultParams } from '../../utils/paramParser'
 import { addToast } from '../common/Toast'
+import ContextMenu from '../common/ContextMenu'
 import {
   startScreenCapture, startRecording, stopRecording, stopRecordingIfActive,
   openRecordingSink, isRecording, getRecordingInfo, mp4Supported, tsStamp,
@@ -20,6 +22,7 @@ const TABS = [
   { id: 'videos', label: 'Videos' },
   { id: 'images', label: 'Images' },
   { id: 'text', label: 'Text' },
+  { id: 'shapes', label: 'Shapes' },
   { id: 'cameras', label: 'Cameras' },
   { id: 'screens', label: 'Screen' },
   { id: 'audio', label: 'Audio' },
@@ -42,14 +45,25 @@ export default function MediaPool() {
   const [optimizeForText, setOptimizeForText] = useState(false)
   const [screenFormat, setScreenFormat] = useState('webm')
   const [, setRecordTick] = useState(0) // drives the recording timer/size readout
+  // Right-click menu: { x, y, kind, entry, confirmDelete }. `confirmDelete` turns
+  // the menu into its own confirmation step, so destructive deletes never need a
+  // blocking modal or a native confirm().
+  const [menu, setMenu] = useState(null)
 
   const clips = useTimelineStore(s => s.clips)
   const addTrack = useTimelineStore(s => s.addTrack)
   const addClip = useTimelineStore(s => s.addClip)
   const updateClip = useTimelineStore(s => s.updateClip)
+  const removeClip = useTimelineStore(s => s.removeClip)
   const tracks = useTimelineStore(s => s.tracks)
   const initClipGraph = useGraphStore(s => s.initClipGraph)
-  const projectFolderHandle = useAppStore(s => s.projectFolderHandle)
+  const removeClipGraph = useGraphStore(s => s.removeClipGraph)
+  const addNode = useGraphStore(s => s.addNode)
+  const removeNode = useGraphStore(s => s.removeNode)
+  // Watched so the Images tab can rebuild its cards from a loaded project's
+  // IMAGE_INPUT nodes (master + per-clip graphs, recursing compounds).
+  const masterGraph = useGraphStore(s => s.masterGraph)
+  const clipGraphs = useGraphStore(s => s.clipGraphs)
   const micEnabled = useAudioStore(s => s.micEnabled)
   const toggleMic = useAudioStore(s => s.toggleMic)
 
@@ -92,6 +106,54 @@ export default function MediaPool() {
     return [...importedAudio, ...clipOnly]
   }, [clips, importedAudio])
 
+  // Rebuild the Images tab from anywhere the project embeds an image data URL:
+  // freshly-imported pool images, image CLIPS on the timeline, and IMAGE_INPUT
+  // NODES in any graph (master, per-clip, and nested compounds). Keyed by the
+  // data URL itself (an image's true identity) so a project reload shows the
+  // images it saved even though the imported-pool state is session-only.
+  const imageEntries = useMemo(() => {
+    const bySrc = new Map()
+
+    // Freshly-imported images win — they carry accurate width/height/size.
+    for (const img of importedImages) {
+      if (img.dataUrl) bySrc.set(img.dataUrl, img)
+    }
+
+    const addDerived = (src, name, width, height) => {
+      if (!src || bySrc.has(src)) return
+      bySrc.set(src, {
+        id: `used_image_${(name || 'image')}_${bySrc.size}`,
+        filename: name || 'Image',
+        dataUrl: src,
+        width: width || 0,
+        height: height || 0,
+        size: dataUrlBytes(src),
+        fromProject: true,
+      })
+    }
+
+    // Image clips placed on the timeline.
+    for (const c of clips) {
+      if (c.fileType === 'image' && c.params?.imageSrc) {
+        addDerived(c.params.imageSrc, c.params.imageName || c.filename, c.metadata?.width, c.metadata?.height)
+      }
+    }
+
+    // IMAGE_INPUT nodes in any graph, recursing into placed compounds' sub-graphs.
+    const scanNodes = (nodes) => {
+      for (const n of (nodes || [])) {
+        if (n.type === 'IMAGE_INPUT' && n.params?.imageSrc) {
+          addDerived(n.params.imageSrc, n.params.imageName || n.name)
+        }
+        if (n.subGraph?.nodes) scanNodes(n.subGraph.nodes)
+      }
+    }
+    scanNodes(masterGraph?.nodes)
+    for (const g of Object.values(clipGraphs || {})) scanNodes(g.nodes)
+
+    return Array.from(bySrc.values())
+  }, [importedImages, clips, masterGraph, clipGraphs])
+
   // Import video file
   const handleImportVideo = useCallback(() => {
     const input = document.createElement('input')
@@ -101,16 +163,8 @@ export default function MediaPool() {
     input.onchange = async (e) => {
       const files = Array.from(e.target.files)
       for (const file of files) {
-        if (projectFolderHandle) {
-          try {
-            await copyFileToProjectFolder(projectFolderHandle, file, 'media')
-          } catch (err) {
-            console.error('Failed to copy imported video file to project folder:', err)
-          }
-        }
-
         const url = URL.createObjectURL(file)
-        
+
         // Get video metadata
         const video = document.createElement('video')
         video.preload = 'metadata'
@@ -182,7 +236,7 @@ export default function MediaPool() {
       }
     }
     input.click()
-  }, [tracks, addTrack, addClip, updateClip, initClipGraph, projectFolderHandle])
+  }, [tracks, addTrack, addClip, updateClip, initClipGraph])
 
   // Import audio file
   const handleImportAudio = useCallback(() => {
@@ -193,14 +247,6 @@ export default function MediaPool() {
     input.onchange = async (e) => {
       const files = Array.from(e.target.files)
       for (const file of files) {
-        if (projectFolderHandle) {
-          try {
-            await copyFileToProjectFolder(projectFolderHandle, file, 'audio')
-          } catch (err) {
-            console.error('Failed to copy imported audio file to project folder:', err)
-          }
-        }
-
         const url = URL.createObjectURL(file)
 
         // Get audio metadata
@@ -251,7 +297,7 @@ export default function MediaPool() {
       }
     }
     input.click()
-  }, [tracks, addTrack, addClip, updateClip, initClipGraph, projectFolderHandle])
+  }, [tracks, addTrack, addClip, updateClip, initClipGraph])
 
   // Import still images. Each image is read as a data URL so it can be embedded
   // in the IMAGE_INPUT node's params and persisted with the project. Cards are
@@ -303,6 +349,25 @@ export default function MediaPool() {
       params,
     })
     initClipGraph(clipId, filename, 'text')
+    app.selectClip?.(clipId)
+  }, [tracks, addTrack, addClip, initClipGraph])
+
+  // Add a shape clip at the playhead (mirror of handleAddText). Shapes are pure
+  // GPU sources, so there is nothing to import — a preset is just a param patch.
+  const handleAddShape = useCallback((preset) => {
+    const app = useAppStore.getState()
+    const playhead = app.playheadTime || 0
+    let videoTrack = tracks.find(t => t.type === 'video')
+    if (!videoTrack) videoTrack = { id: addTrack('video') }
+    const params = makeShapeClipParams(preset?.params || {})
+    const filename = preset?.name || 'Shape'
+    const clipId = addClip(videoTrack.id, {
+      filename, fileType: 'shape',
+      timelineStart: playhead, timelineEnd: playhead + DEFAULT_GENERATOR_DURATION,
+      sourceStart: 0, sourceEnd: DEFAULT_GENERATOR_DURATION,
+      params,
+    })
+    initClipGraph(clipId, filename, 'shape')
     app.selectClip?.(clipId)
   }, [tracks, addTrack, addClip, initClipGraph])
 
@@ -485,7 +550,7 @@ export default function MediaPool() {
       _memWarned.delete(clip.id)
       setRecordTick(t => t + 1)
       if (!result) return
-      const { file, url, durationSec, width, height, fps, sinkKind } = result
+      const { file, url, durationSec, width, height, fps } = result
       setImportedVideos(prev => [...prev.filter(v => v.filename !== file.name), {
         id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
         filename: file.name, fileUrl: url, fileType: 'video',
@@ -493,11 +558,6 @@ export default function MediaPool() {
         duration: durationSec, // measured — never video metadata (WebM = Infinity)
         size: file.size, file,
       }])
-      // Keep the project self-contained if the file landed outside its media/ folder.
-      if (sinkKind !== 'project' && projectFolderHandle) {
-        try { await copyFileToProjectFolder(projectFolderHandle, file, 'media') }
-        catch (err) { console.warn('Could not copy recording into project folder:', err) }
-      }
       addToast({ message: `Recording saved: ${file.name}`, type: 'success' })
       return
     }
@@ -523,19 +583,16 @@ export default function MediaPool() {
     }
     try {
       const name = `screen_${tsStamp()}.${handle.ext}`
-      const sink = await openRecordingSink(name, handle.ext, projectFolderHandle, handle)
+      const sink = await openRecordingSink(name, handle.ext, handle)
       handle.sink = sink
       handle.recorder.start(1000) // 1s timeslices → stream chunks to disk
-      if (sink.kind === 'project') {
-        addToast({ message: 'Recording to the project’s media folder.', type: 'info' })
-      }
       setRecordTick(t => t + 1)
     } catch (err) {
       console.error('Failed to start recording:', err)
       stopRecordingIfActive(clip.id)
       addToast({ message: 'Could not start recording.', type: 'error' })
     }
-  }, [screenFormat, projectFolderHandle])
+  }, [screenFormat])
 
   // End a live screen share: stop any recording, drop the stream (clip freezes).
   const handleEndShare = useCallback(async (clip) => {
@@ -543,6 +600,250 @@ export default function MediaPool() {
     removeCameraStream(clip.id)
     setRecordTick(t => t + 1)
   }, [])
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Right-click menu: Add to Timeline / Add to Master Graph / Delete
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const openMenu = useCallback((e, kind, entry) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setMenu({ x: e.clientX, y: e.clientY, kind, entry, confirmDelete: false })
+  }, [])
+
+  const closeMenu = useCallback(() => setMenu(null), [])
+
+  // Find (or create) the first track of a type. Reads live state — the `tracks`
+  // render closure is stale the moment addTrack runs in the same tick.
+  const ensureTrack = useCallback((type) => {
+    const existing = useTimelineStore.getState().tracks.find(t => t.type === type)
+    return existing ? existing.id : addTrack(type)
+  }, [addTrack])
+
+  // Media-backed clip (video/audio) placed at the playhead, with its own graph.
+  const addMediaClip = useCallback((entry, fileType) => {
+    if (!entry.fileUrl) {
+      addToast({ message: `"${entry.filename}" has no linked file — re-import it first.`, type: 'error' })
+      return
+    }
+    const playhead = useAppStore.getState().playheadTime || 0
+    const duration = entry.duration || 10
+    const trackId = ensureTrack(fileType === 'audio' ? 'audio' : 'video')
+    const clipId = addClip(trackId, {
+      filename: entry.filename, fileUrl: entry.fileUrl, fileType,
+      timelineStart: playhead, timelineEnd: playhead + duration,
+      sourceStart: 0, sourceEnd: duration,
+      width: entry.width, height: entry.height, fps: entry.fps, duration,
+    })
+    initClipGraph(clipId, entry.filename, fileType === 'audio' ? 'audio' : 'video')
+    useAppStore.getState().selectClip?.(clipId)
+    addToast({ message: `Added "${entry.filename}" at the playhead`, type: 'success' })
+  }, [ensureTrack, addClip, initClipGraph])
+
+  // Image entries are generator clips — params carry the data URL, so the clip
+  // stays self-contained across save/load exactly like a dragged image card.
+  const addImageClip = useCallback((img) => {
+    const playhead = useAppStore.getState().playheadTime || 0
+    const filename = img.filename || 'Image'
+    const trackId = ensureTrack('video')
+    const clipId = addClip(trackId, {
+      filename, fileType: 'image',
+      timelineStart: playhead, timelineEnd: playhead + DEFAULT_GENERATOR_DURATION,
+      sourceStart: 0, sourceEnd: DEFAULT_GENERATOR_DURATION,
+      params: makeImageClipParams({ imageSrc: img.dataUrl, imageName: filename }),
+      width: img.width || 1920, height: img.height || 1080,
+    })
+    initClipGraph(clipId, filename, 'image')
+    useAppStore.getState().selectClip?.(clipId)
+    addToast({ message: `Added "${filename}" at the playhead`, type: 'success' })
+  }, [ensureTrack, addClip, initClipGraph])
+
+  // Drop a source node into the master graph, then switch the Node Editor to the
+  // master graph and select it — otherwise the node lands somewhere the user
+  // isn't looking and the action reads as a no-op.
+  const addToMasterGraph = useCallback((nodeType, name, extraParams) => {
+    const shaderCode = getShaderSource(nodeType)
+    const params = getDefaultParams(shaderCode ? parseParams(shaderCode) : [])
+    Object.assign(params, extraParams || {})
+
+    // Place it below the existing nodes at the graph's left edge, so it lands in
+    // clear space instead of on top of the Output / Audio chain.
+    const nodes = useGraphStore.getState().masterGraph?.nodes || []
+    const minX = nodes.reduce((m, n) => Math.min(m, n.position?.x ?? 0), Infinity)
+    const maxY = nodes.reduce((m, n) => Math.max(m, n.position?.y ?? 0), 0)
+    const position = { x: Number.isFinite(minX) ? minX : 80, y: maxY + 180 }
+
+    const nodeId = addNode('master', null, { type: nodeType, name, position, params })
+    const app = useAppStore.getState()
+    app.exitClipGraph?.()
+    app.selectNode?.(nodeId)
+    addToast({ message: `Added "${name}" to the Master Graph`, type: 'success' })
+  }, [addNode])
+
+  // Timeline clips a pool entry owns. Videos/audio match by filename (the pool is
+  // keyed by it); images by their data URL, which is an image's true identity.
+  const clipsUsing = useCallback((kind, entry) => {
+    if (!entry) return []
+    const all = useTimelineStore.getState().clips
+    if (kind === 'video') return all.filter(c => c.fileType === 'video' && c.filename === entry.filename)
+    if (kind === 'audio') return all.filter(c => c.fileType === 'audio' && c.filename === entry.filename)
+    if (kind === 'image') return all.filter(c => c.fileType === 'image' && c.params?.imageSrc === entry.dataUrl)
+    if (kind === 'screen') return all.filter(c => c.id === entry.id)
+    return []
+  }, [])
+
+  // IMAGE_INPUT nodes bound to a data URL. Top-level ones are addressable by
+  // removeNode; compound interiors are not, so they're only counted — the card
+  // legitimately survives while a compound still holds the image.
+  const imageNodeUses = useCallback((dataUrl) => {
+    const { masterGraph: mg, clipGraphs: cgs } = useGraphStore.getState()
+    const top = []
+    let nested = 0
+    const countNested = (nodes) => {
+      for (const n of nodes || []) {
+        if (n.type === 'IMAGE_INPUT' && n.params?.imageSrc === dataUrl) nested++
+        if (n.subGraph?.nodes) countNested(n.subGraph.nodes)
+      }
+    }
+    const scan = (graph, graphLevel, clipId) => {
+      for (const n of graph?.nodes || []) {
+        if (n.type === 'IMAGE_INPUT' && n.params?.imageSrc === dataUrl) top.push({ graphLevel, clipId, nodeId: n.id })
+        if (n.subGraph?.nodes) countNested(n.subGraph.nodes)
+      }
+    }
+    scan(mg, 'master', null)
+    for (const [cid, g] of Object.entries(cgs || {})) scan(g, 'clip', cid)
+    return { top, nested }
+  }, [])
+
+  const deleteImpact = useCallback((kind, entry) => ({
+    clips: clipsUsing(kind, entry).length,
+    nodes: kind === 'image' && entry?.dataUrl ? imageNodeUses(entry.dataUrl).top.length : 0,
+  }), [clipsUsing, imageNodeUses])
+
+  const deleteEntry = useCallback((kind, entry) => {
+    if (!entry) return
+    const label = entry.filename || 'item'
+
+    // Live screen share: stop the recorder and release the stream first so the
+    // device/tab is freed even though the clip removal below is synchronous.
+    if (kind === 'screen') {
+      stopRecordingIfActive(entry.id).then(() => {
+        removeCameraStream(entry.id)
+        _memWarned.delete(entry.id)
+        setRecordTick(t => t + 1)
+      })
+    }
+
+    for (const c of clipsUsing(kind, entry)) {
+      removeClip(c.id)
+      removeClipGraph(c.id)
+    }
+
+    if (kind === 'video' || kind === 'audio') {
+      // Deliberately NOT revoking the blob URL: the delete is undoable (Ctrl+Z
+      // restores the clips through the history snapshot) and a revoked URL would
+      // come back as unplayable media. The URL dies with the page instead.
+      const setter = kind === 'video' ? setImportedVideos : setImportedAudio
+      setter(prev => prev.filter(x => x.filename !== entry.filename))
+    } else if (kind === 'image') {
+      const { top, nested } = imageNodeUses(entry.dataUrl)
+      for (const u of top) removeNode(u.graphLevel, u.clipId, u.nodeId)
+      setImportedImages(prev => prev.filter(i => i.dataUrl !== entry.dataUrl))
+      if (nested > 0) {
+        addToast({
+          message: `"${label}" is still used inside ${nested} compound node${nested !== 1 ? 's' : ''} — card kept.`,
+          type: 'warning', duration: 5000,
+        })
+        return
+      }
+    }
+
+    addToast({ message: `Removed "${label}" from the pool`, type: 'info' })
+  }, [clipsUsing, imageNodeUses, removeClip, removeClipGraph, removeNode])
+
+  const menuItems = useMemo(() => {
+    if (!menu) return []
+    const { kind, entry, confirmDelete } = menu
+    const impact = deleteImpact(kind, entry)
+
+    // Second step: the menu itself is the confirmation, so a destructive delete
+    // is always one deliberate extra click and never a blocking dialog.
+    if (confirmDelete) {
+      const parts = []
+      if (impact.clips) parts.push(`${impact.clips} clip${impact.clips !== 1 ? 's' : ''}`)
+      if (impact.nodes) parts.push(`${impact.nodes} node${impact.nodes !== 1 ? 's' : ''}`)
+      return [
+        {
+          label: kind === 'screen'
+            ? 'Delete — ends the share and removes the clip'
+            : `Delete — also removes ${parts.join(' + ')}`,
+          hint: 'Undoable with Ctrl+Z',
+          icon: '!', danger: true,
+          onSelect: () => deleteEntry(kind, entry),
+        },
+        { label: 'Cancel', onSelect: () => {} },
+      ]
+    }
+
+    const items = []
+    if (kind === 'video') {
+      items.push({
+        label: 'Add to Timeline', icon: '▸', disabled: !entry.fileUrl,
+        hint: entry.fileUrl ? 'Place at the playhead on a video track' : 'Media not linked — re-import the file',
+        onSelect: () => addMediaClip(entry, 'video'),
+      })
+      items.push({
+        label: 'Add to Master Graph', icon: '◆',
+        hint: 'Adds a Video source node (the composited timeline frame)',
+        onSelect: () => addToMasterGraph('VIDEO_INPUT', entry.filename || 'Video'),
+      })
+    } else if (kind === 'audio') {
+      items.push({
+        label: 'Add to Timeline', icon: '▸', disabled: !entry.fileUrl,
+        hint: entry.fileUrl ? 'Place at the playhead on an audio track' : 'Media not linked — re-import the file',
+        onSelect: () => addMediaClip(entry, 'audio'),
+      })
+      items.push({
+        label: 'Add to Master Graph', icon: '◆',
+        hint: 'Adds an Audio Input node tapping this stem',
+        onSelect: () => addToMasterGraph('AUDIO_INPUT', entry.filename || 'Audio', { audioSource: entry.filename }),
+      })
+    } else if (kind === 'image') {
+      items.push({
+        label: 'Add to Timeline', icon: '▸',
+        hint: 'Place an image clip at the playhead',
+        onSelect: () => addImageClip(entry),
+      })
+      items.push({
+        label: 'Add to Master Graph', icon: '◆',
+        hint: 'Adds an Image source node with this image loaded',
+        onSelect: () => addToMasterGraph('IMAGE_INPUT', entry.filename || 'Image', {
+          imageSrc: entry.dataUrl, imageName: entry.filename || '',
+        }),
+      })
+    } else if (kind === 'screen') {
+      items.push({
+        label: 'Add to Master Graph', icon: '◆',
+        hint: 'Adds a Screen source node',
+        onSelect: () => addToMasterGraph('SCREEN_INPUT', entry.filename || 'Screen'),
+      })
+    }
+
+    items.push({ separator: true })
+    const inUse = impact.clips + impact.nodes
+    items.push({
+      label: kind === 'screen' ? 'Delete Capture' : 'Delete from Pool',
+      icon: '×', danger: true,
+      hint: inUse > 0 ? 'This media is in use — you\'ll be asked to confirm' : undefined,
+      keepOpen: inUse > 0,
+      onSelect: () => {
+        if (inUse > 0) setMenu(m => (m ? { ...m, confirmDelete: true } : m))
+        else deleteEntry(kind, entry)
+      },
+    })
+    return items
+  }, [menu, deleteImpact, deleteEntry, addMediaClip, addImageClip, addToMasterGraph])
 
   const formatSize = (bytes) => {
     if (bytes < 1024) return `${bytes} B`
@@ -592,7 +893,12 @@ export default function MediaPool() {
             ) : (
               <div className="media-pool__file-list">
                 {videoEntries.map(v => (
-                  <div key={v.id} className="media-pool__file-item">
+                  <div
+                    key={v.id}
+                    className="media-pool__file-item"
+                    title="Right-click for options"
+                    onContextMenu={(e) => openMenu(e, 'video', v)}
+                  >
                     <div className="media-pool__file-thumb">
                       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
                         <rect x="2" y="4" width="20" height="16" rx="2" />
@@ -618,7 +924,7 @@ export default function MediaPool() {
             <button className="media-pool__import-btn" onClick={handleImportImage}>
               + Import Image
             </button>
-            {importedImages.length === 0 ? (
+            {imageEntries.length === 0 ? (
               <div className="media-pool__empty">
                 <div className="media-pool__empty-icon">
                   <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1" opacity="0.3">
@@ -632,12 +938,13 @@ export default function MediaPool() {
               </div>
             ) : (
               <div className="media-pool__file-list">
-                {importedImages.map(img => (
+                {imageEntries.map(img => (
                   <div
                     key={img.id}
                     className="media-pool__file-item media-pool__file-item--interactive"
                     draggable="true"
-                    title="Drag onto the Timeline to add an image clip, or onto the Node Editor for an Image source node"
+                    title="Drag onto the Timeline to add an image clip, or onto the Node Editor for an Image source node — right-click for options"
+                    onContextMenu={(e) => openMenu(e, 'image', img)}
                     onDragStart={(e) => {
                       e.dataTransfer.setData('application/dalivid-drag', JSON.stringify({
                         kind: 'node',        // Node Editor → IMAGE_INPUT node
@@ -657,7 +964,7 @@ export default function MediaPool() {
                     <div className="media-pool__file-info">
                       <div className="media-pool__file-name">{img.filename}</div>
                       <div className="media-pool__file-meta mono">
-                        {img.width}×{img.height} · {formatSize(img.size)}
+                        {img.width > 0 && img.height > 0 ? `${img.width}×${img.height} · ` : ''}{formatSize(img.size)}
                       </div>
                     </div>
                   </div>
@@ -696,6 +1003,44 @@ export default function MediaPool() {
                   }}
                 >
                   <div className="media-pool__effect-icon" style={{ color: '#ffcc44', fontWeight: 700 }}>T</div>
+                  <div className="media-pool__effect-name">{preset.name}</div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* ── Shapes Tab ── */}
+        {activeTab === 'shapes' && (
+          <>
+            <button className="media-pool__import-btn" onClick={() => handleAddShape(SHAPE_PRESETS[0])}>
+              + Add Shape
+            </button>
+            <p className="media-pool__empty-hint" style={{ margin: '0 0 8px' }}>
+              Click a shape to add it at the playhead, or drag it onto the Timeline (shape clip)
+              or the Node Editor (Shape source node). Drag its handles in the Preview to place it.
+            </p>
+            <div className="media-pool__effects-grid">
+              {SHAPE_PRESETS.map(preset => (
+                <div
+                  key={preset.id}
+                  className="media-pool__effect-card"
+                  style={{ borderColor: '#ff5588' }}
+                  draggable="true"
+                  title="Drag onto the Timeline for a shape clip, or onto the Node Editor for a Shape source node"
+                  onClick={() => handleAddShape(preset)}
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData('application/dalivid-drag', JSON.stringify({
+                      kind: 'node',           // Node Editor → SHAPE_INPUT node
+                      clipType: 'shape',      // Timeline → shape clip
+                      nodeType: 'SHAPE_INPUT',
+                      name: preset.name,
+                      params: preset.params,
+                    }))
+                    e.dataTransfer.effectAllowed = 'copy'
+                  }}
+                >
+                  <div className="media-pool__effect-icon" style={{ color: '#ff5588', fontSize: 16 }}>{preset.icon}</div>
                   <div className="media-pool__effect-name">{preset.name}</div>
                 </div>
               ))}
@@ -782,7 +1127,12 @@ export default function MediaPool() {
                   const recording = isRecording(clip.id)
                   const info = recording ? getRecordingInfo(clip.id) : null
                   return (
-                    <div key={clip.id} className="media-pool__file-item">
+                    <div
+                      key={clip.id}
+                      className="media-pool__file-item"
+                      title="Right-click for options"
+                      onContextMenu={(e) => openMenu(e, 'screen', clip)}
+                    >
                       <div className="media-pool__file-thumb" style={{ color: live ? 'var(--accent-cyan)' : 'var(--text-dim, #888)' }}>
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
                           <rect x="2" y="4" width="20" height="13" rx="1.5" />
@@ -867,7 +1217,12 @@ export default function MediaPool() {
             ) : (
               <div className="media-pool__file-list">
                 {audioEntries.map(a => (
-                  <div key={a.id} className="media-pool__file-item">
+                  <div
+                    key={a.id}
+                    className="media-pool__file-item"
+                    title="Right-click for options"
+                    onContextMenu={(e) => openMenu(e, 'audio', a)}
+                  >
                     <div className="media-pool__file-thumb" style={{ color: 'var(--accent-magenta)' }}>
                       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
                         <path d="M4 9v6M8 7v10M12 5v14M16 7v10M20 9v6" />
@@ -953,6 +1308,18 @@ export default function MediaPool() {
           </div>
         )}
       </div>
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          header={menu.confirmDelete
+            ? `Delete "${menu.entry?.filename || 'item'}"?`
+            : (menu.entry?.filename || 'Media')}
+          items={menuItems}
+          onClose={closeMenu}
+        />
+      )}
     </>
   )
 }
@@ -985,6 +1352,8 @@ function ScopesBars() {
 const EFFECT_PRESETS = [
   { type: 'IMAGE_INPUT', name: 'Image', color: '#44cc88', icon: '◳' },
   { type: 'TEXT_INPUT', name: 'Text', color: '#ffcc44', icon: 'T' },
+  { type: 'SHAPE_INPUT', name: 'Shape', color: '#ff5588', icon: '★' },
+  { type: 'LETTERBOX', name: 'Letterbox', color: '#8899aa', icon: '▤' },
   { type: 'EDGE_DETECTION', name: 'Edge Detection', color: '#ff8844', icon: '◈' },
   { type: 'COLOR_INVERSION', name: 'Color / HSV', color: '#ff44cc', icon: '◐' },
   { type: 'GLITCH', name: 'Glitch', color: '#ff3344', icon: '▦' },

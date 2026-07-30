@@ -6,11 +6,13 @@
 
 import { parseParams } from './paramParser'
 import { getNodeSource } from '../shaders/shaderRegistry'
+import { getDataNodeParams } from '../shaders/dataNodeParams'
 
 // I/O terminals and timeline/camera sources that shouldn't be wrapped into a
-// compound. IMAGE_INPUT is NOT excluded: it's a self-contained source that the
-// unified DAG executor renders inside a compound (image pre-pass), so an image
-// (e.g. as a displacement/blend input) can be compounded like any effect.
+// compound. IMAGE_INPUT / TEXT_INPUT / SHAPE_INPUT are NOT excluded: they're
+// self-contained sources the unified DAG executor renders inside a compound (its
+// image/text/shape pre-passes run per recursion level), so a shape or image used
+// as a mask / displacement / blend input can be compounded like any effect.
 const EXCLUDED_FROM_SELECTION = new Set([
   'OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT',
   'CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT',
@@ -37,15 +39,14 @@ export function isTransitionCompound(entry) {
 }
 
 /**
- * Gather param configs for a sub-graph node (from shader source or hardcoded).
+ * Gather param configs for a sub-graph node: parsed from its shader, or — for the
+ * shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) — from the
+ * shared dataNodeParams table, so a compound can expose a TIME node's rate or
+ * range to its surface just like any shader param.
  */
 function getSubNodeParamConfigs(node) {
-  if (node.type === 'MATH') {
-    return [
-      { name: 'Value A', uniformName: 'value_a', type: 'slider', min: -100, max: 100, step: 0.01, default: 0 },
-      { name: 'Value B', uniformName: 'value_b', type: 'slider', min: -100, max: 100, step: 0.01, default: 1 },
-    ]
-  }
+  const dataParams = getDataNodeParams(node.type)
+  if (dataParams.length) return dataParams
   const shaderSrc = getNodeSource(node)
   if (!shaderSrc) return []
   return parseParams(shaderSrc)

@@ -134,7 +134,7 @@ const useTimelineStore = create((set, get) => ({
     const clip = {
       filename: clipData.filename || 'Untitled',
       fileUrl: clipData.fileUrl || null,
-      fileType: clipData.fileType || 'video', // 'video' | 'audio' | 'camera' | 'screen' | 'image' | 'text'
+      fileType: clipData.fileType || 'video', // 'video' | 'audio' | 'camera' | 'screen' | 'image' | 'text' | 'shape'
       // Generator clips (text/image) keep their content + style here (text string,
       // image data URL, fit/transform). Empty for media-backed clips.
       params: clipData.params || {},
@@ -370,6 +370,81 @@ const useTimelineStore = create((set, get) => ({
         }
         return k
       }).filter(k => k.keys.length > 0),
+    }))
+  },
+
+  // Move every key sitting on one clip-time COLUMN to a new time. The timeline
+  // draws one diamond per rounded-millisecond column (merged across all of a
+  // clip's params/nodes), so dragging that diamond shifts the whole column —
+  // matched by `fromMs` (an integer ms) and re-stamped to `toTime` seconds.
+  // Keeps each track sorted and collapses any exact collision at the target.
+  moveClipKeyframes: (clipId, fromMs, toTime) => {
+    const dest = Math.max(0, toTime)
+    set((state) => ({
+      keyframes: state.keyframes.map(k => {
+        if (k.clipId !== clipId) return k
+        let changed = false
+        const moved = k.keys.map(key => {
+          if (Math.round(key.time * 1000) === fromMs) {
+            changed = true
+            return { ...key, time: dest }
+          }
+          return key
+        })
+        if (!changed) return k
+        // Sort, then drop exact-time duplicates (a key dragged onto an existing
+        // one merges — the moved key, sorted-stable, wins).
+        const sorted = moved.sort((a, b) => a.time - b.time)
+        const deduped = sorted.filter((key, i) =>
+          i === 0 || Math.abs(key.time - sorted[i - 1].time) > 1e-4
+        )
+        return { ...k, keys: deduped }
+      }),
+    }))
+  },
+
+  // Delete every key on one clip-time column (Alt+click a timeline diamond).
+  removeClipKeyframesAtMs: (clipId, fromMs) => {
+    set((state) => ({
+      keyframes: state.keyframes.map(k => {
+        if (k.clipId !== clipId) return k
+        return { ...k, keys: k.keys.filter(key => Math.round(key.time * 1000) !== fromMs) }
+      }).filter(k => k.keys.length > 0),
+    }))
+  },
+
+  // Move ONE key of one param from `oldTime` to `newTime` (the keyframe-lane
+  // drag). Preserves its value/easing, re-sorts, and merges an exact collision.
+  moveKeyframe: (clipId, nodeId, paramName, oldTime, newTime) => {
+    const dest = Math.max(0, newTime)
+    set((state) => ({
+      keyframes: state.keyframes.map(k => {
+        if (k.clipId !== clipId || k.nodeId !== nodeId || k.paramName !== paramName) return k
+        const moved = k.keys.map(key =>
+          Math.abs(key.time - oldTime) < 1e-4 ? { ...key, time: dest } : key
+        )
+        const sorted = moved.sort((a, b) => a.time - b.time)
+        const deduped = sorted.filter((key, i) =>
+          i === 0 || Math.abs(key.time - sorted[i - 1].time) > 1e-4
+        )
+        return { ...k, keys: deduped }
+      }),
+    }))
+  },
+
+  // Remove one param's whole keyframe track (right-click → Clear param).
+  clearParamKeyframes: (clipId, nodeId, paramName) => {
+    set((state) => ({
+      keyframes: state.keyframes.filter(
+        k => !(k.clipId === clipId && k.nodeId === nodeId && k.paramName === paramName)
+      ),
+    }))
+  },
+
+  // Remove every keyframe track belonging to a node (right-click → Clear all).
+  clearNodeKeyframes: (clipId, nodeId) => {
+    set((state) => ({
+      keyframes: state.keyframes.filter(k => !(k.clipId === clipId && k.nodeId === nodeId)),
     }))
   },
 

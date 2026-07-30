@@ -799,6 +799,81 @@ void main() {
 }
 `)
 
+// ── Letterbox / Widescreen Bars ──────────────────────────────────────────────
+// Crops the frame to a delivery aspect ratio and fills the rest with bars.
+// Wider target than the project → horizontal bars (letterbox); narrower →
+// vertical bars (pillarbox). "Zoom to Fill" punches the source in so it fills
+// the cropped window instead of just being covered by it.
+//
+// This is ALSO the shader behind the project-level "Widescreen Bars" toggle:
+// Renderer compiles this same source once and drives it with u_lb_custom set to
+// the chosen ratio, so the node and the master toggle can never drift apart.
+registerShader('LETTERBOX', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+// @param name="Aspect" min=0 max=8 default=0 step=1 type=select options="2.39:1,2.35:1,2:1,1.85:1,16:9,3:2,4:3,1:1,9:16"
+uniform int u_lb_aspect;
+// @param name="Custom Ratio" min=0.0 max=4.0 default=0.0 step=0.01
+uniform float u_lb_custom;
+// @param name="Bar Color" type=color default="#000000"
+uniform vec3 u_lb_color;
+// @param name="Bar Opacity" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_lb_opacity;
+// @param name="Feather" min=0.0 max=0.2 default=0.0 step=0.002
+uniform float u_lb_feather;
+// @param name="Offset" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_lb_offset;
+// @param name="Zoom to Fill" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_lb_zoom;
+out vec4 fragColor;
+
+// Non-premultiplied "source over destination".
+vec4 lbOver(vec4 s, vec4 d) {
+  float a = s.a + d.a * (1.0 - s.a);
+  if (a <= 0.0) return vec4(0.0);
+  return vec4((s.rgb * s.a + d.rgb * d.a * (1.0 - s.a)) / a, a);
+}
+
+// Target ratio: a Custom Ratio above 0 wins, otherwise the Aspect preset.
+float lbTarget() {
+  if (u_lb_custom > 0.01) return u_lb_custom;
+  if (u_lb_aspect == 0) return 2.39;
+  if (u_lb_aspect == 1) return 2.35;
+  if (u_lb_aspect == 2) return 2.0;
+  if (u_lb_aspect == 3) return 1.85;
+  if (u_lb_aspect == 4) return 16.0 / 9.0;
+  if (u_lb_aspect == 5) return 1.5;
+  if (u_lb_aspect == 6) return 4.0 / 3.0;
+  if (u_lb_aspect == 7) return 1.0;
+  return 9.0 / 16.0;
+}
+
+void main() {
+  float frame = u_resolution.x / max(u_resolution.y, 1.0);
+  float target = lbTarget();
+
+  // Visible window as a fraction of the frame on each axis.
+  vec2 keep = vec2(1.0);
+  if (target < frame) keep.x = target / frame;   // pillarbox
+  else                keep.y = frame / target;   // letterbox
+
+  // Zoom so the source fills the cropped window (1.0 = fully filled).
+  float z = mix(1.0, 1.0 / max(min(keep.x, keep.y), 0.001), clamp(u_lb_zoom, 0.0, 1.0));
+  vec4 src = texture(u_texture, (v_uv - 0.5) / z + 0.5);
+
+  // Slide the window along whichever axis is barred.
+  vec2 half_ = keep * 0.5;
+  vec2 off = vec2(u_lb_offset) * (vec2(0.5) - half_);
+  vec2 dist = half_ - abs(v_uv - 0.5 - off);     // > 0 inside the window
+
+  float aa = max(u_lb_feather * 0.5, 0.75 / max(u_resolution.y, 1.0));
+  float inside = smoothstep(-aa, aa, min(dist.x, dist.y));
+  fragColor = mix(lbOver(vec4(u_lb_color, u_lb_opacity), src), src, inside);
+}
+`)
+
 // ── Video Input (passthrough — texture uploaded externally by Renderer) ──
 registerShader('VIDEO_INPUT', `#version 300 es
 precision highp float;
@@ -930,6 +1005,156 @@ void main() {
   } else {
     fragColor = texture(u_image, suv);
   }
+}
+`)
+
+// ── Shape Input (procedural SDF shape source) ────────────────────────────────
+// A first-class vector-shape source, peer to image/text: no texture upload, the
+// whole shape is evaluated on the GPU from signed distance fields, so it is
+// resolution-independent and free to animate. Everything outside the shape (and
+// its background) stays transparent, so a shape composites cleanly over lower
+// layers or feeds any downstream effect / mask input.
+//
+// Coordinate convention (shared with the Preview's on-canvas handles):
+//   • Frame units — y ∈ [-0.5, 0.5], x scaled by aspect, so 1.0 unit == the
+//     frame HEIGHT on both axes (a square with width == height is square).
+//   • v_uv.y is UP, so Position Y +1 is the top edge.
+//   • Rotation is counter-clockwise-positive on screen.
+registerShader('SHAPE_INPUT', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform vec2 u_resolution;        // output canvas size
+uniform float u_time;             // seconds (frame-locked during export)
+uniform float u_audio_bands[8];   // always-live FFT bands
+uniform float u_beat;             // always-live beat trigger
+// @param name="Shape" min=0 max=7 default=0 step=1 type=select options="Rectangle,Ellipse,Triangle,Polygon,Star,Ring,Capsule,Cross"
+uniform int u_shp_type;
+// @param name="Width" min=0.0 max=4.0 default=0.6 step=0.01
+uniform float u_shp_w;
+// @param name="Height" min=0.0 max=4.0 default=0.6 step=0.01
+uniform float u_shp_h;
+// @param name="Position X" min=-1.5 max=1.5 default=0.0 step=0.005
+uniform float u_shp_x;
+// @param name="Position Y" min=-1.5 max=1.5 default=0.0 step=0.005
+uniform float u_shp_y;
+// @param name="Rotation" min=-3.1416 max=3.1416 default=0.0 step=0.01
+uniform float u_shp_rot;
+// @param name="Corner Radius" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_shp_corner;
+// @param name="Sides / Points" min=3 max=16 default=5 step=1
+uniform int u_shp_sides;
+// @param name="Inner Ratio" min=0.05 max=1.0 default=0.45 step=0.01
+uniform float u_shp_inner;
+// @param name="Thickness" min=0.002 max=1.0 default=0.12 step=0.002
+uniform float u_shp_thick;
+// @param name="Feather" min=0.0 max=0.5 default=0.0 step=0.002
+uniform float u_shp_feather;
+// @param name="Fill Color" type=color default="#ff2266"
+uniform vec3 u_shp_fill;
+// @param name="Fill Opacity" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_shp_fill_a;
+// @param name="Stroke Width" min=0.0 max=0.5 default=0.0 step=0.002
+uniform float u_shp_stroke;
+// @param name="Stroke Color" type=color default="#ffffff"
+uniform vec3 u_shp_stroke_col;
+// @param name="Background" type=color default="#000000"
+uniform vec3 u_shp_bg;
+// @param name="Background Opacity" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_shp_bg_a;
+// @param name="Spin Speed" min=-2.0 max=2.0 default=0.0 step=0.01
+uniform float u_shp_spin;
+// @param name="Bass Scale" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_bass_scale;
+// @param name="Beat Punch" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_beat_punch;
+out vec4 fragColor;
+
+// Rounded box (exact).
+float sdBox(vec2 p, vec2 b, float r) {
+  vec2 d = abs(p) - b + r;
+  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;
+}
+// Regular n-gon (exact for convex polygons): fold the angle into one segment,
+// then project onto that edge's normal.
+float sdNgon(vec2 p, float r, float n) {
+  float seg = 6.2831853 / n;
+  float a = atan(p.x, p.y);
+  a = mod(a + seg * 0.5, seg) - seg * 0.5;
+  return length(p) * cos(a) - r * cos(seg * 0.5);
+}
+// n-pointed star — radial blend between the outer radius and inner*outer. Not a
+// euclidean SDF, but monotonic across the edge, which is all the feather needs.
+float sdStar(vec2 p, float r, float n, float inner) {
+  float seg = 6.2831853 / n;
+  float a = atan(p.x, p.y);
+  float t = abs(mod(a + seg * 0.5, seg) - seg * 0.5) / (seg * 0.5); // 0 at tip
+  return length(p) - r * mix(1.0, max(inner, 0.02), t);
+}
+// Capsule along X: a bar with round caps (thickness = b.y).
+float sdCapsule(vec2 p, vec2 b) {
+  float hx = max(b.x - b.y, 0.0);
+  return length(vec2(max(abs(p.x) - hx, 0.0), p.y)) - b.y;
+}
+// Non-premultiplied "source over destination" (the pipeline is straight alpha).
+vec4 shapeOver(vec4 s, vec4 d) {
+  float a = s.a + d.a * (1.0 - s.a);
+  if (a <= 0.0) return vec4(0.0);
+  return vec4((s.rgb * s.a + d.rgb * d.a * (1.0 - s.a)) / a, a);
+}
+
+void main() {
+  float aspect = u_resolution.x / max(u_resolution.y, 1.0);
+  vec2 p = vec2((v_uv.x - 0.5) * aspect, v_uv.y - 0.5);
+  vec2 q = p - vec2(u_shp_x * 0.5 * aspect, u_shp_y * 0.5);
+
+  // Rotation (+ constant spin). mat2 is column-major, so this is R(-ang) applied
+  // to the query point == the shape rotating CCW by ang on screen.
+  float ang = u_shp_rot + u_shp_spin * u_time;
+  float ca = cos(ang), sa = sin(ang);
+  q = mat2(ca, -sa, sa, ca) * q;
+
+  // Always-live reactivity: bass swells the shape, beat punches it.
+  float bass = u_audio_bands[1];
+  float grow = 1.0 + bass * u_bass_scale * 1.5 + u_beat * u_beat_punch * 0.5;
+  vec2 he = max(vec2(u_shp_w, u_shp_h) * 0.5 * grow, vec2(0.0));
+  vec2 e = max(he, vec2(0.0001));
+  float m = min(e.x, e.y);   // scale factor back to frame units
+  vec2 n = q / e;            // unit space (radial shapes are authored there)
+  float sides = float(u_shp_sides);
+
+  float d;
+  if (u_shp_type == 1) {                    // Ellipse
+    d = (length(n) - 1.0) * m;
+  } else if (u_shp_type == 2) {             // Triangle
+    d = sdNgon(n, 1.0, 3.0) * m;
+  } else if (u_shp_type == 3) {             // Polygon
+    d = sdNgon(n, 1.0, sides) * m;
+  } else if (u_shp_type == 4) {             // Star
+    d = sdStar(n, 1.0, sides, u_shp_inner) * m;
+  } else if (u_shp_type == 5) {             // Ring
+    d = abs(length(n) - 1.0) * m - u_shp_thick * 0.5;
+  } else if (u_shp_type == 6) {             // Capsule / bar
+    d = sdCapsule(q, vec2(e.x, min(e.y, e.x)));
+  } else if (u_shp_type == 7) {             // Cross (arm width = Inner Ratio)
+    float arm = clamp(u_shp_inner, 0.02, 1.0);
+    float r = min(u_shp_corner * 0.5, m * arm);
+    d = min(sdBox(q, vec2(e.x, e.y * arm), r), sdBox(q, vec2(e.x * arm, e.y), r));
+  } else {                                  // Rectangle (rounded)
+    d = sdBox(q, he, min(u_shp_corner * 0.5, m));
+  }
+
+  // Feather, floored at ~1px so edges are always anti-aliased (1 frame unit ==
+  // u_resolution.y pixels).
+  float aa = max(u_shp_feather * 0.5, 0.75 / max(u_resolution.y, 1.0));
+  float fill = 1.0 - smoothstep(-aa, aa, d);
+  float stroke = u_shp_stroke > 0.0
+    ? 1.0 - smoothstep(-aa, aa, abs(d) - u_shp_stroke * 0.5)
+    : 0.0;
+
+  vec4 col = vec4(u_shp_bg, u_shp_bg_a);
+  col = shapeOver(vec4(u_shp_fill, u_shp_fill_a * fill), col);
+  col = shapeOver(vec4(u_shp_stroke_col, stroke), col);
+  fragColor = col;
 }
 `)
 

@@ -94,6 +94,17 @@
   color: var(--status-error);
 }
 
+/* Shown while the lazy Monaco chunk loads on first open. */
+.monaco-drawer__loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--text-muted, #7a7a8c);
+}
+
 .monaco-drawer__editor-wrapper {
   flex: 1;
   position: relative;

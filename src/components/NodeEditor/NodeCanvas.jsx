@@ -17,6 +17,7 @@ import { getShaderSource } from '../../shaders/shaderRegistry'
 import { instantiatePreset, instantiateUserCompound } from '../../shaders/compoundPresets'
 import { generateCombinedShader } from '../../shaders/shaderGenerator'
 import { getNodeSockets, getSocketYOffset, canConnect } from '../../shaders/nodeDefinitions'
+import { getDataNodeParams } from '../../shaders/dataNodeParams'
 import './NodeCanvas.css'
 
 const EXCLUDED_FROM_MARQUEE = new Set([
@@ -167,33 +168,13 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       }
       map[node.id] = params
     }
+    // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) have
+    // no @param directives to parse — their configs come from dataNodeParams,
+    // the single source shared with the Inspector and the compound surface.
     for (const node of graph.nodes) {
-      if (node.type === 'MATH' && !map[node.id]?.length) {
-        map[node.id] = [
-          { name: 'Operation', uniformName: 'operation', type: 'select', options: ['Add', 'Subtract', 'Multiply', 'Divide', 'Sine', 'Cosine', 'Absolute', 'Min', 'Max', 'Greater Than', 'Less Than'], default: 0 },
-          { name: 'Value A', uniformName: 'value_a', type: 'slider', min: -100, max: 100, step: 0.01, default: 0 },
-          { name: 'Value B', uniformName: 'value_b', type: 'slider', min: -100, max: 100, step: 0.01, default: 1 },
-        ]
-      }
-      // ENVELOPE is shaderless (CPU float processor, like MATH): attack/release
-      // smoothing + gate + gain over any float signal wired into it.
-      if (node.type === 'ENVELOPE' && !map[node.id]?.length) {
-        map[node.id] = [
-          { name: 'Attack', uniformName: 'attack', type: 'slider', min: 0.001, max: 1, step: 0.001, default: 0.05 },
-          { name: 'Release', uniformName: 'release', type: 'slider', min: 0.01, max: 2, step: 0.01, default: 0.35 },
-          { name: 'Threshold', uniformName: 'threshold', type: 'slider', min: 0, max: 0.95, step: 0.01, default: 0 },
-          { name: 'Gain', uniformName: 'gain', type: 'slider', min: 0, max: 4, step: 0.05, default: 1 },
-        ]
-      }
-      // TRANSITION_PROGRESS is shaderless (CPU float source). The preview
-      // controls only drive its output while no clip transition is running, so
-      // a transition compound can be authored and watched live in the editor.
-      if (node.type === 'TRANSITION_PROGRESS' && !map[node.id]?.length) {
-        map[node.id] = [
-          { name: 'Auto Preview', uniformName: 'auto_preview', type: 'checkbox', default: true },
-          { name: 'Preview', uniformName: 'preview', type: 'slider', min: 0, max: 1, step: 0.01, default: 0.5 },
-          { name: 'Preview Speed', uniformName: 'preview_speed', type: 'slider', min: 0.05, max: 2, step: 0.05, default: 0.25 },
-        ]
+      if (!map[node.id]?.length) {
+        const dataParams = getDataNodeParams(node.type)
+        if (dataParams.length) map[node.id] = dataParams
       }
     }
     return map
@@ -598,6 +579,9 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
         defaultParams.imageSrc = payload.imageSrc
         defaultParams.imageName = payload.imageName || payload.name || ''
       }
+      // Preset cards (e.g. Media Pool shapes) carry a param patch — apply it so
+      // the dropped node looks like the card you dragged, not the bare default.
+      if (payload.params) Object.assign(defaultParams, payload.params)
       const newId = addNode(graphLevel, graphClipId, {
         type: payload.nodeType, name: payload.name, position: basePos,
         params: defaultParams, shaderCode: payload.nodeType === 'CUSTOM' ? shaderCode : null,

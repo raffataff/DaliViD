@@ -53,6 +53,18 @@ const SHORTCUTS = [
     ]
   },
   {
+    // Gizmo for the selected shape node / shape clip, drawn over the preview.
+    category: 'Shape Handles (Preview)',
+    items: [
+      { keys: ['Drag Shape'], desc: 'Move (snaps to center / thirds)' },
+      { keys: ['Drag Corner'], desc: 'Resize from the center' },
+      { keys: ['Shift', 'Drag Corner'], desc: 'Resize Uniformly' },
+      { keys: ['Drag ○ Handle'], desc: 'Rotate (Shift = 15° steps)' },
+      { keys: ['Shift', 'Drag Shape'], desc: 'Move on One Axis' },
+      { keys: ['Alt', 'Drag Shape'], desc: 'Move without Snapping' },
+    ]
+  },
+  {
     category: 'Project',
     items: [
       { keys: ['Ctrl', 'S'], desc: 'Save Project' },

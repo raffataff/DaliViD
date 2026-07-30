@@ -39,6 +39,8 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
       bpm: app.bpm,
       beatOffset: app.beatOffset,
       beatGridEnabled: app.beatGridEnabled,
+      // Delivery framing (widescreen bars) is a project setting, not a node.
+      masterBars: { ...app.masterBars },
     },
 
     timeline: {
@@ -187,6 +189,12 @@ export function deserializeProject(data, getAppStore) {
       bpm: data.project.bpm ?? 120,
       beatOffset: data.project.beatOffset ?? 0,
       beatGridEnabled: !!data.project.beatGridEnabled,
+      // Older projects have no bars block — fall back to the "off" defaults so a
+      // missing field can't silently letterbox someone's edit.
+      masterBars: {
+        enabled: false, aspect: 2.39, color: '#000000', opacity: 1, feather: 0, offset: 0, zoom: 0,
+        ...(data.project.masterBars || {}),
+      },
     })
   }
 
@@ -328,18 +336,67 @@ export async function deleteProject(projectId) {
 }
 
 /**
- * Export project as a JSON file download.
+ * Save the project to a .dalivid.json file the user chooses.
+ *
+ * Prefers `showSaveFilePicker` (a real Save As dialog) over the anchor download,
+ * so the file lands where the user wants it and re-saving can overwrite the same
+ * file instead of piling up `project (3).json` in Downloads. Like the recording
+ * sink, the picker grants write access to exactly ONE user-named file and nothing
+ * is persisted between sessions — it stays inside the zero-standing-authority
+ * model that replaced folder linking.
+ *
+ * The picker needs transient user activation, so this must be called straight
+ * from a click handler and it opens the dialog *before* serializing (a project
+ * with big image data URLs can spend real time in JSON.stringify).
+ *
+ * @returns {Promise<'picker'|'download'|'cancelled'>} how, or whether, it saved.
  */
-export function exportProjectAsJSON(getAppStore, getGraphStore, getTimelineStore) {
+export async function exportProjectAsJSON(getAppStore, getGraphStore, getTimelineStore) {
+  const safeName = (getAppStore().projectName || 'project').replace(/[^a-zA-Z0-9_-]/g, '_')
+
+  // 1. Save As dialog (primary). Grab the handle first, while activation is live.
+  let fileHandle = null
+  if (typeof window !== 'undefined' && window.showSaveFilePicker) {
+    try {
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: `${safeName}.dalivid.json`,
+        startIn: 'documents',
+        types: [{
+          description: 'DaliViD Project',
+          accept: { 'application/json': ['.dalivid.json', '.json'] },
+        }],
+      })
+    } catch (err) {
+      if (err?.name === 'AbortError') return 'cancelled'  // user dismissed the dialog
+      console.warn('[ProjectSerializer] Save picker unavailable, falling back to download:', err)
+    }
+  }
+
   const data = serializeProject(getAppStore, getGraphStore, getTimelineStore)
   const json = JSON.stringify(data, null, 2)
+
+  if (fileHandle) {
+    const writable = await fileHandle.createWritable()
+    try {
+      await writable.write(json)
+      await writable.close()
+    } catch (err) {
+      await writable.abort?.()
+      throw err
+    }
+    return 'picker'
+  }
+
+  // 2. Anchor download fallback (Firefox/Safari, or a blocked picker). Timestamped
+  // because there's no dialog here to ask about overwriting.
   const blob = new Blob([json], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `${data.project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}.dalivid.json`
+  a.download = `${safeName}_${Date.now()}.dalivid.json`
   a.click()
   URL.revokeObjectURL(url)
+  return 'download'
 }
 
 /**
@@ -372,159 +429,131 @@ export function importProjectFromJSON() {
 }
 
 /**
- * Copy a file object to a directory's subfolder (e.g. 'media' or 'audio')
+ * Prompt for media files to relink after a JSON import.
+ *
+ * A file input grants a one-shot read of exactly the files the user picked in
+ * that gesture. No handle is created, nothing is persisted, and the grant dies
+ * with the page — so a tampered bundle gets nothing unless the user actively
+ * picks files for it. This is why folder linking could be removed outright.
  */
-export async function copyFileToProjectFolder(projectDirHandle, file, folderName) {
-  try {
-    const subDirHandle = await projectDirHandle.getDirectoryHandle(folderName, { create: true })
-    const fileHandle = await subDirHandle.getFileHandle(file.name, { create: true })
-    const writable = await fileHandle.createWritable()
-    await writable.write(file)
-    await writable.close()
-    console.log(`[ProjectSerializer] Copied ${file.name} to project folder /${folderName}`)
-    return fileHandle
-  } catch (err) {
-    console.error('[ProjectSerializer] Failed to copy file to folder:', err)
-    throw err
-  }
+export function pickMediaFiles() {
+  return new Promise((resolve) => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.multiple = true
+    input.accept = 'video/*,audio/*'
+    input.addEventListener('change', (e) => resolve([...(e.target.files || [])]), { once: true })
+    // Chrome fires 'cancel' on dismissal; without it the promise would hang and
+    // the caller's toast would never fire.
+    input.addEventListener('cancel', () => resolve([]), { once: true })
+    input.click()
+  })
 }
 
 /**
- * Save project.json directly to the project folder.
+ * Relink timeline media from user-picked files, matching by filename.
+ *
+ * The folder-free restore path: a JSON export keeps the edit (and images, which
+ * are inlined as data URLs in node.params.imageSrc) but not video/audio bytes,
+ * so on import we ask for the media once and rebuild blob URLs by name.
+ * Live sources and generator clips are skipped — they have no on-disk media.
  */
-export async function saveProjectToFolder(projectDirHandle, getAppStore, getGraphStore, getTimelineStore) {
-  const data = serializeProject(getAppStore, getGraphStore, getTimelineStore)
-
-  // Also ensure folder structure is initialized
-  await projectDirHandle.getDirectoryHandle('media', { create: true })
-  await projectDirHandle.getDirectoryHandle('audio', { create: true })
-  await projectDirHandle.getDirectoryHandle('renders', { create: true })
-
-  // Persist the actual media files into the folder so the project is
-  // self-contained and can be restored later. Blob URLs are only valid for the
-  // current session, so we fetch each clip's bytes now and write them to disk.
-  // Dead URLs (e.g. clips from a project loaded without its media) simply fail
-  // the fetch and are skipped.
-  const timeline = getTimelineStore()
-  const persisted = new Set()
-  for (const clip of (timeline.clips || [])) {
-    if (!clip.fileUrl || !clip.filename || persisted.has(clip.filename)) continue
-    persisted.add(clip.filename)
-    const folderName = clip.fileType === 'audio' ? 'audio' : 'media'
-    try {
-      const resp = await fetch(clip.fileUrl)
-      const blob = await resp.blob()
-
-      // Skip the (potentially large) write if an identically-sized copy already
-      // exists in the folder. Keeps the 2-second autosave cheap.
-      try {
-        const sub = await projectDirHandle.getDirectoryHandle(folderName)
-        const existing = await (await sub.getFileHandle(clip.filename)).getFile()
-        if (existing.size === blob.size) continue
-      } catch { /* not present yet — fall through and write it */ }
-
-      const file = new File([blob], clip.filename, { type: blob.type || 'application/octet-stream' })
-      await copyFileToProjectFolder(projectDirHandle, file, folderName)
-    } catch (err) {
-      console.warn(`[ProjectSerializer] Could not persist media "${clip.filename}" to folder (source unavailable):`, err)
-    }
+export function relinkMediaFromFiles(files, clips, updateClipAction) {
+  const byName = new Map()
+  for (const file of files) {
+    if (!byName.has(file.name)) byName.set(file.name, file)
   }
 
-  const fileHandle = await projectDirHandle.getFileHandle('project.json', { create: true })
-  const writable = await fileHandle.createWritable()
-  await writable.write(JSON.stringify(data, null, 2))
-  await writable.close()
-
-  console.log('[ProjectSerializer] Saved project to folder:', data.project.name)
-  return data
-}
-
-/**
- * Load project.json from the project folder.
- */
-export async function loadProjectFromFolder(projectDirHandle) {
-  try {
-    const fileHandle = await projectDirHandle.getFileHandle('project.json')
-    const file = await fileHandle.getFile()
-    const text = await file.text()
-    return JSON.parse(text)
-  } catch (err) {
-    console.error('[ProjectSerializer] Failed to load project.json from folder:', err)
-    return null
-  }
-}
-
-/**
- * Scan timeline clips, read the local files from the project folder,
- * generate Blob URLs, and update the clips' fileUrl property in the timeline store.
- */
-export async function restoreMediaFilesFromFolder(projectDirHandle, clips, updateClipAction) {
-  let restoredCount = 0
+  const urlByName = new Map()
   const missing = []
+  const unused = new Set(byName.keys())
+  let restoredCount = 0
+
   for (const clip of clips) {
     if (!clip.filename) continue
-    // Live-source clips (camera/screen) are backed by a MediaStream, not a file —
-    // they have no on-disk media to restore, so skip them (otherwise they wrongly
-    // land in the "missing media" warning list). Screen clips reconnect via the
-    // MediaPool Screen tab's Reconnect button instead.
+    // Live sources (camera/screen) are MediaStream-backed and generators
+    // (text/image) are self-contained in params — neither has on-disk media,
+    // so neither belongs in the "missing" list.
     if (clip.fileType === 'camera' || clip.fileType === 'screen') continue
-    // Generator clips (text/image) are self-contained in params (no on-disk
-    // media) — nothing to relink.
     if (clip.fileType === 'text' || clip.fileType === 'image') continue
-    // If the fileUrl is missing (or is a stale blob URL from a previous session), restore it!
-    const folderName = clip.fileType === 'audio' ? 'audio' : 'media'
-    try {
-      const subDirHandle = await projectDirHandle.getDirectoryHandle(folderName)
-      const fileHandle = await subDirHandle.getFileHandle(clip.filename)
-      const file = await fileHandle.getFile()
-      const url = URL.createObjectURL(file)
 
-      // Update clip url in store
-      updateClipAction(clip.id, { fileUrl: url })
-
-      restoredCount++
-    } catch (err) {
+    const file = byName.get(clip.filename)
+    if (!file) {
       if (!missing.includes(clip.filename)) missing.push(clip.filename)
-      console.warn(`[ProjectSerializer] Could not restore file ${clip.filename} from ${folderName} folder:`, err)
+      continue
     }
+    unused.delete(clip.filename)
+
+    // One blob URL per file, not per clip: splits and reuse mean several clips
+    // commonly share a source, and a URL each would leak them.
+    let url = urlByName.get(clip.filename)
+    if (!url) {
+      url = URL.createObjectURL(file)
+      urlByName.set(clip.filename, url)
+    }
+    updateClipAction(clip.id, { fileUrl: url })
+    restoredCount++
   }
-  console.log(`[ProjectSerializer] Restored ${restoredCount} media files from folder.`)
-  return { restoredCount, missing }
+
+  console.log(`[ProjectSerializer] Relinked ${restoredCount} clip(s) from ${urlByName.size} file(s).`)
+  return { restoredCount, missing, unused: [...unused] }
 }
 
 /**
- * Verify and request directory permission if needed.
+ * Filenames a project's clips expect on disk — used to tell the user what to
+ * pick before the relink prompt opens.
  */
-export async function verifyDirectoryPermission(fileHandle, readWrite = true) {
-  const options = {}
-  if (readWrite) {
-    options.mode = 'readwrite'
+export function getExpectedMediaFilenames(clips) {
+  const names = []
+  for (const clip of (clips || [])) {
+    if (!clip.filename) continue
+    if (clip.fileType === 'camera' || clip.fileType === 'screen') continue
+    if (clip.fileType === 'text' || clip.fileType === 'image') continue
+    if (!names.includes(clip.filename)) names.push(clip.filename)
   }
+  return names
+}
+
+/**
+ * Delete any directory handles persisted by the old project-folder feature.
+ *
+ * Folder linking is gone (see CLAUDE.md). Handles written by earlier versions
+ * are still sitting in IndexedDB under `project_folder_<id>`, and a stored
+ * handle is a standing readwrite grant over the user's folder that they can no
+ * longer see or revoke from inside the app — so we actively clear them on
+ * startup rather than leaving them to rot.
+ */
+export async function purgeStoredFolderHandles() {
   try {
-    // Check if permission was already granted
-    if ((await fileHandle.queryPermission(options)) === 'granted') {
-      return true
-    }
-    // Request permission
-    if ((await fileHandle.requestPermission(options)) === 'granted') {
-      return true
+    const allKeys = await idbKeys()
+    const stale = allKeys.filter(k => typeof k === 'string' && k.startsWith('project_folder_'))
+    for (const key of stale) await idbDel(key)
+    if (stale.length > 0) {
+      console.log(`[ProjectSerializer] Cleared ${stale.length} stored folder handle(s) from a previous version.`)
     }
   } catch (err) {
-    console.error('[ProjectSerializer] Permission verification failed:', err)
+    console.warn('[ProjectSerializer] Could not purge stored folder handles:', err)
   }
-  return false
 }
 
 /**
- * Save directory handle to IndexedDB
+ * Ask the browser not to evict this origin's storage.
+ *
+ * Autosave now lives only in IndexedDB, which is best-effort by default and can
+ * be cleared under storage pressure — so this is the difference between "your
+ * project survives" and "your project quietly vanished". Chrome usually grants
+ * it silently for engaged sites; a refusal is not an error, it just means the
+ * "Save Project File" download is the only durable copy.
  */
-export async function saveProjectFolderHandle(projectId, handle) {
-  await idbSet(`project_folder_${projectId}`, handle)
-}
-
-/**
- * Load directory handle from IndexedDB
- */
-export async function loadProjectFolderHandle(projectId) {
-  return await idbGet(`project_folder_${projectId}`)
+export async function requestPersistentStorage() {
+  try {
+    if (!navigator.storage?.persist) return false
+    if (await navigator.storage.persisted()) return true
+    const granted = await navigator.storage.persist()
+    console.log(`[ProjectSerializer] Persistent storage ${granted ? 'granted' : 'not granted'}.`)
+    return granted
+  } catch (err) {
+    console.warn('[ProjectSerializer] Persistent storage request failed:', err)
+    return false
+  }
 }

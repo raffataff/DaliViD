@@ -2,9 +2,20 @@
    DaliVid — Global Design Tokens & Reset
    ═══════════════════════════════════════════════════════════ */
 
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap');
+/* Fonts are self-hosted and imported in main.jsx (@fontsource-variable/*).
+   Do not reintroduce a Google Fonts @import — the production CSP blocks
+   external stylesheets, so it would silently fall back to system fonts. */
 
 :root {
+  /* The native <select> popup, <input type=color/date/number> spinners and the
+     default scrollbars are drawn by the browser using the page's color scheme.
+     Without this the popup list renders WHITE, and each <option> inherits the
+     select's own `color` (e.g. the node card's green) → unreadable low-contrast
+     text that only becomes legible under the OS hover highlight. Declaring the
+     scheme is the only way to restyle a native popup; `option { background }`
+     alone is ignored on macOS. */
+  color-scheme: dark;
+
   /* ── Backgrounds ── */
   --bg-base: #0d0d0f;
   --bg-primary: #141418;
@@ -42,8 +53,11 @@
   --text-disabled: #555566;
 
   /* ── Typography ── */
-  --font-ui: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-code: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  /* Fontsource's variable builds register the family with a " Variable" suffix;
+     the bare names are kept next in line so a locally-installed copy still wins
+     over the system stack if the bundled font ever fails to load. */
+  --font-ui: 'DM Sans Variable', 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-code: 'JetBrains Mono Variable', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
 
   /* ── Spacing ── */
   --space-xxs: 2px;
@@ -170,6 +184,40 @@ input, select, textarea {
 input:focus, select:focus, textarea:focus {
   border-color: var(--accent-cyan);
   box-shadow: 0 0 0 1px var(--accent-cyan-glow);
+}
+
+/* ── Native <select> popup ──
+   Options inherit the select's `color` by default, so any select with a custom
+   text colour produces an unreadable popup. Pin both channels explicitly here
+   (Chromium/Windows honours this; `color-scheme: dark` above covers the rest of
+   the popup chrome and macOS/Firefox). `!important` because option colour is
+   inherited from the select, which is nearly always more specific. */
+select option,
+select optgroup {
+  background-color: var(--bg-elevated) !important;
+  color: var(--text-primary) !important;
+  font-family: var(--font-ui);
+  /* Chromium adds no padding of its own on Windows — options otherwise touch
+     the popup edge. */
+  padding: var(--space-xs) var(--space-sm);
+}
+
+select option:checked {
+  background-color: var(--bg-active) !important;
+  color: var(--accent-cyan) !important;
+  font-weight: 600;
+}
+
+select option:disabled {
+  color: var(--text-disabled) !important;
+}
+
+select optgroup {
+  color: var(--text-muted) !important;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 /* ── Utility Classes ── */

@@ -16,8 +16,7 @@ import useAppStore from './store/useAppStore'
 import useGraphStore from './store/useGraphStore'
 import useTimelineStore from './store/useTimelineStore'
 import {
-  saveProject, saveProjectToFolder,
-  verifyDirectoryPermission
+  saveProject, requestPersistentStorage, purgeStoredFolderHandles
 } from './utils/projectSerializer'
 import { initHistory, undo, redo } from './utils/history'
 
@@ -73,25 +72,16 @@ const clearSelection = useAppStore(s => s.clearSelection)
     }, [])
 
     // ── Save / Autosave (defined first — used by keyboard shortcut handler below) ──
-   const handleSaveProject = useCallback(async () => {
+   // Saves to IndexedDB. `silent` suppresses the toast so the 2-second autosave
+   // doesn't spam a notification every time the user nudges a slider.
+   const handleSaveProject = useCallback(async (silent = false) => {
      const appState = useAppStore.getState()
-     const folderHandle = appState.projectFolderHandle
      try {
        appState.markSaving()
-       if (folderHandle) {
-         const hasPermission = await verifyDirectoryPermission(folderHandle, true)
-         if (hasPermission) {
-           await saveProjectToFolder(folderHandle, useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
-           await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
-           appState.markSaved()
-           addToast({ message: 'Project saved to folder', type: 'success' })
-         } else {
-           addToast({ message: 'Permission denied to save in folder', type: 'error' })
-         }
-       } else {
-         await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
-         appState.markSaved()
-         addToast({ message: 'Project saved to browser cache. Link a folder for full save.', type: 'info' })
+       await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
+       appState.markSaved()
+       if (!silent) {
+         addToast({ message: 'Saved to this browser. Use "Save Project File" for a copy on disk.', type: 'info' })
        }
      } catch (err) {
        console.error(err)
@@ -105,7 +95,7 @@ const clearSelection = useAppStore(s => s.clearSelection)
      autosaveTimerRef.current = setTimeout(async () => {
        const appState = useAppStore.getState()
        if (appState.autosaveState === 'unsaved') {
-         await handleSaveProject()
+         await handleSaveProject(true)
        }
      }, 2000)
    }, [handleSaveProject])
@@ -123,6 +113,37 @@ const clearSelection = useAppStore(s => s.clearSelection)
        if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current)
      }
    }, [triggerAutosave])
+
+   // ── Durability safeguards ──
+   // The project now lives only in IndexedDB until the user downloads a project
+   // file, and IndexedDB is evictable by default. Ask the browser to keep it,
+   // and clear any directory handles left behind by the old folder feature (a
+   // stored handle is a standing readwrite grant the user can no longer revoke
+   // from inside the app).
+   useEffect(() => {
+     requestPersistentStorage()
+     purgeStoredFolderHandles()
+   }, [])
+
+   // Warn before leaving with work that exists nowhere but this browser.
+   // lastExportTime is set by "Save Project File"; lastSaveTime by any save. If
+   // edits are newer than the last download — and there's actually something to
+   // lose — the browser shows its generic "Leave site?" confirmation.
+   useEffect(() => {
+     const onBeforeUnload = (e) => {
+       const { lastSaveTime, lastExportTime } = useAppStore.getState()
+       const hasContent =
+         useTimelineStore.getState().clips?.length > 0 ||
+         useGraphStore.getState().masterGraph?.nodes?.length > 0
+       const undownloaded = lastSaveTime && (!lastExportTime || lastExportTime < lastSaveTime)
+       if (hasContent && undownloaded) {
+         e.preventDefault()
+         e.returnValue = ''
+       }
+     }
+     window.addEventListener('beforeunload', onBeforeUnload)
+     return () => window.removeEventListener('beforeunload', onBeforeUnload)
+   }, [])
 
    // Viewport check
    useEffect(() => {

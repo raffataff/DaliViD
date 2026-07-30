@@ -8,7 +8,7 @@ import './NodeCard.css'
 
 export const NODE_COLORS = {
   'CLIP_SOURCE': '#44cc88', 'CLIP_OUTPUT': '#ff6644', 'VIDEO_INPUT': '#44cc88',
-  'IMAGE_INPUT': '#44cc88', 'TEXT_INPUT': '#ffcc44',
+  'IMAGE_INPUT': '#44cc88', 'TEXT_INPUT': '#ffcc44', 'SHAPE_INPUT': '#ff5588', 'LETTERBOX': '#8899aa',
   'CAMERA_INPUT': '#44aaff', 'SCREEN_INPUT': '#44aaff', 'AUDIO_INPUT': '#ff00aa', 'AUDIO_SPLITTER': '#cc44ff',
   'AUDIO_VISUALIZER': '#ff00aa', 'OUTPUT': '#ff6644', 'EDGE_DETECTION': '#ff8844',
   'COLOR_INVERSION': '#ff44cc', 'GLITCH': '#ff3344', 'FEEDBACK': '#aa44ff',
@@ -16,7 +16,7 @@ export const NODE_COLORS = {
   'BLOOM': '#ffcc44', 'CRT': '#88aa44', 'VORONOI': '#44ffaa', 'FLUID_WARP': '#4488ff',
   'HALFTONE': '#aaaacc', 'THRESHOLD': '#ccaa44', 'DEPTH_BLUR': '#44aacc',
   'MIRROR': '#cc44ff', 'PARTICLE': '#ff6644', 'LUT': '#ffaa44',
-  'MATH_BLEND': '#aaccff', 'MIX_BLEND': '#aaccff', 'MATH': '#ffdd00', 'TRANSITION_PROGRESS': '#ffdd00', 'ENVELOPE': '#ffdd00',
+  'MATH_BLEND': '#aaccff', 'MIX_BLEND': '#aaccff', 'MATH': '#ffdd00', 'TRANSITION_PROGRESS': '#ffdd00', 'ENVELOPE': '#ffdd00', 'TIME': '#ffdd00',
   'CUSTOM': '#00e5ff', 'COMPOUND': '#ff00aa',
   'AUDIO_WARP': '#ff00aa', 'SPECTRUM_GLOW': '#ff00aa',
   'EFFECT_INPUT': '#44cc88', 'EFFECT_OUTPUT': '#ff6644',
@@ -30,6 +30,13 @@ export const NODE_COLORS = {
 // Must match .node-card { width } in NodeCard.css — marquee hit-testing and the
 // socket-position fallback in NodeCanvas both derive geometry from this.
 export const NODE_WIDTH = 270
+
+// On-card quick shape switcher for SHAPE_INPUT — [glyph, u_shp_type, tooltip].
+// Indices match the SHAPE_INPUT shader's "Shape" select options.
+const SHAPE_QUICK_PICKS = [
+  ['▭', 0, 'Rectangle'], ['●', 1, 'Ellipse'], ['▲', 2, 'Triangle'], ['⬡', 3, 'Polygon'],
+  ['★', 4, 'Star'], ['◎', 5, 'Ring'], ['▬', 6, 'Capsule'], ['✚', 7, 'Cross'],
+]
 
 function ParamSlider({ nodeId, param, value, onChange, hasAudioBind, disabled = false }) {
   const [isEditing, setIsEditing] = useState(false)
@@ -200,6 +207,7 @@ const NodeCard = memo(function NodeCard({
   // ── Image source: load / replace the still image on this node ──
   const isImageNode = node.type === 'IMAGE_INPUT'
   const isTextNode = node.type === 'TEXT_INPUT'
+  const isShapeNode = node.type === 'SHAPE_INPUT'
 
   const readImageFile = useCallback(async (file) => {
     if (!file || !file.type?.startsWith('image/')) return
@@ -375,6 +383,36 @@ const NodeCard = memo(function NodeCard({
           <div className="mono" style={{ fontSize: 9, color: '#888899' }}>
             Style in the Inspector →
           </div>
+        </div>
+      )}
+
+      {isShapeNode && (
+        // Quick shape switcher — the same u_shp_type the "Shape" dropdown sets,
+        // one click away (the dropdown still lives in the params list below).
+        <div
+          className="node-card__shape-picker"
+          onMouseDown={(e) => e.stopPropagation()}
+          style={{ padding: '6px 8px 0', display: 'flex', gap: 3, flexWrap: 'wrap' }}
+        >
+          {SHAPE_QUICK_PICKS.map(([glyph, type, label]) => {
+            const active = (node.params?.u_shp_type ?? 0) === type
+            return (
+              <button
+                key={type}
+                className="node-card__action-btn"
+                data-tooltip={label}
+                onClick={(e) => { e.stopPropagation(); onParamChange?.(node.id, 'u_shp_type', type) }}
+                style={{
+                  width: 26, height: 22, fontSize: 12, lineHeight: 1,
+                  color: active ? '#0a0a0e' : accentColor,
+                  background: active ? accentColor : 'transparent',
+                  borderColor: accentColor,
+                }}
+              >
+                {glyph}
+              </button>
+            )
+          })}
         </div>
       )}
 

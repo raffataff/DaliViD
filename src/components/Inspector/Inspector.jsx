@@ -5,7 +5,10 @@ import useTimelineStore from '../../store/useTimelineStore'
 import { parseParams } from '../../utils/paramParser'
 import { prepareImageDataURL } from '../../utils/imageProcessing'
 import { TEXT_FONTS } from '../../utils/textRenderer'
-import { getNodeSource } from '../../shaders/shaderRegistry'
+import { getNodeSource, getShaderSource } from '../../shaders/shaderRegistry'
+import { getDataNodeParams } from '../../shaders/dataNodeParams'
+import { SHAPE_PRESETS } from '../../utils/generatorClips'
+import { ASPECT_PRESETS } from '../../utils/aspectPresets'
 import { BLEND_MODE_NAMES } from '../../gl/BlendModes.glsl.js'
 import { TRANSITION_TYPES, getTransitionLabel, getTransitionParams, getTransitionDefaults } from '../../shaders/transitionRegistry.js'
 import { isTransitionCompound } from '../../utils/compoundUtils'
@@ -82,6 +85,12 @@ function ProjectInspector() {
   const resolution = useAppStore(s => s.resolution)
   const setFps = useAppStore(s => s.setFps)
   const setResolution = useAppStore(s => s.setResolution)
+  const masterBars = useAppStore(s => s.masterBars)
+  const setMasterBars = useAppStore(s => s.setMasterBars)
+
+  const bars = masterBars || {}
+  const projectAspect = resolution.height ? resolution.width / resolution.height : 16 / 9
+  const barAxis = (bars.aspect || 2.39) < projectAspect ? 'vertical (pillarbox)' : 'horizontal (letterbox)'
 
   return (
     <div className="inspector__section">
@@ -102,6 +111,24 @@ function ProjectInspector() {
         </div>
       </div>
       <div className="inspector__field"><label className="inspector__label">Color Space</label><span className="inspector__value">sRGB</span></div>
+
+      {/* ── Widescreen bars ──
+          Final pass of the master pipeline, so it shows in the preview and bakes
+          into exports. Per-clip / per-graph framing is the LETTERBOX node. */}
+      <div className="inspector__section-header" style={{ marginTop: 16 }}>Widescreen Bars</div>
+      <FieldCheck label="Enabled" value={bars.enabled} onChange={(v) => setMasterBars({ enabled: v })} />
+      <FieldSelect label="Aspect" value={String(bars.aspect ?? 2.39)}
+        options={ASPECT_PRESETS.map(a => ({ label: a.label, value: String(a.value) }))}
+        onChange={(v) => setMasterBars({ aspect: parseFloat(v) })} />
+      <FieldColor label="Bar Color" value={bars.color} def="#000000" onChange={(v) => setMasterBars({ color: v })} />
+      <FieldNum label="Bar Opacity" value={bars.opacity} def={1} min={0} max={1} step={0.01} onChange={(v) => setMasterBars({ opacity: v })} />
+      <FieldNum label="Feather" value={bars.feather} def={0} min={0} max={0.2} step={0.002} onChange={(v) => setMasterBars({ feather: v })} />
+      <FieldNum label="Offset" value={bars.offset} def={0} min={-1} max={1} step={0.01} onChange={(v) => setMasterBars({ offset: v })} />
+      <FieldNum label="Zoom to Fill" value={bars.zoom} def={0} min={0} max={1} step={0.01} onChange={(v) => setMasterBars({ zoom: v })} />
+      <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '0 8px 6px' }}>
+        {resolution.width}×{resolution.height} is {projectAspect.toFixed(2)}:1 — bars will be {barAxis}
+      </div>
+
       <div className="inspector__section-header" style={{ marginTop: 16 }}>Shader Settings</div>
       <div className="inspector__field"><label className="inspector__label">Precision</label><span className="inspector__value inspector__value--mono">highp float</span></div>
       <div className="inspector__field"><label className="inspector__label">Dithering</label><label className="inspector__toggle"><input type="checkbox" /><span className="inspector__toggle-slider" /></label></div>
@@ -158,7 +185,10 @@ function NodeInspector({ nodeId, graphLevel, clipId }) {
   }
 
   const shaderSrc = getNodeSource(node)
-  const paramConfigs = parseParams(shaderSrc)
+  // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) have no
+  // @param directives, so their controls come from the shared table — which also
+  // gives them Inspector-side keyframing, like every other param.
+  const paramConfigs = shaderSrc ? parseParams(shaderSrc) : getDataNodeParams(node.type)
   const isParamConnected = (paramName) => {
     return graph?.edges?.some(edge => edge.toNode === nodeId && edge.toSocket === paramName) || false
   }
@@ -243,13 +273,10 @@ function CompoundInspector({ node, graphLevel, clipId, onUpdateExposedParam, onE
   // Gather all inner params grouped by node
   const innerParamsByNode = []
   for (const innerNode of innerNodes) {
-    let params
-    if (innerNode.type === 'MATH') {
-      params = [
-        { name: 'Value A', uniformName: 'value_a', type: 'slider', min: -100, max: 100, step: 0.01, default: 0 },
-        { name: 'Value B', uniformName: 'value_b', type: 'slider', min: -100, max: 100, step: 0.01, default: 1 },
-      ]
-    } else {
+    // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) get
+    // their configs from the shared table; everything else parses its shader.
+    let params = getDataNodeParams(innerNode.type)
+    if (!params.length) {
       const shaderSrc = getNodeSource(innerNode)
       params = shaderSrc ? parseParams(shaderSrc) : []
     }
@@ -554,6 +581,45 @@ function ImageStyleEditor({ params, onChange, onReplaceImage }) {
   )
 }
 
+// Shape editor — a shape is defined entirely by the SHAPE_INPUT shader's
+// uniforms, so the controls are generated from the shader itself (same @param
+// configs the node card parses). One source of truth: adding a @param to the
+// shader surfaces it here and on the node with no extra UI code.
+function ShapeStyleEditor({ params, onChange, onApplyPreset }) {
+  const configs = parseParams(getShaderSource('SHAPE_INPUT'))
+  const p = params || {}
+  return (
+    <>
+      <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap', padding: '0 8px 8px' }}>
+        {SHAPE_PRESETS.map(preset => (
+          <button
+            key={preset.id}
+            className="inspector__btn"
+            title={preset.name}
+            onClick={() => onApplyPreset(preset)}
+            style={{ width: 28, height: 24, padding: 0, fontSize: 13, lineHeight: 1 }}
+          >
+            {preset.icon}
+          </button>
+        ))}
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '0 8px 6px' }}>
+        Drag the handles in the Preview to move, scale and rotate
+      </div>
+      {configs.map(cfg => (
+        <InspectorParam
+          key={cfg.uniformName}
+          nodeId={`shape_${cfg.uniformName}`}
+          param={cfg}
+          value={p[cfg.uniformName] ?? cfg.default}
+          onChange={(v) => onChange(cfg.uniformName, v)}
+          isConnected={false}
+        />
+      ))}
+    </>
+  )
+}
+
 function ClipInspector({ clipId }) {
   const clips = useTimelineStore(s => s.clips)
   const updateClip = useTimelineStore(s => s.updateClip)
@@ -627,6 +693,17 @@ function ClipInspector({ clipId }) {
         <>
           <div className="inspector__section-header" style={{ marginTop: 12 }}>Image</div>
           <ImageStyleEditor params={clip.params || {}} onChange={setParam} onReplaceImage={replaceImage} />
+        </>
+      )}
+
+      {clip.fileType === 'shape' && (
+        <>
+          <div className="inspector__section-header" style={{ marginTop: 12 }}>Shape</div>
+          <ShapeStyleEditor
+            params={clip.params || {}}
+            onChange={setParam}
+            onApplyPreset={(preset) => updateClip(clipId, { params: { ...clip.params, ...preset.params } })}
+          />
         </>
       )}
 

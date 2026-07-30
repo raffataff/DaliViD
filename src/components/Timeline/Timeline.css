@@ -317,9 +317,119 @@
   z-index: 2;
 }
 .timeline__clip-keyframes .timeline__keyframe {
-  width: 6px;
-  height: 6px;
+  width: 9px;
+  height: 9px;
+  pointer-events: auto;
+  cursor: grab;
+}
+.timeline__clip-keyframes .timeline__keyframe--dragging {
+  cursor: grabbing;
+  background: var(--accent-cyan);
+  transform: rotate(45deg) translateX(-50%) scale(1.25);
+}
+
+/* ── Keyframe Lane (selected node) ── */
+.timeline__kf-lane {
+  display: flex;
+  height: auto;
+  min-height: 22px;
+  flex-shrink: 0;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border-default);
+  outline: none;
+}
+.timeline__kf-lane-header {
+  width: 160px;
+  min-width: 160px;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-sm);
+  border-right: 1px solid var(--border-default);
+  border-left: 3px solid var(--accent-amber);
+  overflow: hidden;
+}
+.timeline__kf-lane-title {
+  font-size: 10px;
+  color: var(--accent-amber);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.timeline__kf-lane-body {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  padding: 2px 0;
+}
+.timeline__kf-lane-empty {
+  font-size: 10px;
+  color: var(--text-muted);
+  padding: 4px 8px;
+  white-space: nowrap;
+}
+.timeline__kf-row {
+  position: relative;
+  height: 14px;
+}
+.timeline__kf-row-label {
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  font-size: 9px;
+  color: var(--text-muted);
   pointer-events: none;
+  z-index: 1;
+  opacity: 0.7;
+}
+.timeline__kf-key {
+  position: absolute;
+  top: 3px;
+  width: 9px;
+  height: 9px;
+  background: var(--accent-amber);
+  transform: rotate(45deg) translateX(-50%);
+  transform-origin: center;
+  cursor: grab;
+  z-index: 2;
+  transition: background var(--duration-fast);
+}
+.timeline__kf-key:hover {
+  background: var(--accent-cyan);
+}
+.timeline__kf-key--selected {
+  background: #fff;
+  box-shadow: 0 0 0 1px var(--accent-cyan);
+}
+.timeline__kf-menu-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+}
+.timeline__kf-menu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+}
+.timeline__kf-menu button {
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 11px;
+  text-align: left;
+  padding: 6px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.timeline__kf-menu button:hover {
+  background: var(--bg-surface);
 }
 
 /* ── Beat Grid ── */

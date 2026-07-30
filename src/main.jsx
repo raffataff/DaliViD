@@ -1,5 +1,13 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
+// Self-hosted webfonts. These replace a Google Fonts @import: that was a
+// third-party origin in the critical path (blocked by our CSP), a render-blocking
+// round trip, and an IP-address leak to Google on every visit. Vite fingerprints
+// and bundles the woff2 files, so font-src 'self' covers them and the app works
+// fully offline. Imported before index.css so the @font-face rules are in place
+// when the design tokens that reference them are parsed.
+import '@fontsource-variable/dm-sans'
+import '@fontsource-variable/jetbrains-mono'
 import './index.css'
 import App from './App.jsx'
 import React from 'react'

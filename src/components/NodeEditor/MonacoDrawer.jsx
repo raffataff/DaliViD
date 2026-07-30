@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import Editor, { useMonaco } from '@monaco-editor/react'
+import Editor from '@monaco-editor/react'
 import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import { GLSL_BOILERPLATE } from './BoilerplateTemplate'
@@ -23,15 +23,33 @@ export default function MonacoDrawer() {
 
   const [code, setCode] = useState(GLSL_BOILERPLATE)
   const [nodeName, setNodeName] = useState('CUSTOM SHADER')
-  const monaco = useMonaco()
+  const [editorReady, setEditorReady] = useState(false)
   const editorRef = useRef(null)
 
-  // Configure Monaco language and theme when instance is ready
+  // Point @monaco-editor/react at our bundled copy before it mounts (and thus
+  // before its loader would otherwise pull Monaco off the jsDelivr CDN). The
+  // dynamic import keeps the editor in a lazy chunk, so startup cost is
+  // unchanged — we just pay it on first open instead of never leaving the CDN.
   useEffect(() => {
-    if (monaco) {
-      setupGLSLMonaco(monaco)
-    }
-  }, [monaco])
+    if (!monacoOpen || editorReady) return
+    let cancelled = false
+    import('../../monacoSetup')
+      .then(() => { if (!cancelled) setEditorReady(true) })
+      .catch(err => {
+        console.error('[MonacoDrawer] Failed to load shader editor:', err)
+        addToast({ message: 'Failed to load shader editor', type: 'error' })
+      })
+    return () => { cancelled = true }
+  }, [monacoOpen, editorReady])
+
+  // Register the GLSL grammar + theme on the instance we're handed, immediately
+  // before the editor is created. Deliberately NOT useMonaco(): that hook calls
+  // loader.init() as soon as this component mounts — and MonacoDrawer is mounted
+  // by NodeCanvas at startup — which kicked off the default CDN loader before
+  // monacoSetup could point it at the bundled copy.
+  const handleEditorWillMount = (monaco) => {
+    setupGLSLMonaco(monaco)
+  }
 
   // Load code when drawer opens or node changes
   useEffect(() => {
@@ -102,18 +120,22 @@ export default function MonacoDrawer() {
       </div>
       
       <div className="monaco-drawer__editor-wrapper" onKeyDown={handleEditorKeyDown}>
-        {monacoOpen && (
+        {monacoOpen && !editorReady && (
+          <div className="monaco-drawer__loading">Loading shader editor…</div>
+        )}
+        {monacoOpen && editorReady && (
           <Editor
             height="100%"
             language="glsl"
             theme="dalivid-dark"
             value={code}
             onChange={setCode}
+            beforeMount={handleEditorWillMount}
             onMount={handleEditorDidMount}
             options={{
               minimap: { enabled: false },
               fontSize: 13,
-              fontFamily: "'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
+              fontFamily: "'JetBrains Mono Variable', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
               fontLigatures: true,
               wordWrap: 'on',
               lineHeight: 22,

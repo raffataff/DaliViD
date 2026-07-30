@@ -239,6 +239,29 @@ const useGraphStore = create((set, get) => ({
     }))
   },
 
+  /**
+   * Drop a removed clip's graph. The Renderer already frees the clip's GPU
+   * resources when it disappears from the timeline (releaseClipResources), but
+   * the graph entry itself lingers — which matters because the Media Pool
+   * derives its Images tab by scanning every clip graph for IMAGE_INPUT nodes,
+   * so an orphaned graph would keep resurrecting a deleted image card.
+   * Emits removal for each node so any not-yet-freed FBOs are released too.
+   */
+  removeClipGraph: (clipId) => {
+    const graph = get().clipGraphs[clipId]
+    if (!graph) return
+    for (const n of graph.nodes || []) {
+      removeNodeImage(n.id)
+      removeText(n.id)
+      emitNodeRemoved(n)
+    }
+    set((state) => {
+      const next = { ...state.clipGraphs }
+      delete next[clipId]
+      return { clipGraphs: next, topologyVersion: state.topologyVersion + 1 }
+    })
+  },
+
   setCompiledChain: (graphLevel, clipId, chain, errors = []) => {
     set((state) => {
       if (graphLevel === 'master') {
