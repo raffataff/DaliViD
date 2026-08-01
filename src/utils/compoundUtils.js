@@ -40,9 +40,9 @@ export function isTransitionCompound(entry) {
 
 /**
  * Gather param configs for a sub-graph node: parsed from its shader, or — for the
- * shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) — from the
- * shared dataNodeParams table, so a compound can expose a TIME node's rate or
- * range to its surface just like any shader param.
+ * shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / RAMP / LFO) —
+ * from the shared dataNodeParams table, so a compound can expose an LFO's rate
+ * or a RAMP's endpoints to its surface just like any shader param.
  */
 function getSubNodeParamConfigs(node) {
   const dataParams = getDataNodeParams(node.type)

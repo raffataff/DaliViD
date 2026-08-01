@@ -9,10 +9,47 @@ import useAppStore from '../store/useAppStore.js'
 import useGraphStore from '../store/useGraphStore.js'
 import useTimelineStore from '../store/useTimelineStore.js'
 import { STARTER_TRANSITION_COMPOUND } from '../shaders/compoundPresets.js'
+import { migrateTimeNodeParams } from '../shaders/dataNodeParams.js'
 import { clearHistory } from './history.js'
 
 const PROJECT_PREFIX = 'dalivid_project_'
 const AUTOSAVE_KEY = 'dalivid_autosave'
+
+/**
+ * Migration: the combined TIME node was split into RAMP (plays once across a
+ * span) and LFO (oscillates forever). `migrateTimeNodeParams` picks which one a
+ * saved node meant from its Source and translates its params; both new types
+ * expose the `value` and `seconds` output sockets TIME had, so edges are
+ * untouched and no graph needs rewiring.
+ *
+ * Runs on every graph — master, each clip, compound interiors and the compound
+ * library — because a TIME node could be saved at any depth. Nodes are only
+ * copied when something actually changes, so a project with no TIME nodes keeps
+ * its object identity (Zustand's snapshot-based undo depends on that).
+ */
+function migrateGraphNodes(nodes) {
+  if (!Array.isArray(nodes)) return nodes
+  let changed = false
+  const out = nodes.map(n => {
+    let node = n
+    if (n?.type === 'TIME') {
+      const { type, params } = migrateTimeNodeParams(n.params || {})
+      // Only rename an auto-generated label; a user's custom name is theirs.
+      const wasDefault = !n.name || /^(time|time \/ lfo)$/i.test(n.name)
+      node = { ...n, type, params, name: wasDefault ? (type === 'RAMP' ? 'Ramp' : 'LFO') : n.name }
+      changed = true
+    }
+    if (node?.subGraph?.nodes) {
+      const inner = migrateGraphNodes(node.subGraph.nodes)
+      if (inner !== node.subGraph.nodes) {
+        node = { ...node, subGraph: { ...node.subGraph, nodes: inner } }
+        changed = true
+      }
+    }
+    return node
+  })
+  return changed ? out : nodes
+}
 
 /**
  * Serialize the entire project state into a plain object.
@@ -75,7 +112,13 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
         transition: c.transition
           ? { type: c.transition.type, params: { ...(c.transition.params || {}) } }
           : null,
-        transform: { ...c.transform },
+        transitionOut: c.transitionOut
+          ? { type: c.transitionOut.type, params: { ...(c.transitionOut.params || {}) } }
+          : null,
+        // Pan / zoom / rotate framing (uniform-keyed; see utils/clipTransform.js).
+        // Kept null when unset so the renderer can skip the pass on load, and so
+        // an untransformed project doesn't grow an object per clip.
+        transform: c.transform ? { ...c.transform } : null,
         // Generator clips (text/image) carry their content + style here (text
         // string, image data URL, fit/transform). Self-contained — no external
         // file, so text/image clips survive save/load with no re-import.
@@ -209,6 +252,9 @@ export function deserializeProject(data, getAppStore) {
       clips: (data.timeline.clips || []).map(c => ({
         fadeIn: 0,
         fadeOut: 0,
+        // Projects saved before transition-out existed simply have none — the
+        // renderer treats null as "no transition", so they load unchanged.
+        transitionOut: null,
         ...c,
         blendMode: (!c.blendMode || c.blendMode === 'Normal') ? 'Inherit' : c.blendMode,
       })),
@@ -223,7 +269,7 @@ export function deserializeProject(data, getAppStore) {
   if (data.graph) {
     useGraphStore.setState({
       masterGraph: {
-        nodes: data.graph.masterGraph?.nodes || [],
+        nodes: migrateGraphNodes(data.graph.masterGraph?.nodes || []),
         edges: data.graph.masterGraph?.edges || [],
         tapPointNodeId: data.graph.masterGraph?.tapPointNodeId || null,
         compiledChain: [],
@@ -233,7 +279,7 @@ export function deserializeProject(data, getAppStore) {
         Object.entries(data.graph.clipGraphs || {}).map(([clipId, g]) => [
           clipId,
           {
-            nodes: g.nodes || [],
+            nodes: migrateGraphNodes(g.nodes || []),
             edges: g.edges || [],
             tapPointNodeId: g.tapPointNodeId || null,
             compiledChain: [],
@@ -245,7 +291,11 @@ export function deserializeProject(data, getAppStore) {
       // re-seeded so node transitions stay discoverable; a project with its own
       // library keeps exactly what it saved.
       compoundLibrary: (data.graph.compoundLibrary && data.graph.compoundLibrary.length > 0)
-        ? data.graph.compoundLibrary
+        ? data.graph.compoundLibrary.map(c => (
+          c.subGraph?.nodes
+            ? { ...c, subGraph: { ...c.subGraph, nodes: migrateGraphNodes(c.subGraph.nodes) } }
+            : c
+        ))
         : [STARTER_TRANSITION_COMPOUND],
       // Bump so the renderer recompiles the freshly-loaded graph.
       topologyVersion: useGraphStore.getState().topologyVersion + 1,

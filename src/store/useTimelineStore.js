@@ -150,10 +150,22 @@ const useTimelineStore = create((set, get) => ({
       blendMode: 'Inherit',
       fadeIn: 0,  // seconds of linear opacity ramp at the clip's start
       fadeOut: 0, // seconds of linear opacity ramp at the clip's end
-      // Transition-in: { type, params } from transitionRegistry — plays across
-      // the overlap with the previous clip on the track. null = hard cut/blend.
+      // Transition-in: { type, params } from transitionRegistry (or
+      // "compound:<libId>" for a node-graph one). Plays across the overlap with
+      // the previous clip on the track; with no overlap it plays across the
+      // `fadeIn` handle instead, transitioning in FROM whatever is underneath
+      // (the lower tracks, or nothing at all). null = hard cut/blend.
       transition: null,
-      transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 },
+      // Transition-out: same shape, played across the `fadeOut` handle at the
+      // clip's end — the clip transitions away TO whatever is underneath. Kept
+      // as its own field so a clip can blend in and out differently.
+      transitionOut: null,
+      // Pan / zoom / rotate framing, keyed by the TRANSFORM shader's uniforms
+      // ({ u_xf_zoom, u_xf_pan_x, … } — see utils/clipTransform.js). null means
+      // "no transform", which skips the GPU pass entirely, so the default clip
+      // costs nothing. Replaced the old unused { x, y, scaleX… } placeholder;
+      // projects saved with that shape resolve to identity on load.
+      transform: null,
       metadata: {
         width: clipData.width || 1920,
         height: clipData.height || 1080,
@@ -258,8 +270,9 @@ const useTimelineStore = create((set, get) => ({
         if (c.id !== clipId) return c
         // Fades belong to the outer edges: the left half keeps the fade-in and
         // loses the fade-out (the cut is now its end), and vice versa — so a
-        // split doesn't introduce a dip at the cut point.
-        return { ...c, timelineEnd: splitTime, sourceEnd: splitSourceTime, fadeOut: 0 }
+        // split doesn't introduce a dip at the cut point. Transitions follow
+        // their fade handle, since that handle is what times them.
+        return { ...c, timelineEnd: splitTime, sourceEnd: splitSourceTime, fadeOut: 0, transitionOut: null }
       }).concat({
         ...clip,
         id: rightId,

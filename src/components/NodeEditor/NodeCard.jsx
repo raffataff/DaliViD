@@ -1,7 +1,8 @@
-import { useState, useRef, useCallback, memo } from 'react'
+import { useState, useRef, useCallback, useMemo, memo } from 'react'
 import Socket from './Socket'
 import { IconChevronDown, IconSettings, IconEye, IconCode, IconClose } from '../common/Icons'
 import { getNodeSockets } from '../../shaders/nodeDefinitions'
+import { visibleDataParams } from '../../shaders/dataNodeParams'
 import { getNodeSource } from '../../shaders/shaderRegistry'
 import { prepareImageDataURL, dataUrlBytes, formatBytes } from '../../utils/imageProcessing'
 import './NodeCard.css'
@@ -9,6 +10,7 @@ import './NodeCard.css'
 export const NODE_COLORS = {
   'CLIP_SOURCE': '#44cc88', 'CLIP_OUTPUT': '#ff6644', 'VIDEO_INPUT': '#44cc88',
   'IMAGE_INPUT': '#44cc88', 'TEXT_INPUT': '#ffcc44', 'SHAPE_INPUT': '#ff5588', 'LETTERBOX': '#8899aa',
+  'TRANSFORM': '#8899aa',
   'CAMERA_INPUT': '#44aaff', 'SCREEN_INPUT': '#44aaff', 'AUDIO_INPUT': '#ff00aa', 'AUDIO_SPLITTER': '#cc44ff',
   'AUDIO_VISUALIZER': '#ff00aa', 'OUTPUT': '#ff6644', 'EDGE_DETECTION': '#ff8844',
   'COLOR_INVERSION': '#ff44cc', 'GLITCH': '#ff3344', 'FEEDBACK': '#aa44ff',
@@ -16,7 +18,7 @@ export const NODE_COLORS = {
   'BLOOM': '#ffcc44', 'CRT': '#88aa44', 'VORONOI': '#44ffaa', 'FLUID_WARP': '#4488ff',
   'HALFTONE': '#aaaacc', 'THRESHOLD': '#ccaa44', 'DEPTH_BLUR': '#44aacc',
   'MIRROR': '#cc44ff', 'PARTICLE': '#ff6644', 'LUT': '#ffaa44',
-  'MATH_BLEND': '#aaccff', 'MIX_BLEND': '#aaccff', 'MATH': '#ffdd00', 'TRANSITION_PROGRESS': '#ffdd00', 'ENVELOPE': '#ffdd00', 'TIME': '#ffdd00',
+  'MATH_BLEND': '#aaccff', 'MIX_BLEND': '#aaccff', 'MATH': '#ffdd00', 'TRANSITION_PROGRESS': '#ffdd00', 'ENVELOPE': '#ffdd00', 'RAMP': '#ffdd00', 'LFO': '#ffdd00',
   'CUSTOM': '#00e5ff', 'COMPOUND': '#ff00aa',
   'AUDIO_WARP': '#ff00aa', 'SPECTRUM_GLOW': '#ff00aa',
   'EFFECT_INPUT': '#44cc88', 'EFFECT_OUTPUT': '#ff6644',
@@ -158,10 +160,22 @@ const NodeCard = memo(function NodeCard({
   const isLocked = node.locked
   const isCompound = node.type === 'COMPOUND'
 
+  // Sockets are built from the FULL config list, never the visible subset: a
+  // hidden param can still be driven by a wire, and dropping its socket would
+  // strand the noodle. Conditional visibility is a UI concern only.
   const { inputs, outputs } = getNodeSockets(node.type, paramConfigs, node)
   const fixedInputs = inputs.filter(s => !s.isParam)
   const paramInputs = inputs.filter(s => s.isParam)
   const compoundExposedParams = isCompound ? (node.exposedParams || []) : []
+
+  // Controls whose value can't do anything are noise (Beats/Cycle with Beat Sync
+  // off, Pulse Width on a Sine wave). `connectedInputs` is passed as the
+  // always-show set so a wired param keeps its row — and so its socket keeps a
+  // real DOM anchor for `getSocketPos`.
+  const visibleParams = useMemo(
+    () => visibleDataParams(paramConfigs, node.params, connectedInputs),
+    [paramConfigs, node.params, connectedInputs]
+  )
 
   const dragMoved = useRef(false)
 
@@ -429,10 +443,10 @@ const NodeCard = memo(function NodeCard({
         </div>
       )}
 
-      {!isCompound && paramConfigs.length > 0 && (
+      {!isCompound && visibleParams.length > 0 && (
         <div className="node-card__params">
           <div className="node-card__params-divider">PARAMETERS</div>
-          {paramConfigs.map(param => {
+          {visibleParams.map(param => {
             const paramSocket = paramInputs.find(s => s.id === param.uniformName)
             const isConnected = paramSocket && connectedInputs.has(param.uniformName)
             return (
