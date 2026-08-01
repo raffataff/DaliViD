@@ -18,13 +18,14 @@ import { getShaderSource } from '../shaders/shaderRegistry.js'
 import { buildTransitionShader, getTransitionDefaults } from '../shaders/transitionRegistry.js'
 import { evaluateKeyframes } from '../utils/keyframes.js'
 import { hexToVec3 } from '../utils/paramParser.js'
+import { CLIP_TRANSFORM_NODE_ID, resolveClipTransform, isIdentityTransform, clipSupportsTransform } from '../utils/clipTransform.js'
 
 // Node types that are not effect passes (sources, outputs, audio routing). Used
 // to decide whether a graph actually has any effects worth running.
 // NOTE: the self-drawing sources — IMAGE_INPUT, TEXT_INPUT, SHAPE_INPUT — are
 // deliberately NOT listed: they produce pixels with no effect program, so a graph
 // containing only (say) a shape → OUTPUT still has something to render.
-const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE', 'TIME']
+const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE', 'RAMP', 'LFO']
 
 // Passthrough fragment shader — just copies input texture
 const PASSTHROUGH_FS = `#version 300 es
@@ -34,6 +35,34 @@ uniform sampler2D u_texture;
 out vec4 fragColor;
 void main() {
   fragColor = texture(u_texture, v_uv);
+}
+`
+
+// Present fragment shader — the compositor's LAST pass, screen-bound only.
+//
+// applyBlendMode accumulates in PREMULTIPLIED alpha: `composited = src * a +
+// base.rgb * (1 - a)` with `outA = a`, which is the numerically correct space
+// to composite in (and why the recursive base term isn't scaled by base.a).
+// The canvas, however, is created with `premultipliedAlpha: false`, so the
+// browser multiplies by alpha AGAIN when compositing the canvas onto the page.
+// On an opaque frame (a == 1) the two conventions agree, which is why this
+// never showed — it only bites on partial alpha, i.e. exactly a clip fading to
+// or from nothing, where a linear 50% dissolve landed at 25% brightness.
+//
+// Undoing the premultiply once, here, fixes it without touching any FBO or
+// blend mode: opaque pixels divide by 1.0 and come out bit-identical. Kept
+// separate from PASSTHROUGH_FS because that shader is also used for FBO→FBO
+// copies, where the premultiplied chain must be preserved.
+const PRESENT_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+out vec4 fragColor;
+void main() {
+  vec4 c = texture(u_texture, v_uv);
+  // Guard the divide: a fully transparent pixel has no colour to recover, and
+  // its RGB is ignored by the compositor anyway.
+  fragColor = c.a > 0.0001 ? vec4(c.rgb / c.a, c.a) : vec4(0.0);
 }
 `
 
@@ -264,6 +293,10 @@ export class Renderer {
     const passResult = createShaderProgram(this.gl, PASSTHROUGH_FS)
     this.passthroughProgram = passResult
 
+    // Screen-bound present pass (un-premultiplies — see PRESENT_FS).
+    const presentResult = createShaderProgram(this.gl, PRESENT_FS)
+    this.presentProgram = presentResult
+
     const compResult = createShaderProgram(this.gl, COMPOSITE_FS)
     this.compositeProgram = compResult
 
@@ -288,6 +321,11 @@ export class Renderer {
     // in-graph node produce pixel-identical bars.
     const lbSrc = getShaderSource('LETTERBOX')
     if (lbSrc) this.barsProgram = createShaderProgram(this.gl, lbSrc)
+
+    // Per-clip Pan / Zoom — the TRANSFORM node's own shader again, so a clip's
+    // Inspector transform and an in-graph TRANSFORM node reframe identically.
+    const xfSrc = getShaderSource('TRANSFORM')
+    if (xfSrc) this.transformProgram = createShaderProgram(this.gl, xfSrc)
   }
 
   /**
@@ -945,7 +983,8 @@ export class Renderer {
       } else {
         this.renderTextNode(clip.id, inputFBOId, standardState, clip.params || {})
       }
-      return this._runClipGraph(clip, inputFBOId, graphState, standardState, playheadTime)
+      const xfId = this._applyClipTransform(clip, inputFBOId, standardState, playheadTime)
+      return this._runClipGraph(clip, xfId, graphState, standardState, playheadTime)
     }
 
     let videoEl = this._videoElements.get(clip.id)
@@ -1027,7 +1066,67 @@ export class Renderer {
     if (loc != null) gl.uniform1i(loc, 0)
     this.drawQuad()
 
-    return this._runClipGraph(clip, inputFBOId, graphState, standardState, playheadTime)
+    // Reframe (pan/zoom/rotate) before the clip's effect graph sees the frame.
+    const xfFBOId = this._applyClipTransform(clip, inputFBOId, standardState, playheadTime)
+    return this._runClipGraph(clip, xfFBOId, graphState, standardState, playheadTime)
+  }
+
+  /**
+   * Apply a clip's Pan / Zoom / Rotate framing to its source frame, BEFORE its
+   * effect graph runs — so effects operate on the picture you actually see (a
+   * glitch on a punched-in shot glitches the punched-in framing, not the wide).
+   *
+   * Returns the FBO the graph should read from: the untouched input FBO when the
+   * clip has no transform — the common case, costing no pass and no extra VRAM —
+   * or a dedicated `clip_xf_<id>` FBO holding the reframed picture.
+   *
+   * Note this magnifies a canvas-resolution FBO, so a large punch-in on video is
+   * a real upscale and will soften. Stills avoid that by zooming on the
+   * IMAGE_INPUT node instead, which samples the image at its native size.
+   *
+   * @param {object} clip
+   * @param {string} inputFBOId — FBO already holding the clip's source frame
+   * @param {object} standardState — per-frame standard uniform state
+   * @param {number} playheadTime — absolute timeline seconds
+   * @returns {string} FBO id to feed the clip graph
+   */
+  _applyClipTransform(clip, inputFBOId, standardState, playheadTime) {
+    if (!this.transformProgram || !this.transformProgram.program) return inputFBOId
+    if (!clipSupportsTransform(clip)) return inputFBOId
+
+    // Transform keyframes live under a reserved node id and, like every other
+    // clip keyframe, are clip-relative in time so they survive the clip moving.
+    const keyframes = this._getTimelineStore?.()?.keyframes
+    const kfVals = keyframes && keyframes.length > 0
+      ? evaluateKeyframes(keyframes, clip.id, playheadTime - clip.timelineStart)?.[CLIP_TRANSFORM_NODE_ID]
+      : null
+    if (!clip.transform && !kfVals) return inputFBOId
+
+    const params = resolveClipTransform(clip.transform, kfVals)
+    if (isIdentityTransform(params)) return inputFBOId
+
+    const gl = this.gl
+    const outFBOId = `clip_xf_${clip.id}`
+    if (!this.fbos.getTexture(outFBOId)) this.fbos.create(outFBOId, this.width, this.height)
+
+    // Transparent start: with the default "Transparent" edge mode, whatever the
+    // framing doesn't cover must composite as nothing, not black.
+    this.fbos.bind(outFBOId)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    gl.useProgram(this.transformProgram.program)
+    const locs = this.transformProgram.uniformLocations
+    this.fbos.bindTexture(inputFBOId, 0)
+    if (locs.u_texture != null) gl.uniform1i(locs.u_texture, 0)
+    uploadStandardUniforms(gl, locs, standardState)
+    uploadUniforms(gl, locs, this.transformProgram.uniformTypes, params)
+
+    this.drawQuad()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+
+    return outFBOId
   }
 
   /**
@@ -1166,6 +1265,12 @@ export class Renderer {
     let accumReadId = accumAId
     let accumWriteId = accumBId
 
+    // Scratch buffer for transition-OUT only: the "before" state of the frame
+    // (this clip already composited over the accumulator), which the transition
+    // reads as u_from while dissolving TO the bare accumulator. Created lazily
+    // on first use so a project with no transition-out never allocates it.
+    const scratchId = '__compositor_scratch'
+
     // Start from a fully transparent backdrop so uncovered regions / gaps read
     // as nothing (spec: a track with no active clip contributes vec4(0.0)).
     this.fbos.bind(accumReadId)
@@ -1225,42 +1330,115 @@ export class Renderer {
         const clipOpacity = clip.opacity == null ? 1 : clip.opacity
         const trackOpacity = track.opacity == null ? 1 : track.opacity
 
+        const clipDur = clip.timelineEnd - clip.timelineStart
+        const elapsed = playheadTime - clip.timelineStart      // into the clip
+        const remaining = clip.timelineEnd - playheadTime      // left of the clip
+
+        // ── Which transition (if any) owns this frame ──────────────────────
+        // A transition needs a window and a FROM/TO pair. Three sources, in
+        // precedence order:
+        //   1. transition-IN across the OVERLAP with the previous active clip
+        //      (the original behaviour — the overlap defines the window).
+        //   2. transition-IN across the `fadeIn` handle when there is no
+        //      overlap: u_from is the accumulator as-is, which on the bottom
+        //      track is transparent — i.e. the clip blends in FROM NOTHING.
+        //   3. transition-OUT across the `fadeOut` handle: the clip dissolves
+        //      away TO the accumulator (lower tracks, or nothing).
+        // Only one can run per frame — each is a single full-frame pass that
+        // rewrites the accumulator, so they cannot be stacked.
+        let tIn = null
+        let tOut = null
+
+        // An overlap-timed transition-in is the legacy path and keeps priority
+        // over the handle, so existing projects time out exactly as before.
+        let overlapTimedIn = false
+        if (clip.transition && clip.transition.type) {
+          let dur = 0
+          if (ci > 0) {
+            const prev = activeClips[ci - 1]
+            dur = Math.min(prev.timelineEnd, clip.timelineEnd) - clip.timelineStart
+            overlapTimedIn = dur > 0.001
+          }
+          if (!overlapTimedIn) dur = Math.min(clip.fadeIn || 0, clipDur)
+          if (dur > 0.001 && elapsed < dur) {
+            tIn = { transition: clip.transition, progress: Math.max(0, Math.min(1, elapsed / dur)) }
+          }
+        }
+
+        if (clip.transitionOut && clip.transitionOut.type) {
+          // If the next overlapping clip runs its own transition-in, that window
+          // is already spoken for — two transitions fighting over the same
+          // frames looks like a bug, so the incoming clip wins.
+          const nextOwnsWindow = ci + 1 < activeClips.length && !!activeClips[ci + 1].transition?.type
+          const dur = Math.min(clip.fadeOut || 0, clipDur)
+          if (!nextOwnsWindow && dur > 0.001 && remaining < dur) {
+            tOut = { transition: clip.transitionOut, progress: Math.max(0, Math.min(1, 1 - remaining / dur)) }
+          }
+        }
+
+        // Windows collide only when fadeIn + fadeOut exceeds the clip length.
+        // Whichever end the playhead is nearer owns the frame: symmetric, and
+        // it preserves both a clean entrance and a clean exit on a short clip.
+        if (tIn && tOut) {
+          if (elapsed <= remaining) tOut = null
+          else tIn = null
+        }
+
         // Fade-in/out: linear opacity ramps over the first fadeIn / last fadeOut
         // seconds of the clip (timeline time, like NLE fade handles). Both fades
         // multiply, so on a short clip with overlapping ramps the dip composes
         // instead of popping. Zero-length fades are the no-op default.
+        //
+        // A handle-timed transition performs the reveal itself, so its ramp must
+        // NOT also run or the two compound into a visible double-fade. Dropping
+        // the whole term is exact rather than approximate: outside its window
+        // the ramp evaluates to 1.0 anyway, and inside it a transition always
+        // runs (the collision tie-break above hands the frame to one or the
+        // other, never to neither).
+        const inOwnsFadeIn = !!clip.transition?.type && !overlapTimedIn
+        const outOwnsFadeOut = !!clip.transitionOut?.type &&
+          !(ci + 1 < activeClips.length && !!activeClips[ci + 1].transition?.type)
         let fade = 1
-        if (clip.fadeIn > 0) fade *= Math.max(0, Math.min(1, (playheadTime - clip.timelineStart) / clip.fadeIn))
-        if (clip.fadeOut > 0) fade *= Math.max(0, Math.min(1, (clip.timelineEnd - playheadTime) / clip.fadeOut))
+        if (!inOwnsFadeIn && clip.fadeIn > 0) fade *= Math.max(0, Math.min(1, elapsed / clip.fadeIn))
+        if (!outOwnsFadeOut && clip.fadeOut > 0) fade *= Math.max(0, Math.min(1, remaining / clip.fadeOut))
 
         const opacity = Math.max(0, Math.min(1, clipOpacity)) * Math.max(0, Math.min(1, trackOpacity)) * fade
 
-        // Transition-in: when this clip declares one AND overlaps the previous
-        // active clip on this track, the transition shader owns the mix for the
-        // overlap window (u_progress 0 → 1), replacing the plain blend
-        // composite. Both clips are active at the playhead, so the overlap is
-        // guaranteed non-empty; u_from is the accumulator (previous clip over
-        // the lower tracks), which is the correct compositing backdrop.
         let composited = false
-        if (clip.transition && clip.transition.type && ci > 0) {
-          const prev = activeClips[ci - 1]
-          const overlapEnd = Math.min(prev.timelineEnd, clip.timelineEnd)
-          const overlapDur = overlapEnd - clip.timelineStart
-          if (overlapDur > 0.001) {
-            const progress = Math.max(0, Math.min(1, (playheadTime - clip.timelineStart) / overlapDur))
-            // "compound:<libId>" runs a node-graph transition from the compound
-            // library; anything else is a built-in registry transition shader.
-            composited = clip.transition.type.startsWith('compound:')
-              ? this._compositeNodeTransition(
-                  accumReadId, accumWriteId, clipResultFBOId,
-                  clip, progress, opacity, standardState
-                )
-              : this._compositeTransition(
-                  accumReadId, accumWriteId, clipResultFBOId,
-                  clip.transition, progress, opacity, standardState
-                )
-          }
+
+        if (tIn) {
+          // FROM = the accumulator (previous clip over the lower tracks, or
+          // transparent when there is nothing beneath), TO = this clip.
+          // "compound:<libId>" runs a node-graph transition from the compound
+          // library; anything else is a built-in registry transition shader.
+          composited = tIn.transition.type.startsWith('compound:')
+            ? this._compositeNodeTransition(
+                accumReadId, accumWriteId, clipResultFBOId,
+                clip, tIn.transition, tIn.progress, opacity, standardState, 'in', accumReadId
+              )
+            : this._compositeTransition(
+                accumReadId, accumWriteId, clipResultFBOId,
+                tIn.transition, tIn.progress, opacity, standardState
+              )
+        } else if (tOut) {
+          // Transition-out is the mirror image and needs one extra pass: build
+          // the "before" frame (this clip composited over the accumulator with
+          // its normal blend mode + opacity) into scratch, then dissolve FROM
+          // that TO the bare accumulator. At progress 0 the result is
+          // pixel-identical to the plain composite, so the hand-off is seamless.
+          if (!this.fbos.getTexture(scratchId)) this.fbos.create(scratchId, this.width, this.height)
+          this._compositeTrack(accumReadId, scratchId, clipResultFBOId, blendIdx, opacity)
+          composited = tOut.transition.type.startsWith('compound:')
+            ? this._compositeNodeTransition(
+                scratchId, accumWriteId, accumReadId,
+                clip, tOut.transition, tOut.progress, 1, standardState, 'out', accumReadId
+              )
+            : this._compositeTransition(
+                scratchId, accumWriteId, accumReadId,
+                tOut.transition, tOut.progress, 1, standardState
+              )
         }
+
         if (!composited) {
           this._compositeTrack(accumReadId, accumWriteId, clipResultFBOId, blendIdx, opacity)
         }
@@ -1435,6 +1613,7 @@ export class Renderer {
   releaseClipResources(clipId, graphState = null) {
     this.textures.delete(`clip_${clipId}`)
     this.fbos.delete(`clip_input_${clipId}`)
+    this.fbos.delete(`clip_xf_${clipId}`)   // pan/zoom pass (only exists if used)
     this.fbos.delete(`clip_output_${clipId}`)
 
     // Generator clips (text/image) key their source raster/texture by clip id.
@@ -1594,19 +1773,34 @@ export class Renderer {
   }
 
   /**
-   * Composite an incoming clip using a NODE-GRAPH transition: a compound
-   * library entry (clip.transition.type = "compound:<libId>") whose sub-graph
-   * mixes its two image inputs (FROM = accumulator, TO = incoming clip), with
-   * any TRANSITION_PROGRESS node inside driven by the live overlap progress.
-   * The clip's saved param values (clip.transition.params, keyed by exposed-
-   * param index) are applied as live overrides without mutating the entry.
-   * Result is composited over the accumulator Normal-mode at `opacity`, same
-   * contract as the built-in transition footer.
+   * Composite a clip using a NODE-GRAPH transition: a compound library entry
+   * (`type` = "compound:<libId>") whose sub-graph mixes its two image inputs,
+   * with any TRANSITION_PROGRESS node inside driven by the live progress. The
+   * clip's saved param values (transition.params, keyed by exposed-param index)
+   * are applied as live overrides without mutating the entry.
+   *
+   * FROM/TO depend on the direction, which is why `backdropFBOId` is separate
+   * from `fromFBOId`: on the way IN, FROM is the accumulator and that is also
+   * the correct backdrop to composite the result over; on the way OUT, FROM is
+   * the clip-over-accumulator scratch buffer while the backdrop is still the
+   * bare accumulator (compositing over the scratch would leave the outgoing
+   * clip visible wherever the sub-graph's output is transparent).
+   *
+   * @param {string} fromFBOId     — bound to the sub-graph's first image input
+   * @param {string} destFBOId     — destination FBO (distinct from the others)
+   * @param {string} toFBOId       — bound to the second image input
+   * @param {object} clip          — the clip owning the transition (FBO scope + time context)
+   * @param {object} transition    — { type, params }; clip.transition or clip.transitionOut
+   * @param {number} progress      — 0..1 across the transition window
+   * @param {number} opacity       — 0..1 applied when compositing the result
+   * @param {object} standardState — per-frame standard uniform state
+   * @param {'in'|'out'} direction — namespaces the inner FBOs so the two
+   *   directions never share buffers, even with the same library entry
+   * @param {string} backdropFBOId — what the result is composited over
    * @returns {boolean} false → caller falls back to the blend composite
    *   (missing library entry, compile errors, or an unresolvable output).
    */
-  _compositeNodeTransition(baseFBOId, destFBOId, toFBOId, clip, progress, opacity, standardState) {
-    const transition = clip.transition
+  _compositeNodeTransition(fromFBOId, destFBOId, toFBOId, clip, transition, progress, opacity, standardState, direction, backdropFBOId) {
     const libId = transition.type.slice('compound:'.length)
     const entry = this._getGraphStore?.()?.compoundLibrary?.find(c => c.id === libId)
     if (!entry || !entry.subGraph) {
@@ -1649,32 +1843,43 @@ export class Renderer {
       }
     }
 
-    // The incoming clip owns the transition, so a TIME node inside it reads that
-    // clip's window (progress is available separately via TRANSITION_PROGRESS).
+    // The clip owns the transition, so a TIME node inside it reads that clip's
+    // window (progress is available separately via TRANSITION_PROGRESS).
     this._setClipTimeContext(standardState, clip, standardState.playhead ?? 0)
 
-    // Inner FBOs are namespaced per clip so two clips using the same library
-    // transition never collide (freed in releaseClipResources).
+    // Inner FBOs are namespaced per clip AND direction, so two clips using the
+    // same library transition — or one clip using it to blend both in and out —
+    // never collide (all freed in releaseClipResources, which matches on the
+    // `tr~<clipId>~` prefix).
     const resultFBO = executeTransitionCompound(
-      this, cached.chain, entry.subGraph, baseFBOId, toFBOId,
-      standardState, progress, `tr~${clip.id}~`, liveNodes
+      this, cached.chain, entry.subGraph, fromFBOId, toFBOId,
+      standardState, progress, `tr~${clip.id}~${direction}~`, liveNodes
     )
     if (!resultFBO) return false
 
-    this._compositeTrack(baseFBOId, destFBOId, resultFBO, 0 /* Normal */, opacity)
+    this._compositeTrack(backdropFBOId, destFBOId, resultFBO, 0 /* Normal */, opacity)
     return true
   }
 
   /**
-   * Blit an FBO to the screen using the passthrough shader.
+   * Blit an FBO to the SCREEN — the compositor's exit point.
+   *
+   * Uses PRESENT_FS rather than the passthrough so the accumulator's
+   * premultiplied alpha is undone exactly once, at the boundary where the
+   * browser takes over (the canvas is `premultipliedAlpha: false`). Opaque
+   * pixels are unaffected; partial alpha — a clip fading to or from nothing —
+   * now reads as a linear ramp instead of a squared one. Falls back to the
+   * passthrough if the program failed to compile, which is the old behaviour
+   * rather than a black frame.
    */
   _blitToScreen(fboId) {
     const gl = this.gl
+    const prog = this.presentProgram?.program ? this.presentProgram : this.passthroughProgram
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, this.width, this.height)
-    gl.useProgram(this.passthroughProgram.program)
+    gl.useProgram(prog.program)
     this.fbos.bindTexture(fboId, 0)
-    const loc = this.passthroughProgram.uniformLocations.u_texture
+    const loc = prog.uniformLocations.u_texture
     if (loc != null) gl.uniform1i(loc, 0)
     this.drawQuad()
   }
@@ -1706,7 +1911,10 @@ export class Renderer {
 
     const appState = this._getAppStore ? this._getAppStore() : {}
     const playheadTime = appState.playheadTime || 0
-    const inputFBOId = `clip_input_${clipId}`
+    // Reassigned below once the source frame exists: the clip's pan/zoom pass
+    // returns the FBO the graph should read, so the isolated view is framed the
+    // same way the timeline is (authoring effects on the real framing).
+    let inputFBOId = `clip_input_${clipId}`
     if (!this.fbos.getTexture(inputFBOId)) {
       this.fbos.create(inputFBOId, this.width, this.height)
     }
@@ -1785,6 +1993,8 @@ export class Renderer {
         this.drawQuad()
       }
     }
+
+    inputFBOId = this._applyClipTransform(clip, inputFBOId, standardState, playheadTime)
 
     // Execute clip graph
     const clipGraph = graphState.clipGraphs?.[clipId]

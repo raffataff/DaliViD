@@ -222,15 +222,36 @@ const NODE_DEFS = {
     ],
     hasParamInputs: false,
   },
-  // TIME — CPU-side float source (no GLSL shader): an LFO / ramp generator that
-  // replaces most keyframing. `value` is the shaped wave remapped into Min…Max,
-  // `seconds` is the raw time of the chosen source (feed it to MATH for custom
-  // curves). hasParamInputs is true so rate/phase/min/max/pulse width get float
-  // sockets — an audio band or ENVELOPE can modulate the LFO itself.
-  TIME: {
+  // RAMP — CPU-side float source (no GLSL shader): plays ONCE across a span
+  // (clip / timeline / in-out range), which is what replaces most keyframing.
+  // `value` is the eased progress remapped into Start…End, `progress` is the raw
+  // un-eased 0 → 1 (handy to fan out to several params at different ranges via
+  // MATH), `seconds` is elapsed time in the span.
+  //
+  // hasParamInputs is true so Start/End/Cycles/Offset get float sockets — an
+  // audio band or ENVELOPE can modulate the ramp's endpoints.
+  RAMP: {
     inputs: [],
     outputs: [
       { id: 'value', type: 'float', name: 'Value' },
+      { id: 'progress', type: 'float', name: 'Progress' },
+      { id: 'seconds', type: 'float', name: 'Seconds' },
+    ],
+    hasParamInputs: true,
+  },
+  // LFO — CPU-side float source (no GLSL shader): oscillates forever on a
+  // seconds-based time base. `value` is the shaped wave remapped into Min…Max,
+  // `bipolar` is the same wave as −1…1 (add it to a param rather than replacing
+  // the param), `seconds` is the raw time of the chosen base (feed it to MATH
+  // for custom curves).
+  //
+  // `value`/`seconds` are shared with RAMP by design: a project saved with the
+  // old combined TIME node migrates into either one without stranding an edge.
+  LFO: {
+    inputs: [],
+    outputs: [
+      { id: 'value', type: 'float', name: 'Value' },
+      { id: 'bipolar', type: 'float', name: 'Bipolar' },
       { id: 'seconds', type: 'float', name: 'Seconds' },
     ],
     hasParamInputs: true,

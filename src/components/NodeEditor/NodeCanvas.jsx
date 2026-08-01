@@ -17,7 +17,7 @@ import { getShaderSource } from '../../shaders/shaderRegistry'
 import { instantiatePreset, instantiateUserCompound } from '../../shaders/compoundPresets'
 import { generateCombinedShader } from '../../shaders/shaderGenerator'
 import { getNodeSockets, getSocketYOffset, canConnect } from '../../shaders/nodeDefinitions'
-import { getDataNodeParams } from '../../shaders/dataNodeParams'
+import { getDataNodeParams, visibleDataParams } from '../../shaders/dataNodeParams'
 import './NodeCanvas.css'
 
 const EXCLUDED_FROM_MARQUEE = new Set([
@@ -56,7 +56,11 @@ const AUDIO_AUTOWIRE = {
 function estimateNodeHeight(node, params) {
   const { inputs, outputs } = getNodeSockets(node.type, params, node)
   const socketCount = Math.max(inputs.filter(s => !s.isParam).length, outputs.length)
-  return 30 + socketCount * 22 + params.length * 26 + 40
+  // Sockets come from the full config list, but only VISIBLE param rows occupy
+  // height — a `showIf`-hidden control (LFO's Beats/Cycle, …) draws nothing, and
+  // counting it would leave the marquee/insert hit tests reaching below the card.
+  const rows = visibleDataParams(params, node.params).length
+  return 30 + socketCount * 22 + rows * 26 + 40
 }
 
 // Node clipboard (Ctrl+C / Ctrl+V) — module-level so it survives graph
@@ -168,8 +172,8 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       }
       map[node.id] = params
     }
-    // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) have
-    // no @param directives to parse — their configs come from dataNodeParams,
+    // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / RAMP / LFO)
+    // have no @param directives to parse — their configs come from dataNodeParams,
     // the single source shared with the Inspector and the compound surface.
     for (const node of graph.nodes) {
       if (!map[node.id]?.length) {

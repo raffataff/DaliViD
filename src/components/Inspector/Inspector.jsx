@@ -6,13 +6,14 @@ import { parseParams } from '../../utils/paramParser'
 import { prepareImageDataURL } from '../../utils/imageProcessing'
 import { TEXT_FONTS } from '../../utils/textRenderer'
 import { getNodeSource, getShaderSource } from '../../shaders/shaderRegistry'
-import { getDataNodeParams } from '../../shaders/dataNodeParams'
+import { getDataNodeParams, visibleDataParams } from '../../shaders/dataNodeParams'
 import { SHAPE_PRESETS } from '../../utils/generatorClips'
 import { ASPECT_PRESETS } from '../../utils/aspectPresets'
 import { BLEND_MODE_NAMES } from '../../gl/BlendModes.glsl.js'
 import { TRANSITION_TYPES, getTransitionLabel, getTransitionParams, getTransitionDefaults } from '../../shaders/transitionRegistry.js'
 import { isTransitionCompound } from '../../utils/compoundUtils'
 import { keyAtTime } from '../../utils/keyframes'
+import { CLIP_TRANSFORM_NODE_ID, getTransformConfigs, clipSupportsTransform } from '../../utils/clipTransform'
 import './Inspector.css'
 
 // Photoshop-style grouping of BLEND_MODE_NAMES (which is already in canonical
@@ -185,13 +186,19 @@ function NodeInspector({ nodeId, graphLevel, clipId }) {
   }
 
   const shaderSrc = getNodeSource(node)
-  // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) have no
-  // @param directives, so their controls come from the shared table — which also
-  // gives them Inspector-side keyframing, like every other param.
-  const paramConfigs = shaderSrc ? parseParams(shaderSrc) : getDataNodeParams(node.type)
+  // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / RAMP / LFO)
+  // have no @param directives, so their controls come from the shared table —
+  // which also gives them Inspector-side keyframing, like every other param.
+  const allParamConfigs = shaderSrc ? parseParams(shaderSrc) : getDataNodeParams(node.type)
   const isParamConnected = (paramName) => {
     return graph?.edges?.some(edge => edge.toNode === nodeId && edge.toSocket === paramName) || false
   }
+  // Hide controls a `showIf` rules out (Beats/Cycle with Beat Sync off, …), but
+  // never one that's wired — a connected param must stay inspectable.
+  const connectedParams = new Set(
+    (graph?.edges || []).filter(e => e.toNode === nodeId).map(e => e.toSocket)
+  )
+  const paramConfigs = visibleDataParams(allParamConfigs, node.params, connectedParams)
 
   return (
     <div className="inspector__section">
@@ -273,8 +280,8 @@ function CompoundInspector({ node, graphLevel, clipId, onUpdateExposedParam, onE
   // Gather all inner params grouped by node
   const innerParamsByNode = []
   for (const innerNode of innerNodes) {
-    // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) get
-    // their configs from the shared table; everything else parses its shader.
+    // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / RAMP / LFO)
+    // get their configs from the shared table; everything else parses its shader.
     let params = getDataNodeParams(innerNode.type)
     if (!params.length) {
       const shaderSrc = getNodeSource(innerNode)
@@ -620,6 +627,100 @@ function ShapeStyleEditor({ params, onChange, onApplyPreset }) {
   )
 }
 
+// Per-clip Pan / Zoom / Rotate. The controls are generated from the TRANSFORM
+// shader's own @param configs (utils/clipTransform.js) and the Renderer drives
+// that same compiled program, so this section and an in-graph TRANSFORM node can
+// never drift apart — add a @param to the shader and it shows up in both.
+//
+// Keyframes are stored against a reserved node id (CLIP_TRANSFORM_NODE_ID),
+// which is what lets a clip animate a punch-in with no node graph at all. For a
+// hands-off Ken Burns, a TIME node in the clip graph driving a TRANSFORM node's
+// Zoom is the alternative — that one re-times itself when the clip is trimmed.
+function ClipTransformEditor({ clip }) {
+  const updateClip = useTimelineStore(s => s.updateClip)
+  const keyframes = useTimelineStore(s => s.keyframes)
+  const addKeyframe = useTimelineStore(s => s.addKeyframe)
+  const removeKeyframe = useTimelineStore(s => s.removeKeyframe)
+  const clearNodeKeyframes = useTimelineStore(s => s.clearNodeKeyframes)
+  const playheadTime = useAppStore(s => s.playheadTime)
+  const fps = useAppStore(s => s.fps)
+
+  const configs = getTransformConfigs()
+  const t = clip.transform || {}
+  // Clip-relative, so the animation travels with the clip when it's moved.
+  const localTime = Math.max(0, playheadTime - clip.timelineStart)
+  const tolerance = 0.5 / (fps || 30)
+
+  const getTrack = (paramName) => keyframes.find(
+    k => k.clipId === clip.id && k.nodeId === CLIP_TRANSFORM_NODE_ID && k.paramName === paramName
+  )
+  const setParam = (paramName, value) => {
+    updateClip(clip.id, { transform: { ...t, [paramName]: value } })
+    // Auto-key while the param is animated — otherwise the edit would be
+    // silently overridden by the animation on the very next frame.
+    if (getTrack(paramName)) addKeyframe(clip.id, CLIP_TRANSFORM_NODE_ID, paramName, localTime, value)
+  }
+  const toggleKeyframe = (paramName, value) => {
+    const track = getTrack(paramName)
+    const existing = track && keyAtTime(track.keys, localTime, tolerance)
+    if (existing) removeKeyframe(clip.id, CLIP_TRANSFORM_NODE_ID, paramName, existing.time)
+    else addKeyframe(clip.id, CLIP_TRANSFORM_NODE_ID, paramName, localTime, value)
+  }
+
+  const hasKeys = keyframes.some(k => k.clipId === clip.id && k.nodeId === CLIP_TRANSFORM_NODE_ID)
+  const isDefault = (!clip.transform || Object.keys(clip.transform).length === 0) && !hasKeys
+
+  return (
+    <>
+      <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '0 8px 6px' }}>
+        Pan moves the <em>view</em>, so the picture slides the other way — like a camera.
+        Key ◆ Zoom and Pan at two points for a punch-in.
+      </div>
+      {configs.map(cfg => {
+        const keyframable = cfg.type === 'slider'
+        const track = keyframable ? getTrack(cfg.uniformName) : null
+        const keyHere = track ? keyAtTime(track.keys, localTime, tolerance) : null
+        const value = t[cfg.uniformName] ?? cfg.default
+        return (
+          <div key={cfg.uniformName} className="inspector__param-row">
+            {keyframable && (
+              <button
+                className={`inspector__kf-btn ${keyHere ? 'inspector__kf-btn--on' : ''} ${track && !keyHere ? 'inspector__kf-btn--track' : ''}`}
+                title={keyHere ? 'Remove keyframe at playhead' : (track ? 'Add keyframe at playhead (param is animated)' : 'Add keyframe at playhead')}
+                onClick={() => toggleKeyframe(cfg.uniformName, value)}
+              >
+                ◆
+              </button>
+            )}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <InspectorParam
+                nodeId={`xf_${clip.id}`}
+                param={cfg}
+                value={value}
+                onChange={(v) => setParam(cfg.uniformName, v)}
+                isConnected={false}
+              />
+            </div>
+          </div>
+        )
+      })}
+      {/* Reset must clear the keyframe tracks too — leaving them would re-drive
+          the transform on the very next frame and the reset would do nothing. */}
+      <button
+        className="inspector__btn"
+        disabled={isDefault}
+        onClick={() => {
+          updateClip(clip.id, { transform: null })
+          clearNodeKeyframes(clip.id, CLIP_TRANSFORM_NODE_ID)
+        }}
+        style={{ margin: '4px 8px 0' }}
+      >
+        Reset Transform{hasKeys ? ' + Keys' : ''}
+      </button>
+    </>
+  )
+}
+
 function ClipInspector({ clipId }) {
   const clips = useTimelineStore(s => s.clips)
   const updateClip = useTimelineStore(s => s.updateClip)
@@ -628,7 +729,10 @@ function ClipInspector({ clipId }) {
   const clip = clips.find(c => c.id === clipId)
   if (!clip) return <div className="inspector__empty">No clip selected</div>
 
-  const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen'
+  // Transitions apply to anything with a picture — including the text / image /
+  // shape generators, which is where a blend-in matters most (a title card
+  // dissolving in from nothing). Audio clips have no picture, so they're out.
+  const supportsTransition = clipSupportsTransform(clip)
 
   // Merge one generator param into the clip, keeping the rest.
   const setParam = (key, value) => updateClip(clipId, { params: { ...clip.params, [key]: value } })
@@ -655,13 +759,10 @@ function ClipInspector({ clipId }) {
 
   // Node-graph transitions: any library compound with ≥ 2 image inputs.
   const transitionCompounds = compoundLibrary.filter(isTransitionCompound)
-  const isCompoundTransition = clip.transition?.type?.startsWith('compound:')
-  const compoundEntry = isCompoundTransition
-    ? transitionCompounds.find(c => `compound:${c.id}` === clip.transition.type) || null
-    : null
 
-  // The previous clip on this track that overlaps this clip's start — the
-  // transition-in plays across that overlap window.
+  // The previous clip on this track that overlaps this clip's start — when one
+  // exists it defines the transition-in window (and takes priority over the
+  // fade handle, so existing overlap transitions time out exactly as before).
   const prevOverlap = clips
     .filter(c => c.trackId === clip.trackId && c.id !== clip.id &&
       c.timelineStart < clip.timelineStart && c.timelineEnd > clip.timelineStart)
@@ -669,6 +770,32 @@ function ClipInspector({ clipId }) {
   const overlapDur = prevOverlap
     ? Math.min(prevOverlap.timelineEnd, clip.timelineEnd) - clip.timelineStart
     : 0
+
+  // A later clip overlapping this clip's fade-out window. If it runs its own
+  // transition-in, that window is already spoken for and this clip's
+  // transition-out is suppressed (the renderer makes the same call per frame).
+  const fadeOutStart = clip.timelineEnd - Math.min(clip.fadeOut || 0, clip.timelineEnd - clip.timelineStart)
+  const nextOverlap = clips
+    .filter(c => c.trackId === clip.trackId && c.id !== clip.id && c.transition?.type &&
+      c.timelineStart > clip.timelineStart && c.timelineStart < clip.timelineEnd &&
+      c.timelineEnd > fadeOutStart)
+    .sort((a, b) => a.timelineStart - b.timelineStart)[0] || null
+  const nextOwnsWindow = !!nextOverlap
+
+  // Duration hints. In: the overlap if there is one, else the fade-in handle
+  // (blending in from whatever is underneath — the lower tracks, or nothing).
+  // Out: always the fade-out handle.
+  const inHint = overlapDur > 0.001
+    ? { ok: true, text: `Plays over the ${overlapDur.toFixed(2)}s overlap with “${prevOverlap.filename}”` }
+    : (clip.fadeIn > 0
+      ? { ok: true, text: `No overlap — blends in from whatever is underneath over the ${(clip.fadeIn).toFixed(2)}s fade-in handle` }
+      : { ok: false, text: 'Set a Fade In above (or drag the clip’s left fade handle) to give this a duration — or overlap the previous clip' })
+
+  const outHint = nextOwnsWindow
+    ? { ok: false, text: `“${nextOverlap.filename}” overlaps this clip’s end and runs its own transition-in, which owns that window` }
+    : (clip.fadeOut > 0
+      ? { ok: true, text: `Blends out to whatever is underneath over the ${(clip.fadeOut).toFixed(2)}s fade-out handle` }
+      : { ok: false, text: 'Set a Fade Out above (or drag the clip’s right fade handle) to give this a duration' })
 
   return (
     <div className="inspector__section">
@@ -679,8 +806,22 @@ function ClipInspector({ clipId }) {
       <div className="inspector__field"><label className="inspector__label">Speed</label><div className="inspector__slider"><input type="range" min={0.1} max={4} step={0.05} value={clip.speed || 1} onChange={(e) => updateClip(clipId, { speed: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.speed || 1).toFixed(2)}×</span></div></div>
       <div className="inspector__field"><label className="inspector__label">Opacity</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={clip.opacity || 1} onChange={(e) => updateClip(clipId, { opacity: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{((clip.opacity || 1) * 100).toFixed(0)}%</span></div></div>
       <div className="inspector__field"><label className="inspector__label">Blend Mode</label><BlendModeSelect allowInherit value={clip.blendMode || 'Inherit'} onChange={(v) => updateClip(clipId, { blendMode: v })} /></div>
-      <div className="inspector__field"><label className="inspector__label">Fade In</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeIn || 0} onChange={(e) => updateClip(clipId, { fadeIn: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeIn || 0).toFixed(2)}s</span></div></div>
-      <div className="inspector__field"><label className="inspector__label">Fade Out</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeOut || 0} onChange={(e) => updateClip(clipId, { fadeOut: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeOut || 0).toFixed(2)}s</span></div></div>
+      {/* The fade handles double as the transition-in/out duration: with a
+          transition set, the handle stops being a plain opacity ramp and
+          becomes that transition's window (the renderer drops the ramp so the
+          two don't compound into a double-fade). */}
+      <div className="inspector__field"><label className="inspector__label">{clip.transition?.type && overlapDur <= 0.001 ? 'Fade In → Transition' : 'Fade In'}</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeIn || 0} onChange={(e) => updateClip(clipId, { fadeIn: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeIn || 0).toFixed(2)}s</span></div></div>
+      <div className="inspector__field"><label className="inspector__label">{clip.transitionOut?.type && !nextOwnsWindow ? 'Fade Out → Transition' : 'Fade Out'}</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeOut || 0} onChange={(e) => updateClip(clipId, { fadeOut: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeOut || 0).toFixed(2)}s</span></div></div>
+
+      {/* Framing comes before the content sections: it applies to every clip
+          kind that has a picture, and is applied before the clip's effect graph
+          sees the frame. Audio clips are excluded — they have no picture. */}
+      {clipSupportsTransform(clip) && (
+        <>
+          <div className="inspector__section-header" style={{ marginTop: 12 }}>Transform (Pan / Zoom)</div>
+          <ClipTransformEditor clip={clip} />
+        </>
+      )}
 
       {clip.fileType === 'text' && (
         <>
@@ -724,87 +865,125 @@ function ClipInspector({ clipId }) {
         </>
       )}
 
-      {isVideoClip && (
+      {supportsTransition && (
         <>
           <div className="inspector__section-header" style={{ marginTop: 12 }}>Transition In</div>
-          <div className="inspector__field">
-            <label className="inspector__label">Type</label>
-            <select
-              className="inspector__select"
-              value={clip.transition?.type || ''}
-              onChange={(e) => {
-                const type = e.target.value
-                // Built-ins start from registry defaults; compound transitions
-                // start empty — the entry's exposedParams carry their defaults.
-                const params = type && !type.startsWith('compound:') ? getTransitionDefaults(type) : {}
-                updateClip(clipId, { transition: type ? { type, params } : null })
-              }}
-            >
-              <option value="">None</option>
-              <optgroup label="Built-in">
-                {TRANSITION_TYPES.map(t => <option key={t} value={t}>{getTransitionLabel(t)}</option>)}
-              </optgroup>
-              {transitionCompounds.length > 0 && (
-                <optgroup label="Custom (Node Graph)">
-                  {transitionCompounds.map(c => (
-                    <option key={c.id} value={`compound:${c.id}`}>{c.name}</option>
-                  ))}
-                </optgroup>
-              )}
-              {isCompoundTransition && !compoundEntry && (
-                <option value={clip.transition.type} disabled>(missing compound)</option>
-              )}
-            </select>
-          </div>
-          {clip.transition?.type && (
-            <>
-              {overlapDur > 0 ? (
-                <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '2px 8px 6px' }}>
-                  Plays over the {overlapDur.toFixed(2)}s overlap with “{prevOverlap.filename}”
-                </div>
-              ) : (
-                <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
-                  No overlap — drag this clip so it overlaps the previous clip on this track to activate
-                </div>
-              )}
-              {isCompoundTransition && !compoundEntry && (
-                <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
-                  This node transition is no longer in the compound library — the clip falls back to its blend mode
-                </div>
-              )}
-              {/* Built-in transitions: params parsed from the registry shader */}
-              {!isCompoundTransition && getTransitionParams(clip.transition.type).map(param => (
-                <InspectorParam
-                  key={param.uniformName}
-                  nodeId={clipId}
-                  param={param}
-                  value={clip.transition.params?.[param.uniformName] ?? param.default}
-                  onChange={(v) => updateClip(clipId, {
-                    transition: { ...clip.transition, params: { ...clip.transition.params, [param.uniformName]: v } },
-                  })}
-                  isConnected={false}
-                />
-              ))}
-              {/* Node transitions: the compound's exposed params, keyed by index */}
-              {compoundEntry && (compoundEntry.exposedParams || []).map((ep, i) => (
-                <InspectorParam
-                  key={`${compoundEntry.id}_${i}`}
-                  nodeId={clipId}
-                  param={{ ...ep.paramConfig, name: ep.displayName || ep.paramConfig?.name }}
-                  value={clip.transition.params?.[i] ?? ep.value ?? ep.paramConfig?.default}
-                  onChange={(v) => updateClip(clipId, {
-                    transition: { ...clip.transition, params: { ...clip.transition.params, [i]: v } },
-                  })}
-                  isConnected={false}
-                />
-              ))}
-            </>
-          )}
+          <ClipTransitionEditor
+            clipId={clipId}
+            transition={clip.transition}
+            field="transition"
+            transitionCompounds={transitionCompounds}
+            hint={inHint}
+          />
+
+          <div className="inspector__section-header" style={{ marginTop: 12 }}>Transition Out</div>
+          <ClipTransitionEditor
+            clipId={clipId}
+            transition={clip.transitionOut}
+            field="transitionOut"
+            transitionCompounds={transitionCompounds}
+            hint={outHint}
+          />
         </>
       )}
 
       <button className="inspector__btn inspector__btn--primary" onClick={() => enterClipGraph(clipId)} style={{ marginTop: 12 }}>Open Effect Graph</button>
     </div>
+  )
+}
+
+/**
+ * Type selector + parameter sliders for ONE end of a clip's transition.
+ * Rendered twice (in / out) against different clip fields, which is why the
+ * field name is a prop rather than two near-identical blocks — the built-in vs
+ * compound branching, the missing-entry fallback and the param plumbing are
+ * fiddly enough that a second copy would drift.
+ *
+ * @param {string} field — 'transition' (in) or 'transitionOut' (out)
+ * @param {object} hint  — { ok, text }: what times this transition, or why it
+ *   currently won't play. Computed by the caller, which knows the neighbours.
+ */
+function ClipTransitionEditor({ clipId, transition, field, transitionCompounds, hint }) {
+  const updateClip = useTimelineStore(s => s.updateClip)
+
+  const isCompound = !!transition?.type?.startsWith('compound:')
+  const compoundEntry = isCompound
+    ? transitionCompounds.find(c => `compound:${c.id}` === transition.type) || null
+    : null
+
+  const setParams = (params) => updateClip(clipId, { [field]: { ...transition, params } })
+
+  return (
+    <>
+      <div className="inspector__field">
+        <label className="inspector__label">Type</label>
+        <select
+          className="inspector__select"
+          value={transition?.type || ''}
+          onChange={(e) => {
+            const type = e.target.value
+            // Built-ins start from registry defaults; compound transitions start
+            // empty — the entry's exposedParams carry their own defaults.
+            const params = type && !type.startsWith('compound:') ? getTransitionDefaults(type) : {}
+            updateClip(clipId, { [field]: type ? { type, params } : null })
+          }}
+        >
+          <option value="">None</option>
+          <optgroup label="Built-in">
+            {TRANSITION_TYPES.map(t => <option key={t} value={t}>{getTransitionLabel(t)}</option>)}
+          </optgroup>
+          {transitionCompounds.length > 0 && (
+            <optgroup label="Custom (Node Graph)">
+              {transitionCompounds.map(c => (
+                <option key={c.id} value={`compound:${c.id}`}>{c.name}</option>
+              ))}
+            </optgroup>
+          )}
+          {isCompound && !compoundEntry && (
+            <option value={transition.type} disabled>(missing compound)</option>
+          )}
+        </select>
+      </div>
+
+      {transition?.type && (
+        <>
+          <div style={{
+            fontSize: 10,
+            color: hint.ok ? 'var(--text-secondary)' : 'var(--accent-amber)',
+            padding: '2px 8px 6px',
+          }}>
+            {hint.text}
+          </div>
+          {isCompound && !compoundEntry && (
+            <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
+              This node transition is no longer in the compound library — the clip falls back to its blend mode
+            </div>
+          )}
+          {/* Built-in transitions: params parsed from the registry shader */}
+          {!isCompound && getTransitionParams(transition.type).map(param => (
+            <InspectorParam
+              key={param.uniformName}
+              nodeId={clipId}
+              param={param}
+              value={transition.params?.[param.uniformName] ?? param.default}
+              onChange={(v) => setParams({ ...transition.params, [param.uniformName]: v })}
+              isConnected={false}
+            />
+          ))}
+          {/* Node transitions: the compound's exposed params, keyed by index */}
+          {compoundEntry && (compoundEntry.exposedParams || []).map((ep, i) => (
+            <InspectorParam
+              key={`${compoundEntry.id}_${i}`}
+              nodeId={clipId}
+              param={{ ...ep.paramConfig, name: ep.displayName || ep.paramConfig?.name }}
+              value={transition.params?.[i] ?? ep.value ?? ep.paramConfig?.default}
+              onChange={(v) => setParams({ ...transition.params, [i]: v })}
+              isConnected={false}
+            />
+          ))}
+        </>
+      )}
+    </>
   )
 }
 

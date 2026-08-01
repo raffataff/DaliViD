@@ -5,7 +5,20 @@ import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import { IconChevronDown, IconPlus, IconLock } from '../common/Icons'
 import { makeImageClipParams, makeTextClipParams, makeShapeClipParams, DEFAULT_GENERATOR_DURATION } from '../../utils/generatorClips'
+import { getTransitionLabel } from '../../shaders/transitionRegistry'
 import './Timeline.css'
+
+/**
+ * Human-readable name for a clip transition, for the ⇄ badge tooltip.
+ * "compound:<libId>" resolves against the compound library; a stale id (the
+ * entry was deleted) reads as unknown rather than leaking the raw id.
+ */
+function transitionBadgeLabel(type, compoundLibrary) {
+  if (!type) return ''
+  if (!type.startsWith('compound:')) return getTransitionLabel(type)
+  const id = type.slice('compound:'.length)
+  return compoundLibrary?.find(c => c.id === id)?.name || 'missing node transition'
+}
 
 /**
  * Timeline panel — horizontal ruler, tracks, clips, playhead, zoom.
@@ -65,6 +78,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const enterClipGraph = useAppStore(s => s.enterClipGraph)
   const clipGraphs = useGraphStore(s => s.clipGraphs)
   const initClipGraph = useGraphStore(s => s.initClipGraph)
+  const compoundLibrary = useGraphStore(s => s.compoundLibrary)
 
   const pxPerSec = 80 * timelineZoom
   const TRACK_HEADER_W = 160
@@ -890,13 +904,17 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                                   className="timeline__clip-fade-handle"
                                   style={{ left: Math.max(1, Math.min(width - 11, fadeInW - 5)) }}
                                   onMouseDown={(e) => handleFadeMouseDown(e, clip, 'in')}
-                                  title={`Fade in: ${(clip.fadeIn || 0).toFixed(2)}s — drag`}
+                                  title={clip.transition?.type
+                                    ? `Transition in: ${(clip.fadeIn || 0).toFixed(2)}s — drag to set the duration`
+                                    : `Fade in: ${(clip.fadeIn || 0).toFixed(2)}s — drag`}
                                 />
                                 <div
                                   className="timeline__clip-fade-handle"
                                   style={{ left: Math.max(1, Math.min(width - 11, width - fadeOutW - 5)) }}
                                   onMouseDown={(e) => handleFadeMouseDown(e, clip, 'out')}
-                                  title={`Fade out: ${(clip.fadeOut || 0).toFixed(2)}s — drag`}
+                                  title={clip.transitionOut?.type
+                                    ? `Transition out: ${(clip.fadeOut || 0).toFixed(2)}s — drag to set the duration`
+                                    : `Fade out: ${(clip.fadeOut || 0).toFixed(2)}s — drag`}
                                 />
                               </>
                             )}
@@ -913,8 +931,20 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                             {(hasGraph || clip.hasEffects) && (
                               <div className="timeline__clip-fx-badge" style={{ color: track.color }}>FX</div>
                             )}
+                            {/* ⇄ marks the end that carries a transition. In sits
+                                left, out sits right, so a clip that blends in AND
+                                out reads at a glance. */}
                             {clip.transition?.type && (
-                              <div className="timeline__clip-transition-badge" title="Has a transition-in — plays over the overlap with the previous clip">⇄</div>
+                              <div
+                                className="timeline__clip-transition-badge timeline__clip-transition-badge--in"
+                                title={`Transition in: ${transitionBadgeLabel(clip.transition.type, compoundLibrary)} — plays over the overlap with the previous clip, or over the fade-in handle when there is none`}
+                              >⇄</div>
+                            )}
+                            {clip.transitionOut?.type && (
+                              <div
+                                className="timeline__clip-transition-badge timeline__clip-transition-badge--out"
+                                title={`Transition out: ${transitionBadgeLabel(clip.transitionOut.type, compoundLibrary)} — plays over the fade-out handle`}
+                              >⇄</div>
                             )}
                             {clip.audioMuted && (
                               <div className="timeline__clip-audio-muted" title="Clip audio muted">♪×</div>
