@@ -25,6 +25,12 @@ export const NODE_COLORS = {
   'TUNNEL': '#ff8844', 'GEOMETRIC': '#88aa44', 'LIGHTNING': '#44ffaa',
   'CRYSTAL': '#aaccff', 'COSMIC': '#aa44ff', 'WAVES': '#4488ff',
   'SPACE_DISTORTION': '#ccaa44',
+  // 3D / Depth family — one hue family so a depth sub-graph reads as a unit on
+  // the canvas and in the minimap. DEPTH is the brightest: it is the producer.
+  'DEPTH': '#66ddff', 'NORMALS_3D': '#4fb8d8', 'RELIGHT_3D': '#ffd9a0',
+  'AO_3D': '#7b8fa8', 'FOG_3D': '#a8c4d8', 'BOKEH_3D': '#c9a8ff',
+  'CAMERA_3D': '#5ce6c0', 'MULTIPLANE': '#8ad9a0', 'STEREO_3D': '#ff8a8a',
+  'VOXEL_3D': '#d8c86a', 'DEPTH_DISPLACE': '#e08adf', 'TIME_SLICE_3D': '#9a8cff',
 }
 
 // Must match .node-card { width } in NodeCard.css — marquee hit-testing and the

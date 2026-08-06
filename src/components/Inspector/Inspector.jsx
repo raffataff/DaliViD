@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useSyncExternalStore, useCallback } from 'react'
 import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import useTimelineStore from '../../store/useTimelineStore'
@@ -12,7 +12,17 @@ import { ASPECT_PRESETS } from '../../utils/aspectPresets'
 import { BLEND_MODE_NAMES } from '../../gl/BlendModes.glsl.js'
 import { TRANSITION_TYPES, getTransitionLabel, getTransitionParams, getTransitionDefaults } from '../../shaders/transitionRegistry.js'
 import { isTransitionCompound } from '../../utils/compoundUtils'
+import {
+  EDGE_HEAD, EDGE_TAIL, edgeLabel, getEdgeTransition, setEdgeTransitionPatch,
+  findPrevOverlap, findNextOverlap, headRegion, tailRegion,
+  transitionGraphKey, GRAPH_TYPE, isGraphType, isCompoundType, compoundIdOf,
+} from '../../utils/clipTransitions'
 import { keyAtTime } from '../../utils/keyframes'
+import {
+  ALPHA_AUTO, ALPHA_MODES, ALPHA_DETECTION_LABELS, ALPHA_PREMULTIPLIED,
+  alphaSourceKey, resolveAlphaMode,
+} from '../../utils/alphaModes'
+import { getDetectedAlpha, onAlphaDetected } from '../../gl/alphaRegistry'
 import './Inspector.css'
 
 // Photoshop-style grouping of BLEND_MODE_NAMES (which is already in canonical
@@ -620,6 +630,69 @@ function ShapeStyleEditor({ params, onChange, onApplyPreset }) {
   )
 }
 
+/**
+ * Per-clip alpha interpretation (see utils/alphaModes).
+ *
+ * The detected mode comes from the Renderer's GPU probe via `alphaRegistry`,
+ * not from a store — detection happens inside the render loop, and writing it
+ * to Zustand would re-render the app on every probe. `useSyncExternalStore`
+ * subscribes to the registry so the readout updates the moment a verdict lands
+ * and costs nothing the rest of the time.
+ */
+function ClipAlphaSection({ clip, onChange }) {
+  const key = alphaSourceKey(clip)
+  const subscribe = useCallback((cb) => onAlphaDetected(cb), [])
+  const detected = useSyncExternalStore(
+    subscribe,
+    () => getDetectedAlpha(key),
+    () => null,
+  )
+
+  const mode = clip.alphaMode || ALPHA_AUTO
+  const effective = resolveAlphaMode(mode, detected)
+  const active = ALPHA_MODES.find(m => m.value === mode)
+
+  return (
+    <>
+      <div className="inspector__section-header" style={{ marginTop: 12 }}>Alpha Channel</div>
+      <div className="inspector__field">
+        <label className="inspector__label">Interpret As</label>
+        <select
+          className="inspector__select"
+          value={mode}
+          onChange={(e) => onChange({ alphaMode: e.target.value })}
+        >
+          {ALPHA_MODES.map(m => (
+            <option key={m.value} value={m.value}>{m.label}</option>
+          ))}
+        </select>
+      </div>
+      <div className="inspector__field">
+        <label className="inspector__label">Detected</label>
+        <span className="inspector__value inspector__value--mono">
+          {detected ? ALPHA_DETECTION_LABELS[detected] : 'Analysing…'}
+        </span>
+      </div>
+      {/* A matte colour only means anything for premultiplied sources: it is the
+          colour the footage was composited against before being multiplied.
+          Black covers almost everything; white matters for old QuickTime and
+          some render-farm output. */}
+      {effective === ALPHA_PREMULTIPLIED && (
+        <FieldColor
+          label="Matte Colour"
+          value={clip.alphaMatte}
+          def="#000000"
+          onChange={(v) => onChange({ alphaMatte: v })}
+        />
+      )}
+      <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '0 8px 6px', lineHeight: 1.5 }}>
+        {active?.hint}
+        {detected === null && ' Detection runs on the first frames the clip renders.'}
+      </div>
+    </>
+  )
+}
+
 function ClipInspector({ clipId }) {
   const clips = useTimelineStore(s => s.clips)
   const updateClip = useTimelineStore(s => s.updateClip)
@@ -655,20 +728,13 @@ function ClipInspector({ clipId }) {
 
   // Node-graph transitions: any library compound with ≥ 2 image inputs.
   const transitionCompounds = compoundLibrary.filter(isTransitionCompound)
-  const isCompoundTransition = clip.transition?.type?.startsWith('compound:')
-  const compoundEntry = isCompoundTransition
-    ? transitionCompounds.find(c => `compound:${c.id}` === clip.transition.type) || null
-    : null
 
-  // The previous clip on this track that overlaps this clip's start — the
-  // transition-in plays across that overlap window.
-  const prevOverlap = clips
-    .filter(c => c.trackId === clip.trackId && c.id !== clip.id &&
-      c.timelineStart < clip.timelineStart && c.timelineEnd > clip.timelineStart)
-    .sort((a, b) => b.timelineStart - a.timelineStart)[0] || null
-  const overlapDur = prevOverlap
-    ? Math.min(prevOverlap.timelineEnd, clip.timelineEnd) - clip.timelineStart
-    : 0
+  // Live geometry for both edge regions (see utils/clipTransitions).
+  const edgeRegions = {
+    [EDGE_HEAD]: headRegion(clip, findPrevOverlap(clip, clips)),
+    [EDGE_TAIL]: tailRegion(clip, findNextOverlap(clip, clips)),
+  }
+  const nextOverlap = findNextOverlap(clip, clips)
 
   return (
     <div className="inspector__section">
@@ -677,10 +743,54 @@ function ClipInspector({ clipId }) {
       <div className="inspector__field"><label className="inspector__label">End</label><span className="inspector__value inspector__value--mono">{clip.timelineEnd.toFixed(2)}s</span></div>
       <div className="inspector__field"><label className="inspector__label">Duration</label><span className="inspector__value inspector__value--mono">{(clip.timelineEnd - clip.timelineStart).toFixed(2)}s</span></div>
       <div className="inspector__field"><label className="inspector__label">Speed</label><div className="inspector__slider"><input type="range" min={0.1} max={4} step={0.05} value={clip.speed || 1} onChange={(e) => updateClip(clipId, { speed: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.speed || 1).toFixed(2)}×</span></div></div>
+      {(clip.fileType === 'video' || clip.fileType === 'audio') && (
+        <>
+          <div className="inspector__field">
+            <label className="inspector__label">Reverse</label>
+            <label className="inspector__toggle">
+              <input type="checkbox" checked={!!clip.reversed} onChange={(e) => updateClip(clipId, { reversed: e.target.checked })} />
+              <span className="inspector__toggle-slider" />
+            </label>
+          </div>
+          {clip.reversed && (
+            <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '0 8px 6px' }}>
+              Preview is seek-driven and silent; the export renders reversed audio.
+            </div>
+          )}
+        </>
+      )}
       <div className="inspector__field"><label className="inspector__label">Opacity</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={clip.opacity || 1} onChange={(e) => updateClip(clipId, { opacity: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{((clip.opacity || 1) * 100).toFixed(0)}%</span></div></div>
       <div className="inspector__field"><label className="inspector__label">Blend Mode</label><BlendModeSelect allowInherit value={clip.blendMode || 'Inherit'} onChange={(v) => updateClip(clipId, { blendMode: v })} /></div>
-      <div className="inspector__field"><label className="inspector__label">Fade In</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeIn || 0} onChange={(e) => updateClip(clipId, { fadeIn: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeIn || 0).toFixed(2)}s</span></div></div>
-      <div className="inspector__field"><label className="inspector__label">Fade Out</label><div className="inspector__slider"><input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeOut || 0} onChange={(e) => updateClip(clipId, { fadeOut: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.fadeOut || 0).toFixed(2)}s</span></div></div>
+      {/* Region lengths. These ARE the transition durations — the effect each
+          region runs is chosen in the two sections further down. A head region
+          backed by an overlap takes its length from that overlap instead, so
+          the slider is disabled rather than silently ignored. */}
+      <div className="inspector__field">
+        <label className="inspector__label">In Length</label>
+        {edgeRegions[EDGE_HEAD]?.mode === 'crossfade' ? (
+          <span className="inspector__value inspector__value--mono" title="Set by the overlap with the previous clip — move either clip to change it">
+            {edgeRegions[EDGE_HEAD].dur.toFixed(2)}s (overlap)
+          </span>
+        ) : (
+          <div className="inspector__slider">
+            <input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeIn || 0} onChange={(e) => updateClip(clipId, { fadeIn: parseFloat(e.target.value) })} />
+            <span className="inspector__slider-value">{(clip.fadeIn || 0).toFixed(2)}s</span>
+          </div>
+        )}
+      </div>
+      <div className="inspector__field">
+        <label className="inspector__label">Out Length</label>
+        <div className="inspector__slider">
+          <input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeOut || 0} onChange={(e) => updateClip(clipId, { fadeOut: parseFloat(e.target.value) })} />
+          <span className="inspector__slider-value">{(clip.fadeOut || 0).toFixed(2)}s</span>
+        </div>
+      </div>
+
+      {/* Only file-backed video: live camera/screen streams are opaque by
+          construction, and generator clips draw their own alpha. */}
+      {clip.fileType === 'video' && (
+        <ClipAlphaSection clip={clip} onChange={(patch) => updateClip(clipId, patch)} />
+      )}
 
       {clip.fileType === 'text' && (
         <>
@@ -724,87 +834,153 @@ function ClipInspector({ clipId }) {
         </>
       )}
 
-      {isVideoClip && (
-        <>
-          <div className="inspector__section-header" style={{ marginTop: 12 }}>Transition In</div>
-          <div className="inspector__field">
-            <label className="inspector__label">Type</label>
-            <select
-              className="inspector__select"
-              value={clip.transition?.type || ''}
-              onChange={(e) => {
-                const type = e.target.value
-                // Built-ins start from registry defaults; compound transitions
-                // start empty — the entry's exposedParams carry their defaults.
-                const params = type && !type.startsWith('compound:') ? getTransitionDefaults(type) : {}
-                updateClip(clipId, { transition: type ? { type, params } : null })
-              }}
-            >
-              <option value="">None</option>
-              <optgroup label="Built-in">
-                {TRANSITION_TYPES.map(t => <option key={t} value={t}>{getTransitionLabel(t)}</option>)}
-              </optgroup>
-              {transitionCompounds.length > 0 && (
-                <optgroup label="Custom (Node Graph)">
-                  {transitionCompounds.map(c => (
-                    <option key={c.id} value={`compound:${c.id}`}>{c.name}</option>
-                  ))}
-                </optgroup>
-              )}
-              {isCompoundTransition && !compoundEntry && (
-                <option value={clip.transition.type} disabled>(missing compound)</option>
-              )}
-            </select>
-          </div>
-          {clip.transition?.type && (
-            <>
-              {overlapDur > 0 ? (
-                <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '2px 8px 6px' }}>
-                  Plays over the {overlapDur.toFixed(2)}s overlap with “{prevOverlap.filename}”
-                </div>
-              ) : (
-                <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
-                  No overlap — drag this clip so it overlaps the previous clip on this track to activate
-                </div>
-              )}
-              {isCompoundTransition && !compoundEntry && (
-                <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
-                  This node transition is no longer in the compound library — the clip falls back to its blend mode
-                </div>
-              )}
-              {/* Built-in transitions: params parsed from the registry shader */}
-              {!isCompoundTransition && getTransitionParams(clip.transition.type).map(param => (
-                <InspectorParam
-                  key={param.uniformName}
-                  nodeId={clipId}
-                  param={param}
-                  value={clip.transition.params?.[param.uniformName] ?? param.default}
-                  onChange={(v) => updateClip(clipId, {
-                    transition: { ...clip.transition, params: { ...clip.transition.params, [param.uniformName]: v } },
-                  })}
-                  isConnected={false}
-                />
-              ))}
-              {/* Node transitions: the compound's exposed params, keyed by index */}
-              {compoundEntry && (compoundEntry.exposedParams || []).map((ep, i) => (
-                <InspectorParam
-                  key={`${compoundEntry.id}_${i}`}
-                  nodeId={clipId}
-                  param={{ ...ep.paramConfig, name: ep.displayName || ep.paramConfig?.name }}
-                  value={clip.transition.params?.[i] ?? ep.value ?? ep.paramConfig?.default}
-                  onChange={(v) => updateClip(clipId, {
-                    transition: { ...clip.transition, params: { ...clip.transition.params, [i]: v } },
-                  })}
-                  isConnected={false}
-                />
-              ))}
-            </>
-          )}
-        </>
-      )}
+      {isVideoClip && [EDGE_HEAD, EDGE_TAIL].map(edge => (
+        <EdgeTransitionSection
+          key={edge}
+          clip={clip}
+          edge={edge}
+          region={edgeRegions[edge]}
+          nextOverlap={edge === EDGE_TAIL ? nextOverlap : null}
+          transitionCompounds={transitionCompounds}
+        />
+      ))}
 
       <button className="inspector__btn inspector__btn--primary" onClick={() => enterClipGraph(clipId)} style={{ marginTop: 12 }}>Open Effect Graph</button>
     </div>
+  )
+}
+
+/**
+ * One of a clip's two edge transitions. Head and tail are the same control set —
+ * the only differences are which region they read and what the region mixes
+ * against, both of which come from utils/clipTransitions rather than being
+ * re-derived here.
+ */
+function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionCompounds }) {
+  const updateClip = useTimelineStore(s => s.updateClip)
+  const clipGraphs = useGraphStore(s => s.clipGraphs)
+  const enterClipGraph = useAppStore(s => s.enterClipGraph)
+  const setPlayheadTime = useAppStore(s => s.setPlayheadTime)
+
+  const tr = getEdgeTransition(clip, edge)
+  const type = tr?.type || ''
+  const graphKey = transitionGraphKey(clip.id, edge)
+  const hasGraph = !!clipGraphs[graphKey]
+
+  const compoundEntry = isCompoundType(type)
+    ? transitionCompounds.find(c => c.id === compoundIdOf(type)) || null
+    : null
+
+  const setTransition = (next) => updateClip(clip.id, setEdgeTransitionPatch(edge, next))
+  const setParams = (params) => setTransition({ ...tr, params })
+
+  const onPickType = (nextType) => {
+    if (!nextType) { setTransition(null); return }
+    if (isGraphType(nextType)) {
+      if (!hasGraph) useGraphStore.getState().initTransitionGraph(clip.id, edge, compoundEntry?.subGraph || null)
+      setTransition({ type: GRAPH_TYPE, params: {} })
+      return
+    }
+    // Built-ins start from registry defaults; compounds start empty — the
+    // entry's exposedParams carry their own.
+    setTransition({ type: nextType, params: isCompoundType(nextType) ? {} : getTransitionDefaults(nextType) })
+  }
+
+  const openGraph = () => {
+    if (!isGraphType(type)) onPickType(GRAPH_TYPE)
+    if (region) setPlayheadTime(region.start + region.dur * 0.5)
+    enterClipGraph(graphKey)
+  }
+
+  return (
+    <>
+      <div className="inspector__section-header" style={{ marginTop: 12 }}>{edgeLabel(edge)}</div>
+      <div className="inspector__field">
+        <label className="inspector__label">Effect</label>
+        <select className="inspector__select" value={type} onChange={(e) => onPickType(e.target.value)}>
+          <option value="">Fade (opacity ramp)</option>
+          <optgroup label="Built-in">
+            {TRANSITION_TYPES.map(t => <option key={t} value={t}>{getTransitionLabel(t)}</option>)}
+          </optgroup>
+          <optgroup label="Node Graph">
+            <option value={GRAPH_TYPE}>This clip&apos;s own graph</option>
+            {transitionCompounds.map(c => (
+              <option key={c.id} value={`compound:${c.id}`}>{c.name}</option>
+            ))}
+          </optgroup>
+          {isCompoundType(type) && !compoundEntry && (
+            <option value={type} disabled>(missing compound)</option>
+          )}
+        </select>
+      </div>
+
+      {/* What this region mixes against, in plain words. This is the piece the
+          old UI never said out loud, and not saying it is what made transition
+          progress feel arbitrary. */}
+      {!region ? (
+        <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
+          {edge === EDGE_TAIL
+            ? (nextOverlap
+                ? `The next clip “${nextOverlap.filename}” overlaps this one — that cut belongs to its Transition In`
+                : 'No region — give Out Length a value (or drag the clip’s right fade handle)')
+            : 'No region — give In Length a value, or overlap the previous clip for a crossfade'}
+        </div>
+      ) : (
+        <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '2px 8px 6px' }}>
+          {region.mode === 'crossfade'
+            ? `Crossfades with “${region.prev.filename}” over their ${region.dur.toFixed(2)}s overlap`
+            : edge === EDGE_TAIL
+              ? `Plays out to whatever is behind this clip over ${region.dur.toFixed(2)}s — lower tracks, else black`
+              : `Plays in from whatever is behind this clip over ${region.dur.toFixed(2)}s — lower tracks, else black`}
+        </div>
+      )}
+
+      {isCompoundType(type) && !compoundEntry && (
+        <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
+          This node transition is no longer in the compound library — the clip falls back to its blend mode
+        </div>
+      )}
+
+      {isGraphType(type) && (
+        <div style={{ display: 'flex', gap: 6, padding: '2px 8px 6px' }}>
+          <button className="inspector__btn" style={{ flex: 1 }} onClick={openGraph}>Edit Node Graph</button>
+          <button
+            className="inspector__btn"
+            style={{ flex: 1 }}
+            onClick={() => useGraphStore.getState().promoteTransitionGraph(
+              clip.id, edge, `${clip.filename || 'Clip'} ${edgeLabel(edge)}`
+            )}
+            title="Publish a copy to the compound library. This clip keeps its own editable version."
+          >
+            Save to Library
+          </button>
+        </div>
+      )}
+
+      {/* Built-in transitions: params parsed from the registry shader */}
+      {type && !isGraphType(type) && !isCompoundType(type) && getTransitionParams(type).map(param => (
+        <InspectorParam
+          key={param.uniformName}
+          nodeId={clip.id}
+          param={param}
+          value={tr.params?.[param.uniformName] ?? param.default}
+          onChange={(v) => setParams({ ...tr.params, [param.uniformName]: v })}
+          isConnected={false}
+        />
+      ))}
+
+      {/* Shared compounds: the entry's exposed params, keyed by index */}
+      {compoundEntry && (compoundEntry.exposedParams || []).map((ep, i) => (
+        <InspectorParam
+          key={`${compoundEntry.id}_${i}`}
+          nodeId={clip.id}
+          param={{ ...ep.paramConfig, name: ep.displayName || ep.paramConfig?.name }}
+          value={tr.params?.[i] ?? ep.value ?? ep.paramConfig?.default}
+          onChange={(v) => setParams({ ...tr.params, [i]: v })}
+          isConnected={false}
+        />
+      ))}
+    </>
   )
 }
 

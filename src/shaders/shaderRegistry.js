@@ -4,6 +4,8 @@
  * Shaders are imported lazily to keep initial bundle size small.
  */
 
+import { LIB3D } from './lib3d.glsl.js'
+
 // Inline shader sources — each one includes @param directives for the inspector
 const SHADER_SOURCES = {}
 
@@ -1779,33 +1781,48 @@ uniform float u_max_blur;
 // @param name="Use Luminance" type=bool default=true
 uniform bool u_use_lum;
 out vec4 fragColor;
+${LIB3D}
 
 void main() {
+  vec2 px = 1.0 / u_resolution;
   vec4 center = texture(u_texture, v_uv);
+  // Rec.601 luma, kept deliberately instead of lib3d's Rec.709 d3_luma: this
+  // node predates the 3D family and changing its depth estimate would shift the
+  // look of every project that already uses it.
   float depth = u_use_lum
     ? dot(center.rgb, vec3(0.299, 0.587, 0.114))
     : length(v_uv - vec2(0.5)) * 1.414;
 
   // Audio driver (0 until wired): loudness (rms) deepens the blur (clamped).
-  float blur = clamp(abs(depth - u_focus) / u_range, 0.0, 1.0) * min(u_max_blur + u_rms * 6.0, 18.0);
-  int rad = int(blur);
+  float blur = clamp(abs(depth - u_focus) / max(1e-4, u_range), 0.0, 1.0)
+             * min(u_max_blur + u_rms * 6.0, 18.0);
 
-  if (rad <= 0) {
+  if (blur < 0.5) {
     fragColor = center;
     return;
   }
 
-  vec2 px = 1.0 / u_resolution;
-  vec4 sum = vec4(0.0);
-  float total = 0.0;
-  for (int x = -rad; x <= rad; x++) {
-    for (int y = -rad; y <= rad; y++) {
-      float w = exp(-float(x*x + y*y) / (blur * blur * 0.5));
-      sum += texture(u_texture, v_uv + vec2(x, y) * px) * w;
-      total += w;
-    }
+  // Constant-cost gather. This used to be a nested x/y loop over the blur
+  // radius — O(r²), which at radius 18 is a 37×37 kernel, i.e. ~1369 texture
+  // fetches PER PIXEL, and at 1080p that is a slideshow. A 24-tap golden-angle
+  // spiral rotated per pixel resolves comparably at any radius and costs the
+  // same 24 fetches whether the blur is 1px or 18px.
+  //
+  // The params are untouched on purpose, so existing projects keep their values
+  // and simply get faster.
+  const int N = 24;
+  float rot = d3_ign(gl_FragCoord.xy) * D3_TAU;
+  vec4 sum = center;
+  float wsum = 1.0;
+  for (int i = 0; i < N; i++) {
+    vec2 s = d3_vogel(i, N, rot);
+    // Gaussian falloff across the disc, so this stays the soft blur it always
+    // was rather than becoming a hard-edged bokeh disc (that is BOKEH_3D's job).
+    float w = exp(-dot(s, s) * 2.0);
+    sum += texture(u_texture, v_uv + s * blur * px) * w;
+    wsum += w;
   }
-  fragColor = sum / max(total, 1.0);
+  fragColor = sum / wsum;
 }
 `)
 
@@ -3548,5 +3565,1364 @@ void main() {
   fragColor = texture(u_texture, distortedUV);
 }
 `);
+
+// ═══════════════════════════════════════════════════════════
+//  3D / DEPTH FAMILY
+//
+//  One estimator produces depth; everything else consumes it. See
+//  3D_DEPTH_EFFECTS_PLAN.md for the full design.
+//
+//  Two conventions hold across the whole family:
+//   • Depth is 0 = near, 1 = far, carried as GREYSCALE RGB — not packed with
+//     normals. Greyscale is what makes the family composable: the depth socket
+//     accepts a DEPTH node, a painted SHAPE_INPUT gradient, a real depth-map
+//     video or a luma matte interchangeably, the map is viewable while you tune
+//     it, and it doubles as a DISPLACEMENT input. Normals are cheaper to
+//     recompute per consumer (4 taps) than they are to plumb through.
+//   • Every consumer has an optional `depth_map` input. The DAG executor falls
+//     back to the primary input when nothing is wired (see TEXTURE_INPUT_SOCKETS
+//     in clipGraphManager), so a bare node reads the colour image's luma as a
+//     crude depth signal and does something sensible with no wiring at all.
+// ═══════════════════════════════════════════════════════════
+
+// ── DEPTH (monocular depth estimator — the keystone of the family) ──
+// Not ML: a stack of classical depth cues, each individually a guess, combined
+// and edge-smoothed into something convincing enough to drive parallax, fog and
+// relighting. Every cue is a weight, so it is tunable per shot rather than being
+// a black box that is either right or useless.
+registerShader('DEPTH', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+
+// @param name="Mode" min=0 max=6 default=0 step=1 type=select options="Auto Blend,Contrast (Focus),Luma,Aerial (Color),Radial,Horizon,External Map"
+uniform int u_dp_mode;
+// @param name="Luma Weight" min=0.0 max=1.0 default=0.35 step=0.01
+uniform float u_dp_w_luma;
+// @param name="Focus Weight" min=0.0 max=1.0 default=0.45 step=0.01
+uniform float u_dp_w_focus;
+// @param name="Aerial Weight" min=0.0 max=1.0 default=0.25 step=0.01
+uniform float u_dp_w_aerial;
+// @param name="Horizon Weight" min=0.0 max=1.0 default=0.2 step=0.01
+uniform float u_dp_w_horizon;
+// @param name="Radial Weight" min=0.0 max=1.0 default=0.1 step=0.01
+uniform float u_dp_w_radial;
+// @param name="Horizon Line" min=0.0 max=1.0 default=0.62 step=0.01
+uniform float u_dp_horizon;
+// @param name="Focus Sensitivity" min=0.5 max=24.0 default=6.0 step=0.1
+uniform float u_dp_focus_gain;
+// @param name="Smooth Radius" min=0.0 max=24.0 default=6.0 step=0.5
+uniform float u_dp_smooth;
+// @param name="Edge Threshold" min=0.02 max=0.6 default=0.12 step=0.01
+uniform float u_dp_edge;
+// @param name="Depth Curve" min=0.25 max=4.0 default=1.0 step=0.05
+uniform float u_dp_curve;
+// @param name="Near" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_dp_near;
+// @param name="Far" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_dp_far;
+// @param name="Invert" type=bool default=false
+uniform bool u_dp_invert;
+// @param name="Output" min=0 max=1 default=0 step=1 type=select options="Depth (Grey),Colorized (Preview)"
+uniform int u_dp_output;
+// Read by the EXECUTOR, not by this shader: it sizes this node's render target
+// (see nodeFBOScale in clipGraphManager). Depth is a low-frequency map and every
+// consumer samples it with normalized UVs, so a half-res pass costs a quarter of
+// the pixels and looks the same — better, even, since the resample is a denoiser
+// and noisy depth is exactly what makes parallax boil. Declared so the @param is
+// parsed; the compiler strips it as unused, which is fine.
+// @param name="Resolution" min=0 max=2 default=1 step=1 type=select options="Full,Half,Quarter"
+uniform int u_dp_res;
+
+out vec4 fragColor;
+${LIB3D}
+
+void main() {
+  vec2 texel = 1.0 / u_resolution;
+  float inv = u_dp_invert ? 1.0 : 0.0;
+  float aspect = u_resolution.x / max(1.0, u_resolution.y);
+
+  // One 8-tap ring buys BOTH the edge-preserving colour and the local contrast.
+  vec3 flat_;
+  float contrast;
+  d3_ringProbe(u_texture, v_uv, texel, u_dp_smooth, u_dp_edge, flat_, contrast);
+
+  // ── the cue stack (each normalised to 0 = near, 1 = far) ──
+
+  // Lit subjects sit in front of shadowed background more often than not.
+  float cueLuma = 1.0 - d3_luma(flat_);
+
+  // Local contrast: what is in focus is near. The strongest cue a flat image
+  // has, which is why it carries the largest default weight.
+  float cueFocus = 1.0 - clamp(contrast * u_dp_focus_gain, 0.0, 1.0);
+
+  // Atmospheric perspective: distance desaturates and shifts blue (Rayleigh).
+  float sat = d3_saturation(flat_);
+  float blueShift = clamp((flat_.b - (flat_.r + flat_.g) * 0.5) * 2.0 + 0.5, 0.0, 1.0);
+  float cueAerial = clamp((1.0 - sat) * 0.65 + blueShift * 0.35, 0.0, 1.0);
+
+  // Ground planes recede upward toward the horizon; above it is sky, i.e. far.
+  float cueHorizon = v_uv.y < u_dp_horizon
+    ? smoothstep(0.0, 1.0, v_uv.y / max(1e-3, u_dp_horizon))
+    : 1.0;
+
+  // Subject-centre bias — cheap, and often the only cue a close-up gives you.
+  float cueRadial = clamp(length((v_uv - 0.5) * vec2(aspect, 1.0)) * 1.6, 0.0, 1.0);
+
+  float depth;
+  if (u_dp_mode == 1) depth = cueFocus;
+  else if (u_dp_mode == 2) depth = cueLuma;
+  else if (u_dp_mode == 3) depth = cueAerial;
+  else if (u_dp_mode == 4) depth = cueRadial;
+  else if (u_dp_mode == 5) depth = cueHorizon;
+  else if (u_dp_mode == 6) depth = d3_luma(texture(u_texture, v_uv).rgb); // real depth map in
+  else {
+    float wsum = u_dp_w_luma + u_dp_w_focus + u_dp_w_aerial + u_dp_w_horizon + u_dp_w_radial;
+    depth = wsum < 1e-4 ? cueFocus : (
+      cueLuma    * u_dp_w_luma +
+      cueFocus   * u_dp_w_focus +
+      cueAerial  * u_dp_w_aerial +
+      cueHorizon * u_dp_w_horizon +
+      cueRadial  * u_dp_w_radial
+    ) / wsum;
+  }
+
+  depth = pow(clamp(depth, 0.0, 1.0), max(0.05, u_dp_curve));
+  depth = d3_remapDepth(depth, inv, u_dp_near, u_dp_far);
+
+  // Alpha is forced opaque: this output is DATA, not picture. A depth map that
+  // inherited the source's alpha would multiply itself away in any downstream
+  // composite and read as "everything is near".
+  fragColor = u_dp_output == 1
+    ? vec4(d3_falseColor(depth), 1.0)
+    : vec4(vec3(depth), 1.0);
+}
+`)
+
+// ── NORMALS_3D (surface normals / curvature from a depth or luma map) ──
+// Standalone because a normal map is useful well beyond this family: wire it
+// into DISPLACEMENT to bump-map footage, or into MIX_BLEND as a shading layer.
+registerShader('NORMALS_3D', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+
+// @param name="Source" min=0 max=1 default=0 step=1 type=select options="Depth / Luma,Inverted"
+uniform int u_nm_source;
+// @param name="Radius" min=1.0 max=16.0 default=2.0 step=0.5
+uniform float u_nm_radius;
+// @param name="Relief" min=1.0 max=200.0 default=40.0 step=1.0
+uniform float u_nm_relief;
+// @param name="Output" min=0 max=2 default=0 step=1 type=select options="Normal Map,Curvature,Slope"
+uniform int u_nm_output;
+// @param name="Flip X" type=bool default=false
+uniform bool u_nm_flip_x;
+// @param name="Flip Y" type=bool default=false
+uniform bool u_nm_flip_y;
+// @param name="Near" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_nm_near;
+// @param name="Far" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_nm_far;
+
+out vec4 fragColor;
+${LIB3D}
+
+void main() {
+  vec2 texel = 1.0 / u_resolution;
+  float inv = u_nm_source == 1 ? 1.0 : 0.0;
+
+  vec3 n = d3_normalFromDepth(u_texture, v_uv, texel, u_nm_radius,
+                              u_nm_relief, inv, u_nm_near, u_nm_far);
+  if (u_nm_flip_x) n.x = -n.x;
+  if (u_nm_flip_y) n.y = -n.y;
+
+  if (u_nm_output == 1) {
+    // Curvature = the depth Laplacian: positive on ridges, negative in cavities.
+    // Remapped to 0.5-centred grey so it reads as a usable cavity/edge map.
+    vec2 o = texel * max(1.0, u_nm_radius);
+    float c = d3_depthAt(u_texture, v_uv, inv, u_nm_near, u_nm_far);
+    float s = d3_depthAt(u_texture, v_uv + vec2(o.x, 0.0), inv, u_nm_near, u_nm_far)
+            + d3_depthAt(u_texture, v_uv - vec2(o.x, 0.0), inv, u_nm_near, u_nm_far)
+            + d3_depthAt(u_texture, v_uv + vec2(0.0, o.y), inv, u_nm_near, u_nm_far)
+            + d3_depthAt(u_texture, v_uv - vec2(0.0, o.y), inv, u_nm_near, u_nm_far);
+    float curv = (s * 0.25 - c) * u_nm_relief;
+    fragColor = vec4(vec3(clamp(curv * 0.5 + 0.5, 0.0, 1.0)), 1.0);
+  } else if (u_nm_output == 2) {
+    // Slope magnitude — a silhouette/edge mask that ignores which way it faces.
+    fragColor = vec4(vec3(clamp(1.0 - n.z, 0.0, 1.0)), 1.0);
+  } else {
+    fragColor = vec4(n * 0.5 + 0.5, 1.0);
+  }
+}
+`)
+
+// ── RELIGHT_3D (deferred lighting on flat footage) ──
+// The best value-per-flop in the family: normals from depth cost 4 taps, and
+// each light after that is ~10 flops with NO extra texture fetches. Flat footage
+// stops looking flat.
+registerShader('RELIGHT_3D', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+
+// @param name="Mode" min=0 max=5 default=0 step=1 type=select options="Studio (3-Point),Single Key,Rim Only,Toon / Cel,Metal,Wet / Subsurface"
+uniform int u_rl_mode;
+// @param name="Relief" min=1.0 max=200.0 default=40.0 step=1.0
+uniform float u_rl_relief;
+// @param name="Normal Radius" min=1.0 max=12.0 default=2.0 step=0.5
+uniform float u_rl_radius;
+// @param name="Key Angle" min=0.0 max=360.0 default=135.0 step=1.0
+uniform float u_rl_key_angle;
+// @param name="Key Elevation" min=0.0 max=1.0 default=0.35 step=0.01
+uniform float u_rl_key_elev;
+// @param name="Key Intensity" min=0.0 max=3.0 default=1.1 step=0.05
+uniform float u_rl_key_int;
+// @param name="Key Color" type=color default=#fff2dd
+uniform vec3 u_rl_key_color;
+// @param name="Fill Amount" min=0.0 max=2.0 default=0.35 step=0.01
+uniform float u_rl_fill;
+// @param name="Fill Color" type=color default=#8fb4ff
+uniform vec3 u_rl_fill_color;
+// @param name="Rim Amount" min=0.0 max=3.0 default=0.6 step=0.05
+uniform float u_rl_rim;
+// @param name="Rim Color" type=color default=#ffffff
+uniform vec3 u_rl_rim_color;
+// @param name="Ambient" min=0.0 max=2.0 default=0.75 step=0.01
+uniform float u_rl_ambient;
+// @param name="Specular" min=0.0 max=3.0 default=0.5 step=0.05
+uniform float u_rl_spec;
+// @param name="Shininess" min=2.0 max=128.0 default=32.0 step=1.0
+uniform float u_rl_shine;
+// @param name="Toon Steps" min=2.0 max=8.0 default=4.0 step=1.0
+uniform float u_rl_steps;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_rl_invert;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_rl_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+void main() {
+  vec2 texel = 1.0 / u_resolution;
+  vec4 src = texture(u_texture, v_uv);
+  vec3 albedo = src.rgb;
+  float inv = u_rl_invert ? 1.0 : 0.0;
+
+  vec3 n = d3_normalFromDepth(u_depth_map, v_uv, texel, u_rl_radius,
+                              u_rl_relief, inv, 0.0, 1.0);
+  vec3 V = vec3(0.0, 0.0, 1.0);
+
+  // Angle = where on screen the light comes from; elevation = how far round to
+  // the front it is (0 = raking across the surface, 1 = straight on).
+  float a = radians(u_rl_key_angle);
+  vec3 L = normalize(vec3(cos(a), sin(a), mix(0.05, 1.4, u_rl_key_elev)));
+  // Fill sits opposite and lower — the standard three-point relationship, so
+  // one angle control moves the whole rig coherently.
+  vec3 Lf = normalize(vec3(-cos(a), -sin(a) * 0.4, 0.9));
+
+  // Audio drivers (0 until wired): bass pumps the key, beat pops the rim.
+  float keyInt = u_rl_key_int * (1.0 + u_bass * 0.8);
+  float rimAmt = u_rl_rim * (1.0 + u_beat * 0.5);
+
+  float ndl = max(0.0, dot(n, L));
+  float ndf = max(0.0, dot(n, Lf));
+  float fres = pow(1.0 - clamp(n.z, 0.0, 1.0), 3.0);
+
+  vec3 diffuse = vec3(0.0);
+  vec3 spec = vec3(0.0);
+  float ambient = u_rl_ambient;
+
+  if (u_rl_mode == 1) {                       // Single Key
+    diffuse = u_rl_key_color * ndl * keyInt;
+  } else if (u_rl_mode == 2) {                // Rim Only — edges, no re-shading
+    diffuse = vec3(0.0);
+    ambient = max(ambient, 1.0);
+  } else if (u_rl_mode == 3) {                // Toon / Cel
+    float steps = max(2.0, floor(u_rl_steps));
+    float q = floor(ndl * steps) / (steps - 1.0);
+    diffuse = u_rl_key_color * clamp(q, 0.0, 1.0) * keyInt
+            + u_rl_fill_color * ndf * u_rl_fill * 0.5;
+  } else if (u_rl_mode == 4) {                // Metal — spec-dominant, low diffuse
+    diffuse = u_rl_key_color * ndl * keyInt * 0.35;
+    vec3 H = normalize(L + V);
+    spec = u_rl_key_color * pow(max(0.0, dot(n, H)), u_rl_shine) * u_rl_spec * 3.0;
+    ambient *= 0.6;
+  } else if (u_rl_mode == 5) {                // Wet / Subsurface
+    // Wrapped diffuse: light bleeds past the terminator, which is what reads as
+    // translucency (skin, wax, liquid) rather than as a hard-shaded solid.
+    float w = 0.5;
+    float wrap = clamp((dot(n, L) + w) / (1.0 + w), 0.0, 1.0);
+    diffuse = u_rl_key_color * wrap * keyInt
+            + vec3(0.9, 0.35, 0.3) * pow(wrap, 3.0) * keyInt * 0.4;
+    vec3 H = normalize(L + V);
+    spec = vec3(1.0) * pow(max(0.0, dot(n, H)), u_rl_shine * 2.0) * u_rl_spec * 1.5;
+  } else {                                    // Studio (3-point)
+    diffuse = u_rl_key_color * ndl * keyInt
+            + u_rl_fill_color * ndf * u_rl_fill;
+    vec3 H = normalize(L + V);
+    spec = u_rl_key_color * pow(max(0.0, dot(n, H)), u_rl_shine) * u_rl_spec;
+  }
+
+  vec3 rim = u_rl_rim_color * fres * rimAmt;
+  vec3 lit = albedo * (ambient + diffuse) + spec + rim * (0.35 + 0.65 * albedo);
+
+  fragColor = vec4(mix(albedo, lit, u_rl_mix), src.a);
+}
+`)
+
+// ── AO_3D (screen-space ambient occlusion / curvature / contact shadow) ──
+// Adds the contact shadows and creases that make a picture read as solid rather
+// than pasted. 8–32 depth taps on a per-pixel-rotated Vogel spiral: interleaving
+// the rotation makes the under-sampling read as dither, so 8 taps look like 32.
+registerShader('AO_3D', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+
+// @param name="Mode" min=0 max=3 default=0 step=1 type=select options="SSAO,Curvature,Cavity,Contact Shadow"
+uniform int u_ao_mode;
+// @param name="Radius" min=2.0 max=128.0 default=28.0 step=1.0
+uniform float u_ao_radius;
+// @param name="Samples" min=0 max=4 default=2 step=1 type=select options="8,12,16,24,32"
+uniform int u_ao_samples;
+// @param name="Strength" min=0.0 max=4.0 default=1.0 step=0.05
+uniform float u_ao_strength;
+// @param name="Bias" min=0.0 max=0.1 default=0.008 step=0.001
+uniform float u_ao_bias;
+// @param name="Depth Range" min=0.02 max=2.0 default=0.35 step=0.01
+uniform float u_ao_range;
+// @param name="Light Angle" min=0.0 max=360.0 default=135.0 step=1.0
+uniform float u_ao_light;
+// @param name="Shadow Length" min=0.0 max=1.0 default=0.3 step=0.01
+uniform float u_ao_shadow_len;
+// @param name="Occlusion Color" type=color default=#000000
+uniform vec3 u_ao_color;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_ao_invert;
+// @param name="Output" min=0 max=3 default=0 step=1 type=select options="Multiply,Subtract,AO Only,Colorized (Preview)"
+uniform int u_ao_output;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_ao_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+// Sample counts as a select rather than a slider: the loop bound must be a small
+// known set so the compiler can keep it tight, and these are the useful steps.
+int ao_sampleCount(int idx) {
+  if (idx == 0) return 8;
+  if (idx == 1) return 12;
+  if (idx == 2) return 16;
+  if (idx == 3) return 24;
+  return 32;
+}
+
+void main() {
+  vec2 texel = 1.0 / u_resolution;
+  vec4 src = texture(u_texture, v_uv);
+  float inv = u_ao_invert ? 1.0 : 0.0;
+  float centerD = d3_depthAt(u_depth_map, v_uv, inv, 0.0, 1.0);
+  // Audio driver (0 until wired): loudness deepens the occlusion.
+  float strength = u_ao_strength * (1.0 + u_rms * 0.8);
+  float occ = 0.0;
+
+  if (u_ao_mode == 1 || u_ao_mode == 2) {
+    // Curvature / Cavity — a 4-tap Laplacian. No spiral needed: concavity is a
+    // second derivative, so the immediate neighbourhood is all that matters.
+    float r = u_ao_mode == 2 ? max(1.0, u_ao_radius * 0.15) : max(1.0, u_ao_radius * 0.5);
+    vec2 o = texel * r;
+    float s = d3_depthAt(u_depth_map, v_uv + vec2(o.x, 0.0), inv, 0.0, 1.0)
+            + d3_depthAt(u_depth_map, v_uv - vec2(o.x, 0.0), inv, 0.0, 1.0)
+            + d3_depthAt(u_depth_map, v_uv + vec2(0.0, o.y), inv, 0.0, 1.0)
+            + d3_depthAt(u_depth_map, v_uv - vec2(0.0, o.y), inv, 0.0, 1.0);
+    float curv = (centerD - s * 0.25) / max(1e-4, u_ao_range);
+    // Only the concave side occludes; convex ridges would brighten, which AO
+    // has no business doing.
+    occ = clamp(curv * strength, 0.0, 1.0);
+  } else if (u_ao_mode == 3) {
+    // Contact Shadow — one directional march. The ray's depth rises linearly;
+    // anything nearer than the ray at that point is between us and the light.
+    float a = radians(u_ao_light);
+    vec2 dir = vec2(cos(a), sin(a));
+    float jitter = d3_ign(gl_FragCoord.xy);
+    float hit = 0.0;
+    for (int i = 1; i <= 12; i++) {
+      float t = (float(i) - 1.0 + jitter) / 12.0;
+      vec2 p = v_uv + dir * t * u_ao_radius * 2.0 * texel;
+      float sd = d3_depthAt(u_depth_map, p, inv, 0.0, 1.0);
+      float rayD = centerD - t * u_ao_shadow_len;
+      float diff = rayD - sd;
+      if (diff > u_ao_bias) {
+        // Range-check so a distant object doesn't cast onto the foreground.
+        hit = max(hit, (1.0 - smoothstep(u_ao_range, u_ao_range * 2.5, diff)) * (1.0 - t));
+      }
+    }
+    occ = clamp(hit * strength, 0.0, 1.0);
+  } else {
+    // SSAO — per-pixel-rotated Vogel spiral over the depth map.
+    int n = ao_sampleCount(u_ao_samples);
+    float rot = d3_ign(gl_FragCoord.xy) * D3_TAU;
+    float sum = 0.0;
+    for (int i = 0; i < 32; i++) {
+      if (i >= n) break;
+      vec2 off = d3_vogel(i, n, rot) * u_ao_radius * texel;
+      float sd = d3_depthAt(u_depth_map, v_uv + off, inv, 0.0, 1.0);
+      float diff = centerD - sd;              // > 0 → neighbour is nearer
+      float o = clamp((diff - u_ao_bias) / max(1e-4, u_ao_range), 0.0, 1.0);
+      // The range check is what separates AO from a dark halo: once a neighbour
+      // is much nearer than us it is a different object, not a crease, and it
+      // must stop occluding.
+      o *= 1.0 - smoothstep(u_ao_range, u_ao_range * 2.5, diff);
+      sum += o;
+    }
+    occ = clamp(sum / float(n) * strength, 0.0, 1.0);
+  }
+
+  occ *= u_ao_mix;
+  vec3 outCol;
+  if (u_ao_output == 1)      outCol = max(vec3(0.0), src.rgb - occ * (1.0 - u_ao_color));
+  else if (u_ao_output == 2) outCol = vec3(1.0 - occ);
+  else if (u_ao_output == 3) outCol = d3_falseColor(occ);
+  else                       outCol = mix(src.rgb, u_ao_color, occ);
+
+  fragColor = vec4(outCol, src.a);
+}
+`)
+
+// ── FOG_3D (atmospheric depth: fog, haze, aerial perspective, depth grading) ──
+// ~20 flops and zero extra texture taps, and it is the single strongest cue for
+// scale there is. The cheapest thing in the family by a wide margin.
+registerShader('FOG_3D', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+
+// @param name="Mode" min=0 max=5 default=0 step=1 type=select options="Linear,Exponential,Exponential²,Height Fog,Aerial Perspective,Depth Tint"
+uniform int u_fg_mode;
+// @param name="Density" min=0.0 max=4.0 default=1.0 step=0.02
+uniform float u_fg_density;
+// @param name="Start" min=0.0 max=1.0 default=0.1 step=0.01
+uniform float u_fg_start;
+// @param name="End" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_fg_end;
+// @param name="Gradient" min=0 max=6 default=0 step=1 type=select options="Overcast,Warm → Cool,Teal / Orange,Blue Hour,Sunset Haze,Night,Toxic"
+uniform int u_fg_gradient;
+// @param name="Use Gradient" type=bool default=false
+uniform bool u_fg_use_gradient;
+// @param name="Fog Color" type=color default=#b9c6d4
+uniform vec3 u_fg_color;
+// @param name="Height" min=0.0 max=1.0 default=0.5 step=0.01
+uniform float u_fg_height;
+// @param name="Height Falloff" min=0.1 max=8.0 default=2.0 step=0.1
+uniform float u_fg_falloff;
+// @param name="Desaturate Far" min=0.0 max=1.0 default=0.3 step=0.01
+uniform float u_fg_desat;
+// @param name="Blue Shift" min=0.0 max=1.0 default=0.2 step=0.01
+uniform float u_fg_blue;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_fg_invert;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_fg_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+void main() {
+  vec4 src = texture(u_texture, v_uv);
+  float inv = u_fg_invert ? 1.0 : 0.0;
+  float d = d3_depthAt(u_depth_map, v_uv, inv, u_fg_start, u_fg_end);
+  // Audio driver (0 until wired): bass rolls the fog in.
+  float density = u_fg_density * (1.0 + u_bass * 1.2);
+
+  // Fog factor. Modes 0 / 4 / 5 (Linear, Aerial, Depth Tint) all want a plain
+  // linear ramp — the exponential falloffs are what make 1–3 look like *volume*
+  // rather than like a gradient, so they get their own curves.
+  float f;
+  if (u_fg_mode == 1)      f = 1.0 - exp(-d * density * 2.5);
+  else if (u_fg_mode == 2) f = 1.0 - exp(-pow(d * density * 1.8, 2.0));
+  else if (u_fg_mode == 3) {
+    // Height fog: thick low in frame, thinning upward, still gated by depth so
+    // it sits BEHIND near objects instead of washing over them.
+    float h = exp(-max(0.0, v_uv.y - u_fg_height) * u_fg_falloff * 4.0);
+    f = (1.0 - exp(-d * density * 2.5)) * h;
+  }
+  else                     f = d * density;
+
+  f = clamp(f, 0.0, 1.0);
+  vec3 fogCol = u_fg_use_gradient ? d3_depthGradient(u_fg_gradient, d) : u_fg_color;
+  vec3 c = src.rgb;
+
+  if (u_fg_mode == 5) {
+    // Depth Tint — a grade, not a wash: the gradient multiplies through so far
+    // pixels take the cool end and near ones the warm end while keeping detail.
+    vec3 tint = d3_depthGradient(u_fg_gradient, d);
+    c = mix(c, c * tint * 2.0, clamp(density, 0.0, 1.0));
+    c = d3_desaturate(c, u_fg_desat * d);
+  } else if (u_fg_mode == 4) {
+    // Aerial perspective — the physically motivated one: distance desaturates
+    // and shifts blue BEFORE any fog colour is added, so haze reads as
+    // atmosphere rather than as a grey scrim laid over the shot.
+    c = d3_desaturate(c, u_fg_desat * d);
+    c.b += u_fg_blue * d * 0.35;
+    c.r -= u_fg_blue * d * 0.12;
+    c = mix(c, fogCol, f * 0.85);
+  } else {
+    c = d3_desaturate(c, u_fg_desat * d);
+    c.b += u_fg_blue * d * 0.25;
+    c = mix(c, fogCol, f);
+  }
+
+  fragColor = vec4(mix(src.rgb, clamp(c, 0.0, 4.0), u_fg_mix), src.a);
+}
+`)
+
+// ── BOKEH_3D (depth of field with a real lens) ──
+// Replaces DEPTH_BLUR's nested radius loop, which reached ~1369 texture fetches
+// per pixel at max radius (37×37 at radius 18). A golden-angle spiral scaled by
+// circle-of-confusion costs the SAME 16–48 samples at EVERY aperture — and adds
+// aperture shape, anamorphic squeeze, swirl and highlight bokeh for a handful of
+// flops on top.
+//
+// Each sample is 2 fetches, not 1: a gather DOF has to know every tap's own
+// circle of confusion to decide whether that tap may bleed into this pixel, so
+// the depth map is read alongside the colour. Unavoidable, and still an order of
+// magnitude below the loop it replaces. (The Tilt-Shift and Radial focus fields
+// are computed from screen position, so they cost 1 fetch per sample.)
+registerShader('BOKEH_3D', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+
+// @param name="Focus Field" min=0 max=2 default=0 step=1 type=select options="Depth Map,Tilt-Shift (Linear),Radial"
+uniform int u_bk_field;
+// @param name="Focus Distance" min=0.0 max=1.0 default=0.4 step=0.01
+uniform float u_bk_focus;
+// @param name="Focus Range" min=0.005 max=1.0 default=0.12 step=0.005
+uniform float u_bk_range;
+// @param name="Aperture" min=0.0 max=64.0 default=18.0 step=0.5
+uniform float u_bk_aperture;
+// @param name="Samples" min=0 max=3 default=2 step=1 type=select options="16,24,32,48"
+uniform int u_bk_samples;
+// @param name="Blades" min=0.0 max=9.0 default=0.0 step=1.0
+uniform float u_bk_blades;
+// @param name="Blade Rotation" min=0.0 max=360.0 default=0.0 step=1.0
+uniform float u_bk_blade_rot;
+// @param name="Anamorphic" min=0.3 max=3.0 default=1.0 step=0.05
+uniform float u_bk_squeeze;
+// @param name="Swirl" min=-3.0 max=3.0 default=0.0 step=0.05
+uniform float u_bk_swirl;
+// @param name="Highlight Bokeh" min=0.0 max=8.0 default=1.5 step=0.1
+uniform float u_bk_highlight;
+// @param name="Tilt Angle" min=0.0 max=360.0 default=90.0 step=1.0
+uniform float u_bk_tilt;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_bk_invert;
+// @param name="Output" min=0 max=1 default=0 step=1 type=select options="Image,CoC (Preview)"
+uniform int u_bk_output;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_bk_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+// The value the focus distance is compared against. Depth Map is the real thing;
+// the other two synthesise a focus field so DOF works with no depth at all
+// (tilt-shift is how you fake a miniature, and it needs no depth by definition).
+float bk_field(vec2 uv) {
+  if (u_bk_field == 1) {
+    float a = radians(u_bk_tilt);
+    return clamp(dot(uv - 0.5, vec2(cos(a), sin(a))) + 0.5, 0.0, 1.0);
+  }
+  if (u_bk_field == 2) {
+    float aspect = u_resolution.x / max(1.0, u_resolution.y);
+    return clamp(length((uv - 0.5) * vec2(aspect, 1.0)) * 1.414, 0.0, 1.0);
+  }
+  float inv = u_bk_invert ? 1.0 : 0.0;
+  return d3_depthAt(u_depth_map, uv, inv, 0.0, 1.0);
+}
+
+// Circle-of-confusion radius in pixels. Signed distance from the focus plane,
+// normalised by the in-focus half-width, scaled by aperture.
+float bk_coc(vec2 uv, float aperture) {
+  return abs(clamp((bk_field(uv) - u_bk_focus) / max(1e-4, u_bk_range), -1.0, 1.0)) * aperture;
+}
+
+int bk_sampleCount(int idx) {
+  if (idx == 0) return 16;
+  if (idx == 1) return 24;
+  if (idx == 2) return 32;
+  return 48;
+}
+
+void main() {
+  vec2 texel = 1.0 / u_resolution;
+  vec4 src = texture(u_texture, v_uv);
+  // Audio driver (0 until wired): treble opens the aperture.
+  float aperture = u_bk_aperture * (1.0 + u_treble * 0.6);
+  float centerCoC = bk_coc(v_uv, aperture);
+
+  if (u_bk_output == 1) {
+    fragColor = vec4(d3_falseColor(centerCoC / max(1.0, aperture)), src.a);
+    return;
+  }
+  // Nothing to gather — and this is the ONLY early-out that is safe. Bailing on
+  // "this pixel is in focus" would be wrong: an out-of-focus foreground has to
+  // be able to bleed over a sharp background, which is exactly what a gather
+  // pass is for.
+  if (aperture < 0.5) {
+    fragColor = src;
+    return;
+  }
+
+  int n = bk_sampleCount(u_bk_samples);
+  float rot = d3_ign(gl_FragCoord.xy) * D3_TAU;
+
+  // Centre tap first, so a fully in-focus pixel survives unchanged. luma is
+  // clamped non-negative before pow: the pipeline is RGBA16F and a negative
+  // channel (possible after a grade upstream) would make pow return NaN, which
+  // then poisons the whole weighted sum for that pixel.
+  float w0 = 1.0 + u_bk_highlight * pow(max(0.0, d3_luma(src.rgb)), 4.0);
+  vec4 sum = src * w0;
+  float wsum = w0;
+
+  for (int i = 0; i < 48; i++) {
+    if (i >= n) break;
+    vec2 s = d3_aperture(d3_vogel(i, n, rot), u_bk_blades,
+                         radians(u_bk_blade_rot), u_bk_squeeze, u_bk_swirl);
+    float dist = length(s) * aperture;            // distance from centre, px
+    vec2 uv2 = v_uv + s * aperture * texel;
+    vec4 c = texture(u_texture, uv2);
+
+    // A tap contributes only if its OWN circle of confusion reaches this pixel.
+    // Skip this and a sharp foreground smears outward over a blurred
+    // background — the artifact that gives away every fake depth of field.
+    float w = clamp((bk_coc(uv2, aperture) - dist) * 0.5 + 1.0, 0.0, 1.0);
+    // Weight bright samples superlinearly so speculars become real bokeh balls
+    // instead of averaging away into grey mush.
+    w *= 1.0 + u_bk_highlight * pow(max(0.0, d3_luma(c.rgb)), 4.0);
+
+    sum += c * w;
+    wsum += w;
+  }
+
+  vec4 blurred = sum / max(1e-4, wsum);
+  fragColor = vec4(mix(src.rgb, blurred.rgb, u_bk_mix), mix(src.a, blurred.a, u_bk_mix));
+}
+`)
+
+// ── CAMERA_3D (virtual camera over a depth field — real parallax) ──
+// The headline node of the family. One formula (`d3_camVector`) covers pan, dolly
+// and orbit, and `d3_pom` marches the view ray through the depth field so near
+// objects genuinely OCCLUDE far ones instead of sliding over them.
+//
+// Cost is adaptive by design: step count is derived from how far the parallax
+// actually travels in PIXELS, so a subtle move costs 4 taps and a big one costs
+// 24. A camera that hasn't moved costs a single fetch and returns early.
+registerShader('CAMERA_3D', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+uniform float u_time;
+
+// Motion defaults to Sway (index 0) rather than Manual on purpose: a camera node
+// that shows nothing when you drop it reads as broken. Manual is last, for when
+// a TIME node or keyframes are driving Camera X/Y/Z through the float sockets.
+// @param name="Motion" min=0 max=7 default=0 step=1 type=select options="Sway,Dolly In,Dolly Out,Orbit,Handheld,Crane,Figure-8,Manual"
+uniform int u_c3_motion;
+// @param name="Amplitude" min=0.0 max=1.0 default=0.25 step=0.01
+uniform float u_c3_amp;
+// @param name="Speed" min=0.05 max=4.0 default=0.4 step=0.05
+uniform float u_c3_speed;
+// @param name="Camera X" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_c3_x;
+// @param name="Camera Y" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_c3_y;
+// @param name="Camera Z (Dolly)" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_c3_z;
+// @param name="Depth Scale" min=0.0 max=0.5 default=0.08 step=0.005
+uniform float u_c3_scale;
+// @param name="Pivot X" min=0.0 max=1.0 default=0.5 step=0.01
+uniform float u_c3_px;
+// @param name="Pivot Y" min=0.0 max=1.0 default=0.5 step=0.01
+uniform float u_c3_py;
+// @param name="Quality" min=0 max=2 default=1 step=1 type=select options="Single Tap (flat),Occlusion (Fast),Occlusion (Fine)"
+uniform int u_c3_quality;
+// @param name="Reveal Fill" min=0 max=2 default=0 step=1 type=select options="Stretch,Smear,Void (Transparent)"
+uniform int u_c3_fill;
+// @param name="Edge Threshold" min=0.02 max=0.8 default=0.15 step=0.01
+uniform float u_c3_edge;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_c3_invert;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_c3_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+void main() {
+  vec4 src = texture(u_texture, v_uv);
+  float inv = u_c3_invert ? 1.0 : 0.0;
+  float aspect = u_resolution.x / max(1.0, u_resolution.y);
+
+  // Built-in motion, so the node moves the camera with nothing wired. Anything
+  // more specific than these is what the TIME node and keyframes are for — they
+  // drive Camera X/Y/Z directly through the float sockets.
+  float t = u_time * u_c3_speed;
+  // Audio driver (0 until wired): bass drives the camera harder.
+  float amp = u_c3_amp * (1.0 + u_bass * 0.8);
+  vec2 mxy = vec2(0.0);
+  float mz = 0.0;
+  if (u_c3_motion == 0)      mxy = vec2(amp * sin(t), 0.0);                      // Sway
+  else if (u_c3_motion == 1) mz =  amp * (0.5 - 0.5 * cos(t));                   // Dolly In
+  else if (u_c3_motion == 2) mz = -amp * (0.5 - 0.5 * cos(t));                   // Dolly Out
+  else if (u_c3_motion == 3) mxy = vec2(amp * cos(t), amp * sin(t) * 0.5);       // Orbit
+  else if (u_c3_motion == 4) {                                                   // Handheld
+    // Two incommensurate frequencies per axis — enough that the eye never finds
+    // the loop, which is the whole difference between "handheld" and "wobble".
+    mxy = vec2(sin(t * 1.7) + 0.5 * sin(t * 3.1),
+               cos(t * 1.3) + 0.5 * cos(t * 2.7)) * amp * 0.4;
+  }
+  else if (u_c3_motion == 5) mxy = vec2(0.0, amp * sin(t));                       // Crane
+  else if (u_c3_motion == 6) mxy = vec2(amp * sin(t), amp * sin(t * 2.0) * 0.5);  // Figure-8
+  // 7 = Manual — mxy / mz stay zero and only the Camera X/Y/Z params move it.
+
+  vec2 pivot = vec2(u_c3_px, u_c3_py);
+  vec2 camVec = d3_camVector(v_uv, pivot, vec2(u_c3_x, u_c3_y) + mxy, u_c3_z + mz, aspect);
+  vec2 P = camVec * u_c3_scale;
+
+  // How far the parallax actually travels, in pixels. This one number drives the
+  // early-out AND the step count — the cheapest possible adaptive quality.
+  float travelPx = length(P * u_resolution);
+  if (travelPx < 1.0) {
+    fragColor = src;
+    return;
+  }
+
+  float jump = 0.0;
+  vec2 uv2;
+  if (u_c3_quality == 0) {
+    // Flat parallax: one fetch, no occlusion. Fine for a subtle drift, and it is
+    // what every "3D photo" filter does — the reason those look like a rubber
+    // sheet rather than like a camera move.
+    float d = d3_depthAt(u_depth_map, v_uv, inv, 0.0, 1.0);
+    uv2 = v_uv + P * (1.0 - d);
+  } else {
+    int maxSteps = u_c3_quality == 1 ? 12 : 24;
+    int steps = clamp(int(travelPx / 3.0), 4, maxSteps);
+    int refine = u_c3_quality == 1 ? 3 : 5;
+    uv2 = d3_pom(u_depth_map, v_uv, P, steps, refine, inv, 0.0, 1.0, jump);
+  }
+
+  vec4 c = texture(u_texture, uv2);
+
+  // Disocclusion: the region the camera move revealed, which was never filmed.
+  // \`jump\` is the largest height discontinuity the ray crossed, so it is exactly
+  // "did this pixel come from across a silhouette" — and it cost nothing.
+  float diso = smoothstep(u_c3_edge, u_c3_edge * 2.0, jump);
+
+  if (u_c3_fill == 1 && diso > 0.002) {
+    // Smear the revealed strip along the parallax direction. The eye forgives
+    // directional blur in a moving shot; it does not forgive a hard seam.
+    vec3 sm = c.rgb;
+    for (int i = 1; i <= 4; i++) {
+      sm += texture(u_texture, uv2 + P * (float(i) / 4.0) * 0.35).rgb;
+    }
+    c.rgb = mix(c.rgb, sm / 5.0, diso);
+  } else if (u_c3_fill == 2) {
+    // Void — tear the frame open. Only alpha is touched: the pipeline is STRAIGHT
+    // alpha, so scaling rgb here would double-darken at the present pass.
+    c.a *= 1.0 - diso;
+  }
+
+  fragColor = vec4(mix(src.rgb, c.rgb, u_c3_mix), mix(src.a, c.a, u_c3_mix));
+}
+`)
+
+// ── STEREO_3D (stereoscopic output — anaglyph / SBS / interlaced / wiggle) ──
+// Two fetches of colour plus two of depth and the frame reads as 3D. Best
+// wow-per-flop in the family by a wide margin.
+//
+// Deliberately single-tap, not POM: stereo parallax is SIGNED around a
+// convergence plane (near content shifts one way, far content the other), which
+// is a different problem from marching a ray down into a heightfield. Occlusion
+// errors at silhouettes are also far less visible in stereo than in a camera
+// move, because each eye only ever sees a half-pixel-scale discrepancy.
+registerShader('STEREO_3D', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+uniform float u_time;
+
+// @param name="Mode" min=0 max=5 default=0 step=1 type=select options="Anaglyph (Red/Cyan),Anaglyph (Dubois),Side-by-Side,Over-Under,Interlaced,Wiggle"
+uniform int u_st_mode;
+// @param name="Interaxial" min=0.0 max=0.12 default=0.025 step=0.001
+uniform float u_st_sep;
+// @param name="Convergence" min=0.0 max=1.0 default=0.4 step=0.01
+uniform float u_st_conv;
+// @param name="Ghost Reduction" min=0.0 max=1.0 default=0.3 step=0.01
+uniform float u_st_ghost;
+// @param name="Wiggle Rate" min=0.5 max=12.0 default=5.0 step=0.1
+uniform float u_st_wiggle;
+// @param name="Swap Eyes" type=bool default=false
+uniform bool u_st_swap;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_st_invert;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_st_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+// Sample one eye. eyeSign is -1 for left, +1 for right.
+//
+// Convergence is the zero-parallax plane: content at that depth lands in the
+// same place in both eyes and therefore sits ON the screen surface. Nearer
+// content gets negative parallax and pops out toward the viewer; farther content
+// recedes behind the screen. Getting this wrong is what makes cheap 3D hurt to
+// look at — everything sits in front of you and the eyes never relax.
+vec3 st_eye(float eyeSign, vec2 uv, float doInvert, float aspect) {
+  float d = d3_depthAt(u_depth_map, uv, doInvert, 0.0, 1.0);
+  float par = (u_st_conv - d) * u_st_sep;
+  return texture(u_texture, uv + vec2(eyeSign * par / max(1e-3, aspect), 0.0)).rgb;
+}
+
+void main() {
+  vec4 src = texture(u_texture, v_uv);
+  float inv = u_st_invert ? 1.0 : 0.0;
+  float aspect = u_resolution.x / max(1.0, u_resolution.y);
+  float sgn = u_st_swap ? -1.0 : 1.0;
+  vec3 col;
+
+  if (u_st_mode == 2) {                     // Side-by-Side
+    // Each half is horizontally squeezed to fit, so the eye's aspect is doubled —
+    // otherwise the interaxial would mean something different in SBS than in
+    // anaglyph and you'd have to re-tune it per delivery format.
+    bool isLeft = v_uv.x < 0.5;
+    vec2 uvs = vec2(isLeft ? v_uv.x * 2.0 : (v_uv.x - 0.5) * 2.0, v_uv.y);
+    col = st_eye(isLeft ? -sgn : sgn, uvs, inv, aspect * 2.0);
+  } else if (u_st_mode == 3) {              // Over-Under
+    bool isTop = v_uv.y >= 0.5;
+    vec2 uvs = vec2(v_uv.x, isTop ? (v_uv.y - 0.5) * 2.0 : v_uv.y * 2.0);
+    col = st_eye(isTop ? -sgn : sgn, uvs, inv, aspect * 0.5);
+  } else if (u_st_mode == 4) {              // Interlaced (row-alternating)
+    bool isLeft = fract(gl_FragCoord.y * 0.5) < 0.5;
+    col = st_eye(isLeft ? -sgn : sgn, v_uv, inv, aspect);
+  } else if (u_st_mode == 5) {
+    // Wiggle stereoscopy — flip between the two eyes a few times a second and
+    // the brain reconstructs depth with no glasses and no colour loss. Cheapest
+    // convincing 3D there is: ONE eye is sampled per frame.
+    bool isLeft = fract(u_time * u_st_wiggle) < 0.5;
+    col = st_eye(isLeft ? -sgn : sgn, v_uv, inv, aspect);
+  } else {
+    vec3 L = st_eye(-sgn, v_uv, inv, aspect);
+    vec3 R = st_eye( sgn, v_uv, inv, aspect);
+    // Desaturating before the channel split reduces retinal rivalry — the
+    // fighting-colours headache that makes red/cyan unwatchable on saturated
+    // footage.
+    L = d3_desaturate(L, u_st_ghost);
+    R = d3_desaturate(R, u_st_ghost);
+    if (u_st_mode == 1) {
+      // Dubois optimised red/cyan: a least-squares fit that minimises both
+      // ghosting and colour error, instead of naively throwing away channels.
+      col = clamp(
+        mat3( 0.4561,    -0.0400822, -0.0152161,
+              0.500484,  -0.0378246, -0.0205971,
+              0.176381,  -0.0157589, -0.00546856) * L
+      + mat3(-0.0434706,  0.378476,  -0.0721527,
+             -0.0879388,  0.73364,   -0.112961,
+             -0.00155529,-0.0184503,  1.2264) * R, 0.0, 1.0);
+    } else {
+      col = vec3(L.r, R.g, R.b);
+    }
+  }
+
+  fragColor = vec4(mix(src.rgb, col, u_st_mix), src.a);
+}
+`)
+
+// ── MULTIPLANE (depth-sliced parallax — Disney's multiplane camera) ──
+// Quantise depth into N ≤ 8 bands and give each its own parallax, then composite
+// far-to-near. No marching at all: 2 fetches per slice, and the hard band edges
+// are the POINT — this is crisp cardboard-cutout parallax (paper diorama, anime
+// background, Wes Anderson) rather than an attempt at smooth realism.
+registerShader('MULTIPLANE', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+uniform float u_time;
+
+// @param name="Slices" min=2.0 max=8.0 default=5.0 step=1.0
+uniform float u_mp_slices;
+// @param name="Spread" min=0.0 max=0.3 default=0.06 step=0.005
+uniform float u_mp_spread;
+// Sway first so the node is alive on drop (see CAMERA_3D's Motion note).
+// @param name="Motion" min=0 max=3 default=0 step=1 type=select options="Sway,Orbit,Handheld,Manual"
+uniform int u_mp_motion;
+// @param name="Amplitude" min=0.0 max=1.0 default=0.3 step=0.01
+uniform float u_mp_amp;
+// @param name="Speed" min=0.05 max=4.0 default=0.4 step=0.05
+uniform float u_mp_speed;
+// @param name="Camera X" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_mp_x;
+// @param name="Camera Y" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_mp_y;
+// @param name="Separation" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_mp_sep;
+// @param name="Feather" min=0.0 max=1.0 default=0.4 step=0.01
+uniform float u_mp_feather;
+// @param name="Gaps" min=0 max=2 default=0 step=1 type=select options="Source,Color,Transparent"
+uniform int u_mp_gaps;
+// @param name="Gap Color" type=color default=#000000
+uniform vec3 u_mp_gap_color;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_mp_invert;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_mp_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+void main() {
+  vec4 src = texture(u_texture, v_uv);
+  float inv = u_mp_invert ? 1.0 : 0.0;
+  float aspect = u_resolution.x / max(1.0, u_resolution.y);
+  float t = u_time * u_mp_speed;
+  // Audio driver (0 until wired): bass drives the camera.
+  float amp = u_mp_amp * (1.0 + u_bass * 0.8);
+
+  vec2 mxy = vec2(0.0);
+  if (u_mp_motion == 0)      mxy = vec2(amp * sin(t), 0.0);                  // Sway
+  else if (u_mp_motion == 1) mxy = vec2(amp * cos(t), amp * sin(t) * 0.5);   // Orbit
+  else if (u_mp_motion == 2) mxy = vec2(sin(t * 1.7) + 0.5 * sin(t * 3.1),   // Handheld
+                                        cos(t * 1.3) + 0.5 * cos(t * 2.7)) * amp * 0.4;
+  // 3 = Manual — only the Camera X/Y params move it.
+
+  vec2 cam = vec2(u_mp_x, u_mp_y) + mxy;
+  cam.x /= max(1e-3, aspect);
+
+  int n = int(clamp(u_mp_slices, 2.0, 8.0));
+  float half_ = 0.5 / float(n);
+
+  // FAR → NEAR, so each slice composites over the ones behind it. Painter's
+  // algorithm, which is all that is needed once depth is quantised: within a
+  // slice there is nothing left to sort.
+  vec4 acc = vec4(0.0);
+  for (int i = 0; i < 8; i++) {
+    if (i >= n) break;
+    // Band centre in depth: i = 0 is the farthest slice.
+    float band = 1.0 - (float(i) + 0.5) / float(n);
+    float near_ = 1.0 - band;               // nearer slices travel further
+
+    vec2 uvS = v_uv + cam * near_ * u_mp_spread;
+    // Separation scales each plane about the centre, which pulls the stack apart
+    // into a visible diorama instead of a single flat image.
+    uvS = 0.5 + (uvS - 0.5) / (1.0 + u_mp_sep * near_);
+
+    float dS = d3_depthAt(u_depth_map, uvS, inv, 0.0, 1.0);
+    // Does the sampled pixel belong to THIS band? Feather softens the cut; at 0
+    // the planes are hard-edged cutouts.
+    float edge = half_ * max(0.02, u_mp_feather);
+    float m = 1.0 - smoothstep(half_ - edge, half_ + edge, abs(dS - band));
+
+    vec4 c = texture(u_texture, uvS);
+    acc = mix(acc, vec4(c.rgb, c.a), clamp(m, 0.0, 1.0));
+  }
+
+  // acc came out of the slice loop PREMULTIPLIED — each mix() scaled the colour
+  // by that slice's coverage — so the backdrop goes in as + gap * (1 - a), not
+  // as a second mix() by acc.a. Mixing again would multiply coverage in twice and
+  // darken every soft plane edge.
+  vec3 gap = u_mp_gaps == 1 ? u_mp_gap_color : src.rgb;
+  vec3 outRgb = acc.rgb + gap * (1.0 - clamp(acc.a, 0.0, 1.0));
+  float outA = u_mp_gaps == 2 ? acc.a : src.a;
+
+  fragColor = vec4(mix(src.rgb, outRgb, u_mp_mix), mix(src.a, outA, u_mp_mix));
+}
+`)
+
+// ── DEPTH_DISPLACE (displacement along the depth gradient) ──
+// Ordinary displacement pushes pixels around in the plane. This pushes them
+// along the SURFACE NORMAL, so things inflate, melt and shatter volumetrically
+// instead of sliding flat. Same 4 normal taps every consumer in the family pays;
+// everything after that is arithmetic.
+registerShader('DEPTH_DISPLACE', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+uniform float u_time;
+
+// @param name="Mode" min=0 max=5 default=0 step=1 type=select options="Inflate,Melt,Explode,Shear by Depth,Depth Glitch,Ripple by Depth"
+uniform int u_dd_mode;
+// @param name="Amount" min=0.0 max=0.3 default=0.06 step=0.002
+uniform float u_dd_amount;
+// @param name="Depth Bias" min=0.0 max=1.0 default=0.5 step=0.01
+uniform float u_dd_bias;
+// @param name="Relief" min=1.0 max=200.0 default=40.0 step=1.0
+uniform float u_dd_relief;
+// @param name="Normal Radius" min=1.0 max=12.0 default=2.0 step=0.5
+uniform float u_dd_radius;
+// @param name="Direction" min=0.0 max=360.0 default=270.0 step=1.0
+uniform float u_dd_dir;
+// @param name="Bands" min=1.0 max=24.0 default=8.0 step=1.0
+uniform float u_dd_bands;
+// @param name="Speed" min=0.0 max=4.0 default=1.0 step=0.05
+uniform float u_dd_speed;
+// @param name="Frequency" min=1.0 max=40.0 default=8.0 step=0.5
+uniform float u_dd_freq;
+// @param name="Chroma Split" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_dd_chroma;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_dd_invert;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_dd_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+void main() {
+  vec2 texel = 1.0 / u_resolution;
+  vec4 src = texture(u_texture, v_uv);
+  float inv = u_dd_invert ? 1.0 : 0.0;
+  float t = u_time * u_dd_speed;
+
+  float d = d3_depthAt(u_depth_map, v_uv, inv, 0.0, 1.0);
+  vec3 n = d3_normalFromDepth(u_depth_map, v_uv, texel, u_dd_radius,
+                              u_dd_relief, inv, 0.0, 1.0);
+
+  // Signed distance from the bias plane: content AT the bias depth never moves,
+  // so the effect has an anchor instead of sliding the whole frame.
+  float rel = d - u_dd_bias;
+  // Audio drivers (0 until wired): bass swells it, the beat throws it.
+  float amt = u_dd_amount * (1.0 + u_bass * 1.5);
+  float dirA = radians(u_dd_dir);
+  vec2 dirV = vec2(cos(dirA), sin(dirA));
+
+  vec2 disp = vec2(0.0);
+  if (u_dd_mode == 0) {
+    // Inflate — push along the normal, strongest where the surface is nearest.
+    disp = -n.xy * amt * (1.0 - d);
+  } else if (u_dd_mode == 1) {
+    // Melt — gravity-biased: the further back a pixel is, the further it runs,
+    // and the normal tilts the flow so it follows the surface.
+    disp = dirV * amt * max(0.0, rel) * (1.0 + 0.5 * sin(t + d * 6.28318))
+         - n.xy * amt * 0.3;
+  } else if (u_dd_mode == 2) {
+    // Explode — along the normal, kicked by the beat. u_beat is always live, so
+    // this pops with the music even before anything is wired.
+    disp = n.xy * amt * (0.35 + u_beat) * (1.0 - d) * 2.0;
+  } else if (u_dd_mode == 3) {
+    disp = dirV * rel * amt * 3.0;
+  } else if (u_dd_mode == 4) {
+    // Depth Glitch — quantise depth into slabs and tear each one sideways on its
+    // own schedule. Far more interesting than a flat glitch because the tears
+    // follow the geometry: foreground and background break apart separately.
+    float bands = max(1.0, floor(u_dd_bands));
+    float slab = floor(d * bands);
+    float h = d3_hash12(vec2(slab, floor(t * 3.0)));
+    float on = step(0.55, h);
+    disp = vec2((h - 0.5) * 2.0, 0.0) * amt * 4.0 * on;
+  } else {
+    // Ripple — a wave travelling through DEPTH rather than across the screen, so
+    // it reads as a shockwave moving toward or away from camera.
+    disp = n.xy * sin(d * u_dd_freq - t * 3.0) * amt;
+  }
+
+  vec3 col;
+  if (u_dd_chroma > 0.001) {
+    // Per-channel displacement magnitude — the dispersion you get from a real
+    // lens or a torn tape, for 2 extra fetches.
+    float s = u_dd_chroma * 0.35;
+    col = vec3(
+      texture(u_texture, v_uv + disp * (1.0 + s)).r,
+      texture(u_texture, v_uv + disp).g,
+      texture(u_texture, v_uv + disp * (1.0 - s)).b
+    );
+  } else {
+    col = texture(u_texture, v_uv + disp).rgb;
+  }
+
+  fragColor = vec4(mix(src.rgb, col, u_dd_mix), src.a);
+}
+`)
+
+// ── VOXEL_3D (the frame rebuilt as extruded blocks) ──
+// Depth quantised in BOTH axes — a grid of cells laterally, discrete levels
+// vertically — then ray-marched. Quantising is what makes it cheap AND is the
+// whole look: hard block faces, real occlusion between columns, Lego / voxel /
+// equaliser-bar geometry receding into the frame.
+//
+// The march samples a quantised height, so a step that lands on a TALLER cell
+// means the ray is looking at that block's SIDE rather than its top — which is
+// how the faces get shaded differently for free, with no geometry and no normals.
+registerShader('VOXEL_3D', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+uniform float u_time;
+
+// @param name="Mode" min=0 max=3 default=0 step=1 type=select options="Cubes,Columns,Terraces,Pins"
+uniform int u_vx_mode;
+// @param name="Grid" min=8.0 max=160.0 default=48.0 step=1.0
+uniform float u_vx_grid;
+// @param name="Height" min=0.0 max=0.6 default=0.18 step=0.005
+uniform float u_vx_height;
+// @param name="Levels" min=2.0 max=24.0 default=8.0 step=1.0
+uniform float u_vx_levels;
+// @param name="Motion" min=0 max=2 default=0 step=1 type=select options="Sway,Orbit,Manual"
+uniform int u_vx_motion;
+// @param name="Amplitude" min=0.0 max=1.0 default=0.35 step=0.01
+uniform float u_vx_amp;
+// @param name="Speed" min=0.05 max=4.0 default=0.35 step=0.05
+uniform float u_vx_speed;
+// @param name="View X" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_vx_x;
+// @param name="View Y" min=-1.0 max=1.0 default=-0.35 step=0.01
+uniform float u_vx_y;
+// @param name="Face Shading" min=0.0 max=2.0 default=1.0 step=0.05
+uniform float u_vx_shade;
+// @param name="Mortar" min=0.0 max=0.5 default=0.08 step=0.01
+uniform float u_vx_mortar;
+// @param name="Flat Cells" type=bool default=true
+uniform bool u_vx_flat;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_vx_invert;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_vx_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+// Cells are kept square in PIXELS, not in UV — square-in-UV cells would be
+// stretched rectangles on any non-square frame.
+vec2 vx_gridDims(float aspect) {
+  return vec2(u_vx_grid, max(2.0, floor(u_vx_grid / max(0.05, aspect))));
+}
+
+vec2 vx_cellCenter(vec2 uv, vec2 g) {
+  return (floor(uv * g) + 0.5) / g;
+}
+
+// Quantised height for the cell containing uv. Columns mode skips the vertical
+// quantisation, which turns the blocks into smooth extruded bars.
+float vx_height(vec2 uv, vec2 g, float inv) {
+  float d = d3_depthAt(u_depth_map, vx_cellCenter(uv, g), inv, 0.0, 1.0);
+  float h = 1.0 - d;
+  if (u_vx_mode == 1) return h;
+  float levels = max(2.0, floor(u_vx_levels));
+  return floor(h * levels) / levels;
+}
+
+void main() {
+  vec4 src = texture(u_texture, v_uv);
+  float inv = u_vx_invert ? 1.0 : 0.0;
+  float aspect = u_resolution.x / max(1.0, u_resolution.y);
+  vec2 g = vx_gridDims(aspect);
+
+  float t = u_time * u_vx_speed;
+  // Audio driver (0 until wired): bass drives the view around.
+  float amp = u_vx_amp * (1.0 + u_bass * 0.8);
+  vec2 mxy = vec2(0.0);
+  if (u_vx_motion == 0)      mxy = vec2(amp * sin(t), 0.0);
+  else if (u_vx_motion == 1) mxy = vec2(amp * cos(t), amp * sin(t) * 0.4);
+  // 2 = Manual — View X/Y alone.
+
+  vec2 view = vec2(u_vx_x, u_vx_y) + mxy;
+  view.x /= max(1e-3, aspect);
+  vec2 P = view * u_vx_height;
+
+  // Adaptive step count off the travel distance, same rule as CAMERA_3D — but a
+  // tighter step (~2.8px vs ~3px) and a lower ceiling. A block edge is a hard
+  // discontinuity, so under-stepping shows up as a staircase rather than as
+  // softness; 24 is where extra steps stop being visible and start being spend.
+  // This is the heaviest node in the family: one depth fetch per step.
+  float travelPx = length(P * u_resolution);
+  int steps = clamp(int(travelPx / 2.0), 6, 24);
+  float dl = 1.0 / float(steps);
+  vec2 duv = P * dl;
+
+  float layer = 1.0;
+  vec2 uv = v_uv;
+  float h = vx_height(uv, g, inv);
+  float side = 0.0;
+  float topLevel = h;
+
+  for (int i = 0; i < 24; i++) {
+    if (i >= steps) break;
+    if (h >= layer) break;
+    layer -= dl;
+    uv += duv;
+    float hPrev = h;
+    h = vx_height(uv, g, inv);
+    // The ray stepped onto something TALLER than what it was over: from here on
+    // it is grazing that block's vertical face, not its top.
+    if (h > hPrev + 1e-4) side = 1.0;
+    topLevel = h;
+  }
+
+  // Flat Cells samples the cell centre, so each block is one solid colour — the
+  // toy-brick read. Off, each block keeps the image detail inside it.
+  vec2 sampleUV = u_vx_flat ? vx_cellCenter(uv, g) : uv;
+  vec3 col = texture(u_texture, sampleUV).rgb;
+
+  // Face shading. Sides go darker, and taller blocks catch more light on top —
+  // there is no normal and no light here, just the two facts the march already
+  // knows, which is enough for the eye to build the solid.
+  float shade = 1.0 - side * 0.35 * u_vx_shade;
+  shade *= 1.0 + (topLevel - 0.5) * 0.25 * u_vx_shade;
+
+  // Mortar: the gap between blocks. Terraces widens it per level so the steps
+  // read as separate plates.
+  vec2 f = fract(uv * g);
+  float edge = min(min(f.x, f.y), min(1.0 - f.x, 1.0 - f.y));
+  float gapW = u_vx_mortar * 0.5 * (u_vx_mode == 2 ? 1.6 : 1.0);
+  float mortar = smoothstep(0.0, max(1e-4, gapW), edge);
+  if (u_vx_mode == 3) {
+    // Pins — round the top face off by darkening toward the cell edge instead of
+    // cutting a hard gap. Cheaper than an SDF and reads as a domed stud.
+    float r = length(f - 0.5) * 2.0;
+    shade *= 1.0 - smoothstep(0.55, 1.0, r) * 0.55 * u_vx_shade;
+    mortar = 1.0;
+  }
+
+  col *= shade * mix(1.0, mortar, min(1.0, u_vx_mortar * 4.0));
+
+  fragColor = vec4(mix(src.rgb, clamp(col, 0.0, 4.0), u_vx_mix), src.a);
+}
+`)
+
+// ── TIME_SLICE_3D (the third axis is TIME) ──
+// Every other node in this family treats z as distance. This one treats it as
+// AGE: how old a pixel is depends on how far away it is, so the background lags
+// behind the foreground and the frame becomes a corridor of its own history.
+//
+// The design doc wanted a 4×4 atlas of past frames for this. It isn't needed —
+// declaring `u_prev_frame` makes the executor hand this node its own ping-pong
+// pair (see the isFeedback branch in executeGraphDAG), and every mode here is
+// expressible as "output = f(live frame, my own last output, depth)". The output
+// IS the accumulator, so history costs one FBO that the renderer already knows
+// how to manage, instead of new plumbing.
+registerShader('TIME_SLICE_3D', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_prev_frame;
+uniform sampler2D u_depth_map;
+uniform vec2 u_resolution;
+uniform float u_time;
+
+// @param name="Mode" min=0 max=5 default=3 step=1 type=select options="Slit Scan (Rows),Slit Scan (Columns),Time Tunnel,Depth Freeze,Time Smear,Echo Trails"
+uniform int u_ts_mode;
+// @param name="Persistence" min=0.0 max=0.99 default=0.9 step=0.01
+uniform float u_ts_persist;
+// @param name="Scan Speed" min=0.1 max=16.0 default=2.0 step=0.1
+uniform float u_ts_scan;
+// @param name="Depth Rate" min=0.0 max=1.0 default=0.7 step=0.01
+uniform float u_ts_depth_rate;
+// @param name="Warp" min=0.0 max=0.08 default=0.01 step=0.001
+uniform float u_ts_warp;
+// @param name="Echo Band" min=0.0 max=1.0 default=0.6 step=0.01
+uniform float u_ts_band;
+// @param name="Band Width" min=0.02 max=1.0 default=0.4 step=0.01
+uniform float u_ts_band_w;
+// @param name="Decay Tint" type=color default=#6688cc
+uniform vec3 u_ts_tint;
+// @param name="Tint Amount" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_ts_tint_amt;
+// @param name="Invert Depth" type=bool default=false
+uniform bool u_ts_invert;
+// @param name="Mix" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_ts_mix;
+
+out vec4 fragColor;
+${LIB3D}
+
+void main() {
+  vec2 texel = 1.0 / u_resolution;
+  vec4 src = texture(u_texture, v_uv);
+  float inv = u_ts_invert ? 1.0 : 0.0;
+  float d = d3_depthAt(u_depth_map, v_uv, inv, 0.0, 1.0);
+  vec3 cur = src.rgb;
+  vec3 col;
+
+  if (u_ts_mode == 0) {
+    // Slit Scan (Rows) — the history scrolls down and the live frame only ever
+    // writes the top strip, so the vertical axis of the output IS elapsed time.
+    float shift = u_ts_scan * texel.y;
+    col = v_uv.y > 1.0 - shift
+      ? cur
+      : texture(u_prev_frame, v_uv + vec2(0.0, shift)).rgb;
+  } else if (u_ts_mode == 1) {
+    float shift = u_ts_scan * texel.x;
+    col = v_uv.x > 1.0 - shift
+      ? cur
+      : texture(u_prev_frame, v_uv + vec2(shift, 0.0)).rgb;
+  } else if (u_ts_mode == 2) {
+    // Time Tunnel — history expands outward from the centre every frame, so
+    // radius reads as age and the frame becomes a corridor of past frames.
+    vec2 zoomed = (v_uv - 0.5) / (1.0 + max(1e-4, u_ts_warp) * 4.0) + 0.5;
+    vec3 prev = texture(u_prev_frame, zoomed).rgb;
+    float r = length((v_uv - 0.5) * vec2(u_resolution.x / max(1.0, u_resolution.y), 1.0));
+    // New content enters in the middle; everything already there keeps flying out.
+    float gate = 1.0 - smoothstep(0.05, 0.28, r);
+    col = mix(prev * u_ts_persist, cur, gate);
+  } else if (u_ts_mode == 3) {
+    // Depth Freeze — the star. Each pixel's chance of refreshing this frame falls
+    // off with distance, so the far field literally lags in time behind the near
+    // field. A per-pixel hash makes the update DISCRETE, which is what gives the
+    // grainy datamosh texture; a smooth blend (Time Smear, below) just looks like
+    // motion blur.
+    float updateP = mix(1.0, 1.0 - u_ts_persist, clamp(d * u_ts_depth_rate, 0.0, 1.0));
+    float rnd = d3_hash12(gl_FragCoord.xy + vec2(floor(u_time * 60.0)));
+    vec3 prev = texture(u_prev_frame, v_uv).rgb;
+    col = rnd < updateP ? cur : prev;
+  } else if (u_ts_mode == 4) {
+    // Time Smear — the smooth sibling: near pixels track the live frame, far ones
+    // trail it. Optional warp drifts the history so the trail also moves.
+    float k = mix(1.0, 1.0 - u_ts_persist, clamp(d * u_ts_depth_rate, 0.0, 1.0));
+    vec2 warped = (v_uv - 0.5) * (1.0 + u_ts_warp) + 0.5;
+    vec3 prev = texture(u_prev_frame, warped).rgb;
+    col = mix(prev, cur, clamp(k, 0.0, 1.0));
+  } else {
+    // Echo Trails — feedback restricted to a DEPTH BAND, so only objects at a
+    // chosen distance leave trails. That selectivity is the thing plain feedback
+    // can never do.
+    vec2 warped = (v_uv - 0.5) * (1.0 + u_ts_warp) + 0.5;
+    vec3 prev = texture(u_prev_frame, warped).rgb;
+    float inBand = 1.0 - smoothstep(u_ts_band_w * 0.5, u_ts_band_w * 0.5 + 0.08,
+                                    abs(d - u_ts_band));
+    col = mix(cur, max(cur, prev * u_ts_persist), inBand);
+  }
+
+  // Age tint: history is pulled toward a colour as it decays, which makes the
+  // time axis legible instead of just soft.
+  if (u_ts_tint_amt > 0.001) {
+    float ageLike = clamp(length(col - cur), 0.0, 1.0);
+    col = mix(col, mix(col, u_ts_tint, 0.6), ageLike * u_ts_tint_amt);
+  }
+
+  fragColor = vec4(mix(src.rgb, clamp(col, 0.0, 4.0), u_ts_mix), src.a);
+}
+`)
 
 export default SHADER_SOURCES

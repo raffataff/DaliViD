@@ -9,10 +9,20 @@ import useAppStore from '../store/useAppStore.js'
 import useGraphStore from '../store/useGraphStore.js'
 import useTimelineStore from '../store/useTimelineStore.js'
 import { STARTER_TRANSITION_COMPOUND } from '../shaders/compoundPresets.js'
+import { clearDetectedAlpha } from '../gl/alphaRegistry.js'
 import { clearHistory } from './history.js'
 
 const PROJECT_PREFIX = 'dalivid_project_'
 const AUTOSAVE_KEY = 'dalivid_autosave'
+
+/**
+ * Plain-object copy of an edge transition, or null.
+ * `params` is copied shallowly on purpose: values are scalars, colour strings,
+ * or exposed-param values keyed by index — never nested objects.
+ */
+function serializeTransition(tr) {
+  return tr && tr.type ? { type: tr.type, params: { ...(tr.params || {}) } } : null
+}
 
 /**
  * Serialize the entire project state into a plain object.
@@ -66,15 +76,25 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
         sourceStart: c.sourceStart,
         sourceEnd: c.sourceEnd,
         speed: c.speed,
+        reversed: !!c.reversed,
         opacity: c.opacity,
         volume: c.volume == null ? 1 : c.volume,
         audioMuted: !!c.audioMuted,
         blendMode: c.blendMode,
+        // Alpha interpretation (see utils/alphaModes). Omitted rather than
+        // defaulted on save so an untouched clip stays on 'auto' and picks up
+        // any future improvement to detection instead of being frozen to
+        // whatever this session decided.
+        alphaMode: c.alphaMode || undefined,
+        alphaMatte: c.alphaMatte || undefined,
         fadeIn: c.fadeIn || 0,
         fadeOut: c.fadeOut || 0,
-        transition: c.transition
-          ? { type: c.transition.type, params: { ...(c.transition.params || {}) } }
-          : null,
+        // Edge transitions. `transition` (head-only, pre-edge-model) is written
+        // as null rather than omitted so a project saved by this version and
+        // reopened by an older one degrades to plain fades instead of throwing.
+        transitionIn: serializeTransition(c.transitionIn || c.transition),
+        transitionOut: serializeTransition(c.transitionOut),
+        transition: null,
         transform: { ...c.transform },
         // Generator clips (text/image) carry their content + style here (text
         // string, image data URL, fit/transform). Self-contained — no external
@@ -178,6 +198,12 @@ export function deserializeProject(data, getAppStore) {
 
   const app = getAppStore()
 
+  // Alpha detections are keyed by FILENAME so splits of one file share a probe.
+  // That means they must not survive a project load: a different project can
+  // legitimately have a different "logo.webm", and inheriting the old verdict
+  // would apply the wrong interpretation to it.
+  clearDetectedAlpha()
+
   // Restore project settings
   if (data.project) {
     app.setProjectSettings({
@@ -202,14 +228,23 @@ export function deserializeProject(data, getAppStore) {
   if (data.timeline) {
     useTimelineStore.setState({
       tracks: data.timeline.tracks || [],
-      // Migration: clip blendMode 'Normal' used to mean "fall back to the track's
-      // mode" — that behaviour is now the explicit 'Inherit' value (an explicit
-      // 'Normal' is a real override). Mapping legacy 'Normal'/unset to 'Inherit'
-      // keeps old projects rendering identically.
+      // Two migrations, both of which keep older projects rendering identically:
+      //
+      // 1. clip blendMode 'Normal' used to mean "fall back to the track's mode" —
+      //    that is now the explicit 'Inherit' value (an explicit 'Normal' is a
+      //    real override), so legacy 'Normal'/unset maps to 'Inherit'.
+      // 2. `clip.transition` was a head-only transition tied to the overlap with
+      //    the previous clip. It is now `transitionIn`, one of two edge
+      //    transitions. Same semantics on load — a clip with an overlap still
+      //    crossfades across exactly that overlap — so the only visible change
+      //    is that the clip now also has a tail slot it can use.
       clips: (data.timeline.clips || []).map(c => ({
         fadeIn: 0,
         fadeOut: 0,
+        transitionOut: null,
         ...c,
+        transitionIn: c.transitionIn || c.transition || null,
+        transition: null,
         blendMode: (!c.blendMode || c.blendMode === 'Normal') ? 'Inherit' : c.blendMode,
       })),
       markers: data.timeline.markers || [],

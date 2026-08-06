@@ -18,6 +18,7 @@ import { instantiatePreset, instantiateUserCompound } from '../../shaders/compou
 import { generateCombinedShader } from '../../shaders/shaderGenerator'
 import { getNodeSockets, getSocketYOffset, canConnect } from '../../shaders/nodeDefinitions'
 import { getDataNodeParams } from '../../shaders/dataNodeParams'
+import { parseTransitionGraphKey, edgeLabel } from '../../utils/clipTransitions'
 import './NodeCanvas.css'
 
 const EXCLUDED_FROM_MARQUEE = new Set([
@@ -112,6 +113,23 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   const updateExposedCompoundParam = useGraphStore(s => s.updateExposedCompoundParam)
 
   const graph = graphLevel === 'master' ? masterGraph : (clipGraphs[graphClipId] || masterGraph)
+
+  // A transition graph is a clip graph under a synthetic key, so it needs its
+  // own title — the generic path looks for a CLIP_SOURCE node it doesn't have
+  // and would just say "Clip". The clip list is read non-reactively: the header
+  // only has to be right when the key changes, and subscribing the whole canvas
+  // to `clips` would re-render it on every timeline edit.
+  const isTransitionGraph = graphLevel === 'clip' && !!parseTransitionGraphKey(graphClipId)
+
+  const graphTitle = useMemo(() => {
+    if (graphLevel === 'master') return 'Master Effect Graph'
+    const tr = parseTransitionGraphKey(graphClipId)
+    if (tr) {
+      const clip = useTimelineStore.getState().clips.find(c => c.id === tr.clipId)
+      return `${edgeLabel(tr.edge)}: ${clip?.filename || 'Clip'}`
+    }
+    return `Effect Graph: ${graph.nodes.find(n => n.type === 'CLIP_SOURCE')?.name || 'Clip'}`
+  }, [graphLevel, graphClipId, graph])
 
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
@@ -1115,19 +1133,22 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
         <button className={`panel__collapse-btn ${collapsed ? 'panel__collapse-btn--collapsed' : ''}`} onClick={onToggleCollapse}>
           <IconChevronDown />
         </button>
-        <span className="panel__header-title">
-          {graphLevel === 'master'
-            ? 'Master Effect Graph'
-            : `Effect Graph: ${graph.nodes.find(n => n.type === 'CLIP_SOURCE')?.name || 'Clip'}`
-          }
-        </span>
+        <span className="panel__header-title">{graphTitle}</span>
         {graphLevel === 'clip' && (
           <button className="node-canvas__back-btn" onClick={exitClipGraph}>
             ↩ Back to Master
           </button>
         )}
         <div style={{ flex: 1 }} />
-        {graphLevel === 'clip' && (
+        {/* A transition graph is previewed in the FULL pipeline (it mixes two
+            sides that only exist there), so the isolated/through-master choice
+            doesn't apply — the hint replaces it with the one thing worth
+            knowing: scrub the region to see the effect. */}
+        {isTransitionGraph ? (
+          <span className="node-canvas__transition-hint">
+            Scrub the transition region to preview
+          </span>
+        ) : graphLevel === 'clip' && (
           <button
             className={`node-canvas__masterfx-toggle ${previewThroughMaster ? 'node-canvas__masterfx-toggle--on' : ''}`}
             onClick={togglePreviewThroughMaster}

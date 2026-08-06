@@ -14,10 +14,20 @@ import { getCameraStream, removeCameraStream } from './cameraRegistry.js'
 import { ensureNodeImage, removeNodeImage } from './imageRegistry.js'
 import { ensureText, removeText } from './textRegistry.js'
 import { onNodeRemoved } from './nodeLifecycle.js'
+import { setDetectedAlpha, getDetectedAlpha } from './alphaRegistry.js'
 import { getShaderSource } from '../shaders/shaderRegistry.js'
 import { buildTransitionShader, getTransitionDefaults } from '../shaders/transitionRegistry.js'
 import { evaluateKeyframes } from '../utils/keyframes.js'
 import { hexToVec3 } from '../utils/paramParser.js'
+import {
+  EDGE_HEAD, EDGE_TAIL, clipEdgeState, clipEnvelopeGain,
+  findPrevOverlap, findNextOverlap,
+  transitionGraphKey, isTransitionGraphKey, isGraphType, isCompoundType, compoundIdOf,
+} from '../utils/clipTransitions.js'
+import {
+  ALPHA_IGNORE, ALPHA_MODE_INDEX, ALPHA_PROBE_SIZE, ALPHA_PROBE_MAX_ATTEMPTS,
+  classifyAlphaSample, resolveAlphaMode, alphaSourceKey,
+} from '../utils/alphaModes.js'
 
 // Node types that are not effect passes (sources, outputs, audio routing). Used
 // to decide whether a graph actually has any effects worth running.
@@ -34,6 +44,84 @@ uniform sampler2D u_texture;
 out vec4 fragColor;
 void main() {
   fragColor = texture(u_texture, v_uv);
+}
+`
+
+// Source alpha interpretation — the video → clip_input pass (see utils/alphaModes).
+// DaliVid's pipeline is STRAIGHT alpha throughout, so an imported source is
+// converted here, once, and nothing downstream has to care where it came from.
+// u_alpha_mode MUST match ALPHA_MODE_INDEX: 0 = ignore, 1 = straight, 2 = premultiplied.
+const ALPHA_INTERPRET_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform int u_alpha_mode;
+uniform vec3 u_alpha_matte;   // colour the source was matted against (usually black)
+out vec4 fragColor;
+void main() {
+  vec4 c = texture(u_texture, v_uv);
+  if (u_alpha_mode == 0) {          // Ignore — force opaque
+    fragColor = vec4(c.rgb, 1.0);
+    return;
+  }
+  if (u_alpha_mode == 2) {          // Premultiplied — undo src*a + matte*(1-a)
+    // Guarding the divisor rather than branching keeps this uniform-flow; a
+    // fully transparent pixel divides garbage but its alpha is 0, so the
+    // compositor discards the colour anyway. Clamped because a mis-set matte
+    // colour would otherwise push values far out of range and blow up the
+    // half-float FBOs downstream.
+    float a = max(c.a, 1.0 / 255.0);
+    vec3 straight = (c.rgb - u_alpha_matte * (1.0 - c.a)) / a;
+    fragColor = vec4(clamp(straight, 0.0, 1.0), c.a);
+    return;
+  }
+  fragColor = c;                    // Straight — already what the pipeline wants
+}
+`
+
+// Preview backdrop — what "transparent" looks like on screen. Runs only when the
+// backdrop is not plain black (the default present already composites over black
+// for free via the colour mask), so the common path pays nothing.
+const BACKDROP_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform int u_backdrop;     // 0 = black, 1 = checkerboard, 2 = white
+uniform int u_alpha_view;   // 1 = show the alpha channel as greyscale
+out vec4 fragColor;
+void main() {
+  vec4 c = texture(u_texture, v_uv);
+  if (u_alpha_view == 1) {  // Matte view: white = opaque, black = transparent
+    fragColor = vec4(vec3(c.a), 1.0);
+    return;
+  }
+  vec3 bg = vec3(0.0);
+  if (u_backdrop == 1) {
+    // Checker cells are sized in CANVAS pixels, so they stay a constant size on
+    // screen and read as "background", not as part of the picture.
+    vec2 cell = floor(v_uv * u_resolution / 16.0);
+    bg = mix(vec3(0.38), vec3(0.26), mod(cell.x + cell.y, 2.0));
+  } else if (u_backdrop == 2) {
+    bg = vec3(1.0);
+  }
+  // The accumulator is PREMULTIPLIED, so source-over is rgb + bg*(1-a).
+  fragColor = vec4(c.rgb + bg * (1.0 - c.a), 1.0);
+}
+`
+
+// Un-premultiply for the alpha export path. The compositor's output is
+// premultiplied but the canvas is `premultipliedAlpha: false`, so the drawing
+// buffer must be handed STRAIGHT colour — otherwise every semi-transparent
+// pixel is multiplied by alpha a second time and exports too dark.
+const UNPREMULTIPLY_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+out vec4 fragColor;
+void main() {
+  vec4 c = texture(u_texture, v_uv);
+  fragColor = vec4(c.rgb / max(c.a, 1.0 / 255.0), c.a);
 }
 `
 
@@ -177,6 +265,17 @@ export class Renderer {
     // Video elements for texture upload
     this._videoElements = new Map() // clipId → HTMLVideoElement
 
+    // Per-source alpha probes (see utils/alphaModes). Keyed by media filename so
+    // splits/duplicates of one file share a single detection.
+    // { mode, attempts, settled } — `settled` stops the readPixels stall once a
+    // verdict is in or the attempt budget is spent.
+    this._alphaProbes = new Map()
+
+    // Export flag: when true the present pass keeps REAL alpha in the drawing
+    // buffer (un-premultiplied) instead of flattening onto black, so a PNG or a
+    // VP9-alpha encode can carry transparency. See _presentToScreen.
+    this._presentAlpha = false
+
     // Callbacks
     this.onFPSUpdate = null
     this.onFrameComplete = null
@@ -266,6 +365,12 @@ export class Renderer {
 
     const compResult = createShaderProgram(this.gl, COMPOSITE_FS)
     this.compositeProgram = compResult
+
+    // Alpha handling: source interpretation on the way in, backdrop + matte view
+    // on the way to the screen, un-premultiply on the way to an alpha export.
+    this.alphaProgram = createShaderProgram(this.gl, ALPHA_INTERPRET_FS)
+    this.backdropProgram = createShaderProgram(this.gl, BACKDROP_FS)
+    this.unpremultiplyProgram = createShaderProgram(this.gl, UNPREMULTIPLY_FS)
 
     // Image source program — the IMAGE_INPUT shader (fit/transform/reactive).
     // Single source of truth: the same registry shader the node card parses for
@@ -462,15 +567,132 @@ export class Renderer {
    * Present a finished frame to the screen: straight blit normally, or through
    * the letterbox pass when project widescreen bars are enabled. Export reads the
    * same canvas, so bars are baked into exports with no extra plumbing.
+   *
+   * ── Why the alpha is masked off ──
+   * The compositor's output is PREMULTIPLIED (applyBlendMode returns
+   * `src*a + base*(1-a)` with `outA = a + base.a*(1-a)`), but the canvas is
+   * created `premultipliedAlpha: false`. Writing the accumulator's alpha
+   * straight to the drawing buffer therefore made the browser multiply RGB by
+   * alpha a SECOND time when compositing the canvas onto the page: a linear
+   * fade rendered as a quadratic one (50% opacity showed at 25% brightness),
+   * which is why a fade-out looked like it dropped out early and never landed
+   * cleanly on "nothing" — and, since both export paths read this canvas, the
+   * same wrong curve was baked into renders.
+   *
+   * The screen is cleared to OPAQUE black each frame and the present draw masks
+   * alpha writes off, so the drawing buffer stays a=1 everywhere. That makes the
+   * present exactly "composite over black" — the backdrop every NLE assumes —
+   * and it costs nothing: no extra pass, no extra program. FBO passes are
+   * unaffected; the mask is restored immediately.
+   *
    * @param {string} fboId — FBO holding the finished frame
    * @param {object|null} bars — result of _masterBars() for this frame
    */
   _presentToScreen(fboId, bars) {
-    if (!bars) { this._blitToScreen(fboId); return }
+    const gl = this.gl
+
+    // Export path: keep the real alpha instead of flattening onto black.
+    if (this._presentAlpha) { this._presentAlphaToScreen(fboId, bars); return }
+
+    const src = this._applyPreviewBackdrop(fboId)
+    gl.colorMask(true, true, true, false)
+    try {
+      this._presentPass(src, bars)
+    } finally {
+      gl.colorMask(true, true, true, true)
+    }
+  }
+
+  /**
+   * Composite the finished frame over the preview backdrop (checkerboard/white),
+   * or replace it with the alpha-matte view. Returns the FBO the present should
+   * read — which is the INPUT unchanged in the default case, because "over
+   * black" is already exactly what the colour-masked present does for free.
+   * So the normal preview still costs zero extra passes.
+   */
+  _applyPreviewBackdrop(fboId) {
+    // Both of these are things you look AT the picture through, never part of
+    // the picture. Every export path reads this same canvas, so without this
+    // gate an export started with the checkerboard on would bake a checkerboard
+    // into the file — and one started in matte view would render a greyscale
+    // matte. `previewTapEnabled` is already the renderer's "this frame is for
+    // output, not for the eye" flag (both export paths and the frame save clear
+    // it), so it is the right thing to hang this on.
+    if (!this.previewTapEnabled) return fboId
+
+    const app = this._getAppStore?.() || {}
+    const backdrop = app.previewBackdrop || 'black'
+    const alphaView = !!app.previewAlphaView
+    if ((!alphaView && backdrop === 'black') || !this.backdropProgram?.program) return fboId
+
+    const gl = this.gl
+    const dstId = '__preview_backdrop'
+    if (!this.fbos.getTexture(dstId)) this.fbos.create(dstId, this.width, this.height)
+    else this.fbos.resize(dstId, this.width, this.height)
+
+    this.fbos.bind(dstId)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.useProgram(this.backdropProgram.program)
+    const locs = this.backdropProgram.uniformLocations
+    this.fbos.bindTexture(fboId, 0)
+    if (locs.u_texture != null) gl.uniform1i(locs.u_texture, 0)
+    if (locs.u_resolution != null) gl.uniform2f(locs.u_resolution, this.width, this.height)
+    if (locs.u_backdrop != null) gl.uniform1i(locs.u_backdrop, backdrop === 'checker' ? 1 : backdrop === 'white' ? 2 : 0)
+    if (locs.u_alpha_view != null) gl.uniform1i(locs.u_alpha_view, alphaView ? 1 : 0)
+    this.drawQuad()
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    return dstId
+  }
+
+  /**
+   * Present with transparency intact, for an alpha export.
+   *
+   * Runs the ordinary present (including bars) into an FBO rather than the
+   * screen, then un-premultiplies on the way to the drawing buffer: the
+   * compositor's output is premultiplied but the canvas is
+   * `premultipliedAlpha: false`, so straight colour is what it expects. The
+   * colour mask is deliberately NOT applied here — the whole point is that the
+   * drawing buffer keeps a real alpha channel for `toDataURL` / `VideoFrame`
+   * to pick up. (`_renderFrame` clears the screen transparent to match.)
+   */
+  _presentAlphaToScreen(fboId, bars) {
+    const gl = this.gl
+    if (!this.unpremultiplyProgram?.program) { this._presentPass(fboId, bars); return }
+
+    // Bars need a pass of their own before the un-premultiply; without them the
+    // finished frame is already where it needs to be and the staging copy is
+    // skipped entirely.
+    let srcId = fboId
+    if (bars) {
+      srcId = '__present_alpha'
+      if (!this.fbos.getTexture(srcId)) this.fbos.create(srcId, this.width, this.height)
+      else this.fbos.resize(srcId, this.width, this.height)
+      this._presentPass(fboId, bars, srcId)
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.useProgram(this.unpremultiplyProgram.program)
+    this.fbos.bindTexture(srcId, 0)
+    const loc = this.unpremultiplyProgram.uniformLocations.u_texture
+    if (loc != null) gl.uniform1i(loc, 0)
+    this.drawQuad()
+  }
+
+  /**
+   * The present draw itself (see _presentToScreen for the alpha handling).
+   * `dstFBOId` null draws to the screen; an id draws into that FBO instead,
+   * which is how the alpha-export path gets a bars-applied frame it can
+   * un-premultiply.
+   */
+  _presentPass(fboId, bars, dstFBOId = null) {
+    if (!bars) { this._blitToScreen(fboId, dstFBOId); return }
 
     const gl = this.gl
     const locs = this.barsProgram.uniformLocations
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    if (dstFBOId) this.fbos.bind(dstFBOId)
+    else gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, this.width, this.height)
     gl.useProgram(this.barsProgram.program)
 
@@ -522,9 +744,15 @@ export class Renderer {
   executePass(nodeProgram, inputFBOId, outputFBOId, standardState, customParams = {}, prevFrameFBOId = null, extraTextures = []) {
     const gl = this.gl
 
-    // Bind output FBO
+    // Bind output FBO. FBOManager.bind already sets the viewport from the
+    // target's OWN dimensions, and that is what makes scaled (half / quarter-res)
+    // targets possible — this used to hard-code the canvas size straight
+    // afterwards, silently overriding it, which is why a scaled pass would have
+    // written one corner of its buffer. Identical behaviour for every full-size
+    // FBO (they are all canvas-sized); the fallback covers drawing to the screen,
+    // where there is no entry to read dimensions from.
     this.fbos.bind(outputFBOId)
-    gl.viewport(0, 0, this.width, this.height)
+    if (!outputFBOId) gl.viewport(0, 0, this.width, this.height)
     gl.clear(gl.COLOR_BUFFER_BIT)
 
     // Use program
@@ -759,10 +987,22 @@ export class Renderer {
       beatCount: audioState.beatCount || 0,
     }
 
-    // Clear the screen
+    // Clear the screen. A timeline with clips clears to BLACK, because black is
+    // what "no picture" means in a video program: it's the backdrop the present
+    // pass flattens onto, so a clip fading out to nothing lands on exactly the
+    // same colour the gap after it shows — no step at the end of the fade. The
+    // empty-project idle colour stays the panel grey so a brand-new project
+    // doesn't look like a dead output.
+    //
+    // An alpha export is the one exception: it wants "no picture" to mean
+    // genuinely nothing, so uncovered regions land in the file as transparent
+    // rather than as black.
+    const hasTimelineContent = clips.length > 0
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, this.width, this.height)
-    gl.clearColor(0.05, 0.05, 0.06, 1.0)
+    if (this._presentAlpha) gl.clearColor(0, 0, 0, 0)
+    else if (hasTimelineContent) gl.clearColor(0, 0, 0, 1)
+    else gl.clearColor(0.05, 0.05, 0.06, 1.0)
     gl.clear(gl.COLOR_BUFFER_BIT)
 
     // Tick texture manager (evicts stale textures)
@@ -780,8 +1020,14 @@ export class Renderer {
     // Determine graph context
     // Already declared earlier in the function
 
-    // If in isolated clip graph mode, just render that clip's graph
-    if (graphLevel === 'clip' && graphClipId) {
+    // If in isolated clip graph mode, just render that clip's graph.
+    //
+    // A TRANSITION graph is the exception: it is meaningless in isolation (it
+    // mixes two sides that only exist in the composite), so editing one keeps
+    // the FULL pipeline on screen. Scrub the region and you watch the actual
+    // transition you're building, in context, with the real neighbouring clip.
+    const editingTransition = graphLevel === 'clip' && isTransitionGraphKey(graphClipId)
+    if (graphLevel === 'clip' && graphClipId && !editingTransition) {
       this._renderClipGraphIsolated(graphClipId, clips, graphState, standardState)
     } else {
       // Full compositing pipeline
@@ -841,14 +1087,53 @@ export class Renderer {
    * the sound always follows the picture.
    */
   _clipAudioGain(clip, playheadTime) {
-    if (clip.audioMuted) return 0
-    let g = clip.volume == null ? 1 : Math.max(0, Math.min(1, clip.volume))
-    if (clip.fadeIn > 0) g *= Math.max(0, Math.min(1, (playheadTime - clip.timelineStart) / clip.fadeIn))
-    if (clip.fadeOut > 0) g *= Math.max(0, Math.min(1, (clip.timelineEnd - playheadTime) / clip.fadeOut))
-    return g
+    return clipEnvelopeGain(clip, clipEdgeState(clip, null, null, playheadTime))
   }
 
   _syncVideoPlayback(clip, videoEl, sourceTime, isMuted = false, gain = 1) {
+    // ── Reversed clips ──
+    // No browser supports a negative playbackRate, so a reversed clip is driven
+    // as a seek-per-frame scrubber: the element stays PAUSED and we walk
+    // currentTime backwards. Two consequences we lean on deliberately:
+    //  · We never queue a second seek while one is in flight — the decoder is
+    //    the bottleneck and a backlog would make the picture lag the playhead
+    //    further every frame. The previous frame simply repeats instead, so the
+    //    preview degrades to the decoder's seek rate rather than falling behind.
+    //  · A paused element produces no sound, so reversed clips are SILENT in the
+    //    preview. Export reverses the decoded AudioBuffer properly
+    //    (ExportModal.renderTimelineAudio), so the rendered file does have audio.
+    if (clip.reversed) {
+      if (!videoEl.paused && !videoEl._playPending) videoEl.pause()
+      if (videoEl._playbackGain) videoEl._playbackGain.gain.value = 0
+      else if (!videoEl.muted) videoEl.muted = true
+
+      // Never seek to exactly `duration`: that lands the element in the `ended`
+      // state with no frame to present, which is black. A reversed clip's FIRST
+      // frame is sourceEnd — normally the media duration exactly — so without
+      // this clamp every reversed clip starts on a black frame.
+      const dur = videoEl.duration
+      const target = (Number.isFinite(dur) && dur > 0)
+        ? Math.max(0, Math.min(sourceTime, dur - 0.04))
+        : Math.max(0, sourceTime)
+
+      // Seek/upload handshake. The render loop calls this BEFORE it uploads the
+      // frame, so issuing a seek on every pass would leave `seeking` true at
+      // upload time forever and the clip would never receive a decoded frame —
+      // a permanently black preview. Asking for the next frame only once the
+      // last one has actually been uploaded makes reverse alternate
+      // seek-frame / upload-frame, which is correct and self-throttling: the
+      // decoder, not the render loop, sets the pace. (`_lastUploadedTime` is
+      // undefined for audio-only elements, which have no upload step — treat
+      // those as always consumed so they still track the playhead.)
+      const consumed = videoEl._lastUploadedTime == null ||
+        videoEl._lastUploadedTime === videoEl.currentTime
+      if (!videoEl.seeking && consumed && Math.abs(videoEl.currentTime - target) > 0.001) {
+        videoEl.currentTime = target
+        videoEl._lastSetSourceTime = target
+      }
+      return
+    }
+
     // Clip-level audio: track mute wins; otherwise the audible level follows
     // the computed gain (clip volume × fades × transition crossfade).
     //
@@ -930,7 +1215,6 @@ export class Renderer {
    * a MediaStream in cameraRegistry (no fileUrl, no seeking/playback sync).
    */
   _renderClipToFBO(track, clip, isLiveStream, graphState, standardState, playheadTime) {
-    const gl = this.gl
     const inputFBOId = `clip_input_${clip.id}`
 
     // ── Generator clips (text / image / shape) ──
@@ -1008,26 +1292,145 @@ export class Renderer {
     if (!hasTexture) {
       this.textures.create(texId, videoEl.videoWidth || 1920, videoEl.videoHeight || 1080)
     }
-    if (videoEl.readyState >= 2 && (!hasTexture || videoEl.currentTime !== videoEl._lastUploadedTime)) {
+    // Never sample MID-SEEK. While a seek is in flight `currentTime` already
+    // reports the target but the decoder has not presented that frame yet, so
+    // uploading now gets either a stale picture or — on a paused element — a
+    // blank one. Holding the previous good texture until the seek lands is both
+    // correct and what the eye expects (the picture holds, it doesn't flash).
+    // The one exception is the very first frame, where there's no texture to
+    // fall back on and something is better than black.
+    const settled = !videoEl.seeking
+    if (videoEl.readyState >= 2 &&
+        (!hasTexture || (settled && videoEl.currentTime !== videoEl._lastUploadedTime))) {
       this.textures.uploadVideoFrame(texId, videoEl)
-      videoEl._lastUploadedTime = videoEl.currentTime
+      // Only stamp a settled frame, so a bootstrap upload is re-done properly
+      // once the decoder catches up.
+      if (settled) videoEl._lastUploadedTime = videoEl.currentTime
+      // Probe THIS frame for an alpha channel. Driven off the upload rather than
+      // the frame loop so successive attempts see genuinely different pictures —
+      // a clip can open on an opaque frame and reveal its alpha a second later.
+      // Live streams are always opaque, so they never pay for a probe.
+      if (settled && !isLiveStream) this._probeSourceAlpha(clip, texId)
     }
 
     if (!this.fbos.getTexture(inputFBOId)) {
       this.fbos.create(inputFBOId, this.width, this.height)
     }
 
-    // Render the video texture into the clip's input FBO.
-    this.fbos.bind(inputFBOId)
-    gl.viewport(0, 0, this.width, this.height)
-    gl.useProgram(this.passthroughProgram.program)
-    gl.activeTexture(gl.TEXTURE0)
-    gl.bindTexture(gl.TEXTURE_2D, this.textures.getTexture(texId))
-    const loc = this.passthroughProgram.uniformLocations.u_texture
-    if (loc != null) gl.uniform1i(loc, 0)
-    this.drawQuad()
+    // Render the video texture into the clip's input FBO, converting whatever
+    // the decoder handed us into the pipeline's straight-alpha convention.
+    this._drawSourceWithAlpha(clip, texId, inputFBOId, isLiveStream)
 
     return this._runClipGraph(clip, inputFBOId, graphState, standardState, playheadTime)
+  }
+
+  /**
+   * Draw a decoded source texture into `dstFBOId`, applying the clip's alpha
+   * interpretation (see utils/alphaModes). This is the ONLY place an imported
+   * source's alpha is reasoned about — everything downstream is straight alpha.
+   *
+   * @param {object} clip — the timeline clip (reads `alphaMode` / `alphaMatte`)
+   * @param {string} texId — decoded source texture id
+   * @param {string} dstFBOId — destination FBO (already created by the caller)
+   * @param {boolean} isLive — live camera/screen streams are always opaque
+   */
+  _drawSourceWithAlpha(clip, texId, dstFBOId, isLive = false) {
+    const gl = this.gl
+    const prog = this.alphaProgram?.program ? this.alphaProgram : this.passthroughProgram
+
+    this.fbos.bind(dstFBOId)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.useProgram(prog.program)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, this.textures.getTexture(texId))
+    const locs = prog.uniformLocations
+    if (locs.u_texture != null) gl.uniform1i(locs.u_texture, 0)
+
+    if (locs.u_alpha_mode != null) {
+      // A live stream has no alpha to interpret; forcing Ignore also stops a
+      // stray decoder alpha value from punching a hole in a camera feed.
+      const mode = isLive
+        ? ALPHA_IGNORE
+        : resolveAlphaMode(clip.alphaMode, getDetectedAlpha(alphaSourceKey(clip)))
+      gl.uniform1i(locs.u_alpha_mode, ALPHA_MODE_INDEX[mode] ?? ALPHA_MODE_INDEX.straight)
+    }
+    if (locs.u_alpha_matte != null) {
+      const m = hexToVec3(clip.alphaMatte || '#000000')
+      gl.uniform3f(locs.u_alpha_matte, m[0], m[1], m[2])
+    }
+
+    this.drawQuad()
+  }
+
+  /**
+   * One-shot GPU probe: does this source actually carry an alpha channel, and if
+   * so is it straight or premultiplied? (See `classifyAlphaSample` for the test.)
+   *
+   * Point-samples the decoded frame into a small RGBA8 FBO and reads it back.
+   * Deliberately does NOT average: averaging would destroy the very relationship
+   * being measured (premultiplied colour never exceeds its own alpha), whereas
+   * point samples preserve each pixel's rgb-vs-a relationship exactly.
+   *
+   * `readPixels` is a synchronous GPU stall, so this is strictly budgeted: at
+   * most ALPHA_PROBE_MAX_ATTEMPTS per source, ever, and it stops the instant it
+   * finds alpha. Results are shared by filename, so splitting a clip is free.
+   */
+  _probeSourceAlpha(clip, texId) {
+    const key = alphaSourceKey(clip)
+    if (!key) return
+    let rec = this._alphaProbes.get(key)
+    if (rec?.settled) return
+    if (!rec) {
+      rec = { mode: ALPHA_IGNORE, attempts: 0, settled: false }
+      this._alphaProbes.set(key, rec)
+    }
+
+    const gl = this.gl
+    const tex = this.textures.getTexture(texId)
+    if (!tex || !this.passthroughProgram?.program) return
+
+    const probeId = '__alpha_probe'
+    // RGBA8, not the default half-float: readPixels(RGBA/UNSIGNED_BYTE) is the
+    // one format combination WebGL2 guarantees for a colour attachment.
+    // `fixedSize` keeps setResolution's resizeAll from inflating the sample grid
+    // to canvas size, which would leave the readback covering one corner of the
+    // frame instead of the whole of it.
+    if (!this.fbos.getTexture(probeId)) {
+      this.fbos.create(probeId, ALPHA_PROBE_SIZE, ALPHA_PROBE_SIZE, { halfFloat: false, fixedSize: true })
+    }
+
+    try {
+      this.fbos.bind(probeId)
+      gl.viewport(0, 0, ALPHA_PROBE_SIZE, ALPHA_PROBE_SIZE)
+      gl.useProgram(this.passthroughProgram.program)
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, tex)
+      const loc = this.passthroughProgram.uniformLocations.u_texture
+      if (loc != null) gl.uniform1i(loc, 0)
+      this.drawQuad()
+
+      const pixels = new Uint8Array(ALPHA_PROBE_SIZE * ALPHA_PROBE_SIZE * 4)
+      gl.readPixels(0, 0, ALPHA_PROBE_SIZE, ALPHA_PROBE_SIZE, gl.RGBA, gl.UNSIGNED_BYTE, pixels)
+
+      const { mode } = classifyAlphaSample(pixels)
+      rec.attempts++
+      if (mode !== ALPHA_IGNORE) {
+        rec.mode = mode
+        rec.settled = true
+      } else if (rec.attempts >= ALPHA_PROBE_MAX_ATTEMPTS) {
+        rec.settled = true
+      }
+      // Publish every verdict, including the interim "no alpha yet", so the
+      // Inspector readout is never blank once a clip has rendered a frame.
+      setDetectedAlpha(key, rec.mode)
+    } catch (e) {
+      // A probe is an optimisation, never a reason to lose a frame.
+      console.warn('[DaliVid] Alpha probe failed:', e?.message)
+      rec.settled = true
+    } finally {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      gl.viewport(0, 0, this.width, this.height)
+    }
   }
 
   /**
@@ -1184,22 +1587,44 @@ export class Renderer {
       // (spec §C). A single clip is just the common case of one active clip.
       const activeClips = getActiveClips(clips, track.id, playheadTime)
 
-      // Per-clip audio gains at the playhead (volume × mute × fades). During a
-      // transition the incoming clip's audio ramps up with the picture and the
-      // outgoing clip's ramps down — an automatic audio crossfade. Plain
-      // overlaps without a transition keep both audible (layering is a valid
-      // use); mute or fade a clip to silence it.
-      for (const c of activeClips) this._audioGains[c.id] = this._clipAudioGain(c, playheadTime)
-      for (let ci = 1; ci < activeClips.length; ci++) {
-        const c = activeClips[ci]
-        if (!c.transition || !c.transition.type) continue
-        const prev = activeClips[ci - 1]
-        const overlapEnd = Math.min(prev.timelineEnd, c.timelineEnd)
-        const overlapDur = overlapEnd - c.timelineStart
-        if (overlapDur <= 0.001) continue
-        const p = Math.max(0, Math.min(1, (playheadTime - c.timelineStart) / overlapDur))
-        this._audioGains[c.id] *= p
-        this._audioGains[prev.id] *= (1 - p)
+      // Edge state for every active clip, computed ONCE per frame and reused by
+      // both the picture and the audio below — that shared derivation is the
+      // point of utils/clipTransitions: sound can't drift from the image
+      // because they read the same numbers.
+      //
+      // The neighbours are looked up from the FULL clip list, not from
+      // `activeClips`. Using the active neighbours would be cheaper but wrong:
+      // whether a clip overlaps this one's start or end is a property of the
+      // timeline, not of this instant, and a neighbour can enter or leave the
+      // active set part-way through a region. Deriving it from `activeClips`
+      // made a region change length mid-play — the transition's progress would
+      // jump, or a tail would snap back to full opacity the frame the next clip
+      // became active. Two short scans per clip is a cheap price for a region
+      // that holds still.
+      const edgeStates = {}
+      for (const c of activeClips) {
+        edgeStates[c.id] = clipEdgeState(
+          c, findPrevOverlap(c, clips), findNextOverlap(c, clips), playheadTime
+        )
+      }
+
+      // Per-clip audio: volume × mute × whatever envelope owns this instant —
+      // the plain fade ramp, or a transition's progress when one has taken the
+      // window over. A head transition additionally ducks the clip it is
+      // crossfading FROM, which is the one thing the outgoing clip's own state
+      // can't know. Plain overlaps with no transition keep both clips audible
+      // (layering is a valid use); mute or fade a clip to silence it.
+      for (const c of activeClips) {
+        this._audioGains[c.id] = clipEnvelopeGain(c, edgeStates[c.id])
+      }
+      for (const c of activeClips) {
+        const es = edgeStates[c.id]
+        if (!es.headTransition || es.head?.mode !== 'crossfade') continue
+        // The outgoing clip is named by the region itself, not inferred from
+        // ordering — and it is guaranteed active here, since the region ends at
+        // its timelineEnd.
+        const outId = es.head.prev.id
+        if (this._audioGains[outId] != null) this._audioGains[outId] *= 1 - es.headProgress
       }
 
       for (let ci = 0; ci < activeClips.length; ci++) {
@@ -1225,41 +1650,34 @@ export class Renderer {
         const clipOpacity = clip.opacity == null ? 1 : clip.opacity
         const trackOpacity = track.opacity == null ? 1 : track.opacity
 
-        // Fade-in/out: linear opacity ramps over the first fadeIn / last fadeOut
-        // seconds of the clip (timeline time, like NLE fade handles). Both fades
-        // multiply, so on a short clip with overlapping ramps the dip composes
-        // instead of popping. Zero-length fades are the no-op default.
-        let fade = 1
-        if (clip.fadeIn > 0) fade *= Math.max(0, Math.min(1, (playheadTime - clip.timelineStart) / clip.fadeIn))
-        if (clip.fadeOut > 0) fade *= Math.max(0, Math.min(1, (clip.timelineEnd - playheadTime) / clip.fadeOut))
+        // `fade` is the plain linear ramp for whichever edge windows a shader
+        // did NOT take over (clipEdgeState suppresses the ramp under a typed
+        // transition, so the two can't stack into a double dip).
+        const es = edgeStates[clip.id]
+        const opacity = Math.max(0, Math.min(1, clipOpacity)) * Math.max(0, Math.min(1, trackOpacity)) * es.fade
 
-        const opacity = Math.max(0, Math.min(1, clipOpacity)) * Math.max(0, Math.min(1, trackOpacity)) * fade
-
-        // Transition-in: when this clip declares one AND overlaps the previous
-        // active clip on this track, the transition shader owns the mix for the
-        // overlap window (u_progress 0 → 1), replacing the plain blend
-        // composite. Both clips are active at the playhead, so the overlap is
-        // guaranteed non-empty; u_from is the accumulator (previous clip over
-        // the lower tracks), which is the correct compositing backdrop.
+        // Edge transitions own their window outright, replacing the blend
+        // composite. At most one is live per frame — clipEdgeState already
+        // resolves the short-clip case where the two regions overlap.
+        //
+        // Both directions are the SAME pass, only the sides swap:
+        //   head → FROM = the accumulator (previous clip over the lower tracks,
+        //          or just the backdrop when nothing precedes it), TO = the clip
+        //   tail → FROM = the clip, TO = the accumulator (what's behind it)
+        // which is what makes "transition out to nothing" work at all: the
+        // outgoing side is a real texture and the incoming side is the empty
+        // backdrop, the exact mirror of a transition in from nothing.
         let composited = false
-        if (clip.transition && clip.transition.type && ci > 0) {
-          const prev = activeClips[ci - 1]
-          const overlapEnd = Math.min(prev.timelineEnd, clip.timelineEnd)
-          const overlapDur = overlapEnd - clip.timelineStart
-          if (overlapDur > 0.001) {
-            const progress = Math.max(0, Math.min(1, (playheadTime - clip.timelineStart) / overlapDur))
-            // "compound:<libId>" runs a node-graph transition from the compound
-            // library; anything else is a built-in registry transition shader.
-            composited = clip.transition.type.startsWith('compound:')
-              ? this._compositeNodeTransition(
-                  accumReadId, accumWriteId, clipResultFBOId,
-                  clip, progress, opacity, standardState
-                )
-              : this._compositeTransition(
-                  accumReadId, accumWriteId, clipResultFBOId,
-                  clip.transition, progress, opacity, standardState
-                )
-          }
+        if (es.headTransition) {
+          composited = this._compositeEdgeTransition(
+            accumReadId, accumWriteId, accumReadId, clipResultFBOId,
+            clip, EDGE_HEAD, es.headTransition, es.headProgress, opacity, standardState, graphState
+          )
+        } else if (es.tailTransition) {
+          composited = this._compositeEdgeTransition(
+            accumReadId, accumWriteId, clipResultFBOId, accumReadId,
+            clip, EDGE_TAIL, es.tailTransition, es.tailProgress, opacity, standardState, graphState
+          )
         }
         if (!composited) {
           this._compositeTrack(accumReadId, accumWriteId, clipResultFBOId, blendIdx, opacity)
@@ -1321,9 +1739,9 @@ export class Renderer {
         const blendIdx = getBlendModeIndex(blendName)
         const clipOpacity = clip.opacity == null ? 1 : clip.opacity
         const trackOpacity = track.opacity == null ? 1 : track.opacity
-        let fade = 1
-        if (clip.fadeIn > 0) fade *= Math.max(0, Math.min(1, (playheadTime - clip.timelineStart) / clip.fadeIn))
-        if (clip.fadeOut > 0) fade *= Math.max(0, Math.min(1, (clip.timelineEnd - playheadTime) / clip.fadeOut))
+        // Audio visuals take the plain ramp: an audio clip has no picture to
+        // transition, so its edges are always the default fade.
+        const fade = clipEdgeState(clip, null, null, playheadTime).fade
         const opacity = Math.max(0, Math.min(1, clipOpacity)) * Math.max(0, Math.min(1, trackOpacity)) * fade
 
         this._compositeTrack(accumReadId, accumWriteId, visFBOId, blendIdx, opacity)
@@ -1341,16 +1759,20 @@ export class Renderer {
       const masterGraph = graphState.masterGraph
       const hasEffects = masterGraph && masterGraph.nodes.some(n => !NON_EFFECT_TYPES.includes(n.type))
 
-      // Project widescreen bars are the very last pass, applied to the finished
-      // frame. With bars on, the master chain renders into an FBO instead of
-      // straight to the screen so the letterbox pass has something to read.
+      // The master chain ALWAYS renders into an FBO, never straight to the
+      // screen, so that _presentToScreen is the single choke point every frame
+      // passes through. It has to be: the alpha colour-mask, the preview
+      // backdrop, the alpha-export un-premultiply and the widescreen bars are
+      // all present-time concerns, and when the chain drew itself to the
+      // drawing buffer (which it did whenever the master graph had effects and
+      // bars were off) every one of them was silently skipped — including the
+      // fade-out alpha fix, which is why it only ever worked on some projects.
+      // The cost is one full-screen blit, i.e. exactly what a bars-on frame
+      // already paid.
       const bars = this._masterBars()
-      let presentFBOId = null
-      if (bars) {
-        presentFBOId = '__master_present'
-        if (!this.fbos.getTexture(presentFBOId)) this.fbos.create(presentFBOId, this.width, this.height)
-        else this.fbos.resize(presentFBOId, this.width, this.height)
-      }
+      const presentFBOId = '__master_present'
+      if (!this.fbos.getTexture(presentFBOId)) this.fbos.create(presentFBOId, this.width, this.height)
+      else this.fbos.resize(presentFBOId, this.width, this.height)
 
       if (hasEffects) {
         if (!this.masterChain || this._needsRecompile) {
@@ -1375,7 +1797,7 @@ export class Renderer {
           this._setClipTimeContext(standardState, null, playheadTime)
           const kfMaster = this._withKeyframes(buildNodeMap(masterGraph), 'master', playheadTime)
           executeChain(this, this.masterChain.chain, masterInputFBOId, presentFBOId, standardState, {}, kfMaster, this.masterChain.edges, this.previewTapEnabled ? masterGraph.tapPointNodeId : null)
-          if (bars) this._presentToScreen(presentFBOId, bars)
+          this._presentToScreen(presentFBOId, bars)
         } else {
           if (hasContent) this._presentToScreen(masterInputFBOId, bars)
         }
@@ -1443,22 +1865,23 @@ export class Renderer {
     removeNodeImage(clipId)
     removeText(clipId)
 
-    // Node-transition FBOs are namespaced `…tr~<clipId>~…` (see
-    // _compositeNodeTransition); enumerate-and-match frees them without needing
-    // to know which library transition (or which of its inner nodes) ran.
+    // Node-transition FBOs are namespaced `…tr~<clipId>~<edge>~…` (see
+    // _compositeGraphTransition); enumerate-and-match frees them without needing
+    // to know which transition (or which of its inner nodes) ran.
     const trScope = `tr~${clipId}~`
     for (const key of [...this.fbos.fbos.keys()]) {
       if (key.includes(trScope)) this.fbos.delete(key)
     }
 
     // Free each node's GPU resources; releaseNodeResources descends into
-    // compounds. The clip's graph is needed to enumerate its node ids.
-    const clipGraph = graphState?.clipGraphs?.[clipId]
-    if (clipGraph?.nodes) {
-      for (const n of clipGraph.nodes) this.releaseNodeResources(n)
+    // compounds. The clip's graph is needed to enumerate its node ids — and its
+    // two private transition graphs are clip-owned too, so they go with it.
+    for (const key of [clipId, transitionGraphKey(clipId, EDGE_HEAD), transitionGraphKey(clipId, EDGE_TAIL)]) {
+      const g = graphState?.clipGraphs?.[key]
+      if (g?.nodes) for (const n of g.nodes) this.releaseNodeResources(n)
+      this.compiledChains.delete(key)
+      delete this._nodeTransitionChains[key]
     }
-
-    this.compiledChains.delete(clipId)
   }
 
   /**
@@ -1531,22 +1954,84 @@ export class Renderer {
   }
 
   /**
-   * Composite an incoming clip over the accumulator with a transition shader
-   * instead of the blend-mode compositor. Same FBO contract as _compositeTrack
-   * (three distinct FBOs; caller ping-pongs). Standard uniforms are uploaded, so
-   * transitions get u_time / u_beat / u_audio_rms for free (audio-reactive).
+   * Run one of a clip's edge transitions and composite the result. Dispatches on
+   * the transition's type to one of three implementations, all of which share
+   * the same FROM / TO / BACKDROP contract so a transition behaves identically
+   * whichever edge it is on:
    *
-   * @param {string} baseFBOId  — backdrop FBO: accumulator incl. the outgoing clip
-   * @param {string} destFBOId  — destination FBO
-   * @param {string} toFBOId    — the incoming clip's finished frame
-   * @param {object} transition — { type, params } from clip.transition
-   * @param {number} progress   — 0..1 across the overlap window
-   * @param {number} opacity    — 0..1 effective clip × track opacity
-   * @param {object} standardState — per-frame standard uniform state
-   * @returns {boolean} true if the transition pass ran (false → caller falls
-   *   back to the blend composite, e.g. unknown type or failed compile)
+   *   'graph'            → this clip edge's PRIVATE node graph (clipGraphs under
+   *                        a synthetic key — see utils/clipTransitions)
+   *   'compound:<libId>' → a shared compound-library entry
+   *   anything else      → a built-in registry shader
+   *
+   * Same FBO contract as _compositeTrack: three distinct FBOs, caller ping-pongs.
+   *
+   * @param {string} baseFBOId — backdrop: the accumulator as it stands
+   * @param {string} destFBOId — destination (must differ from base)
+   * @param {string} fromFBOId — the side the region starts on
+   * @param {string} toFBOId   — the side the region ends on
+   * @param {object} clip
+   * @param {string} edge      — EDGE_HEAD | EDGE_TAIL
+   * @param {object} transition — { type, params }
+   * @param {number} progress  — 0..1 across the region
+   * @param {number} opacity   — 0..1 effective clip × track opacity
+   * @param {object} standardState
+   * @param {object} graphState — store snapshot (holds clipGraphs)
+   * @returns {boolean} false → caller falls back to the plain blend composite
+   *   (unknown type, missing graph, compile failure). Falling back rather than
+   *   dropping the frame means a broken transition degrades to a hard cut
+   *   instead of a black hole in the timeline.
    */
-  _compositeTransition(baseFBOId, destFBOId, toFBOId, transition, progress, opacity, standardState) {
+  _compositeEdgeTransition(baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge, transition, progress, opacity, standardState, graphState) {
+    const type = transition?.type
+    if (!type) return false
+
+    if (isGraphType(type)) {
+      const key = transitionGraphKey(clip.id, edge)
+      const graph = graphState?.clipGraphs?.[key]
+      if (!graph || !graph.nodes || graph.nodes.length === 0) {
+        this._warnTransitionOnce(key, `[Renderer] Transition graph "${key}" is empty`)
+        return false
+      }
+      return this._compositeGraphTransition(
+        baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge,
+        graph, key, null, null, progress, opacity, standardState
+      )
+    }
+
+    if (isCompoundType(type)) {
+      const libId = compoundIdOf(type)
+      const entry = this._getGraphStore?.()?.compoundLibrary?.find(c => c.id === libId)
+      if (!entry || !entry.subGraph) {
+        this._warnTransitionOnce(type, `[Renderer] Node transition "${libId}" not found in compound library`)
+        return false
+      }
+      return this._compositeGraphTransition(
+        baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge,
+        entry.subGraph, `lib:${libId}`, entry, transition.params, progress, opacity, standardState
+      )
+    }
+
+    return this._compositeBuiltinTransition(
+      baseFBOId, destFBOId, fromFBOId, toFBOId, transition, progress, opacity, standardState
+    )
+  }
+
+  /** Warn once per key — a broken transition runs every frame, so this is the
+   *  difference between one console line and a flooded console. */
+  _warnTransitionOnce(key, message) {
+    if (this._transitionWarned.has(key)) return
+    this._transitionWarned.add(key)
+    console.warn(message)
+  }
+
+  /**
+   * Built-in registry transition: one full-screen shader pass. Standard uniforms
+   * are uploaded, so transitions get u_time / u_beat / u_audio_rms for free
+   * (audio-reactive with no wiring).
+   * @returns {boolean} true if the pass ran
+   */
+  _compositeBuiltinTransition(baseFBOId, destFBOId, fromFBOId, toFBOId, transition, progress, opacity, standardState) {
     const gl = this.gl
     const type = transition.type
 
@@ -1562,10 +2047,7 @@ export class Renderer {
     // eviction) recompiles transparently.
     const prog = createShaderProgram(gl, src)
     if (!prog.program) {
-      if (!this._transitionWarned.has(type)) {
-        this._transitionWarned.add(type)
-        console.warn(`[Renderer] Transition "${type}" failed to compile:`, prog.errors)
-      }
+      this._warnTransitionOnce(type, `[Renderer] Transition "${type}" failed to compile: ${prog.errors}`)
       return false
     }
 
@@ -1576,16 +2058,21 @@ export class Renderer {
 
     gl.useProgram(prog.program)
     const locs = prog.uniformLocations
-    this.fbos.bindTexture(baseFBOId, 0)
+    this.fbos.bindTexture(fromFBOId, 0)
     if (locs.u_from != null) gl.uniform1i(locs.u_from, 0)
     this.fbos.bindTexture(toFBOId, 1)
     if (locs.u_to != null) gl.uniform1i(locs.u_to, 1)
+    // The opacity fallback target. On a head pass this is the same FBO as
+    // u_from (two units, one texture — free); on a tail it is the same as u_to.
+    this.fbos.bindTexture(baseFBOId, 2)
+    if (locs.u_backdrop != null) gl.uniform1i(locs.u_backdrop, 2)
     if (locs.u_progress != null) gl.uniform1f(locs.u_progress, progress)
     if (locs.u_opacity != null) gl.uniform1f(locs.u_opacity, opacity)
 
     uploadStandardUniforms(gl, locs, standardState)
-    // Registry defaults overlaid with the clip's saved param values.
-    const params = { ...getTransitionDefaults(type), ...(transition.params || {}) }
+    // Registry defaults overlaid with the clip's saved values. normalizeParams
+    // converts '#rrggbb' colour params to vec3 — uploadUniforms can't guess.
+    const params = normalizeParams({ ...getTransitionDefaults(type), ...(transition.params || {}) })
     uploadUniforms(gl, locs, prog.uniformTypes, params)
 
     this.drawQuad()
@@ -1594,70 +2081,72 @@ export class Renderer {
   }
 
   /**
-   * Composite an incoming clip using a NODE-GRAPH transition: a compound
-   * library entry (clip.transition.type = "compound:<libId>") whose sub-graph
-   * mixes its two image inputs (FROM = accumulator, TO = incoming clip), with
-   * any TRANSITION_PROGRESS node inside driven by the live overlap progress.
-   * The clip's saved param values (clip.transition.params, keyed by exposed-
-   * param index) are applied as live overrides without mutating the entry.
-   * Result is composited over the accumulator Normal-mode at `opacity`, same
-   * contract as the built-in transition footer.
+   * Node-graph transition: a sub-graph whose first two image EFFECT_INPUT
+   * terminals are bound FROM / TO, with any TRANSITION_PROGRESS node inside
+   * driven by the live region progress. Backs both the per-clip private graph
+   * and shared compound-library entries — they differ only in where the graph
+   * comes from and whether exposed-param overrides apply.
+   *
+   * @param {object} subGraph — { nodes, edges }
+   * @param {string} cacheKey — compile-cache key (graph key, or `lib:<id>`)
+   * @param {object|null} entry — library entry, when this is a shared compound
+   * @param {object|null} overrides — exposed-param values by index (entry only)
    * @returns {boolean} false → caller falls back to the blend composite
-   *   (missing library entry, compile errors, or an unresolvable output).
    */
-  _compositeNodeTransition(baseFBOId, destFBOId, toFBOId, clip, progress, opacity, standardState) {
-    const transition = clip.transition
-    const libId = transition.type.slice('compound:'.length)
-    const entry = this._getGraphStore?.()?.compoundLibrary?.find(c => c.id === libId)
-    if (!entry || !entry.subGraph) {
-      if (!this._transitionWarned.has(transition.type)) {
-        this._transitionWarned.add(transition.type)
-        console.warn(`[Renderer] Node transition "${libId}" not found in compound library`)
-      }
-      return false
-    }
-
-    // Compile (or reuse) the entry's sub-graph chain.
-    let cached = this._nodeTransitionChains[libId]
-    if (!cached || cached.entry !== entry) {
-      const compiled = compileGraph(this.gl, entry.subGraph)
-      cached = { entry, chain: compiled.chain, errors: compiled.errors }
-      this._nodeTransitionChains[libId] = cached
+  _compositeGraphTransition(baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge, subGraph, cacheKey, entry, overrides, progress, opacity, standardState) {
+    // Compile (or reuse) the sub-graph's chain.
+    //
+    // Invalidation is by `topologyVersion`, NOT by object identity: the store
+    // replaces the graph object on every param change too, so identity would
+    // recompile the whole sub-graph on each frame of a slider drag. Baked params
+    // don't matter here — executeTransitionCompound passes a live node map, so
+    // the executor reads current values off the graph regardless of what the
+    // chain was compiled with. topologyVersion bumps on exactly the changes that
+    // DO need a recompile (nodes, edges, shader source, bypass), and on project
+    // load, so it is both sufficient and cheap.
+    const topo = this._getGraphStore?.()?.topologyVersion ?? 0
+    let cached = this._nodeTransitionChains[cacheKey]
+    if (!cached || cached.topo !== topo) {
+      const compiled = compileGraph(this.gl, subGraph)
+      cached = { source: subGraph, topo, chain: compiled.chain, errors: compiled.errors }
+      this._nodeTransitionChains[cacheKey] = cached
       if (compiled.errors?.length) {
-        console.warn(`[Renderer] Node transition "${entry.name}" compiled with errors:`, compiled.errors)
+        console.warn(`[Renderer] Transition graph "${cacheKey}" compiled with errors:`, compiled.errors)
       }
     }
     if (!cached.chain || cached.chain.length === 0) return false
 
-    // Apply the clip's exposed-param values as live overrides.
+    // Shared library entries expose params on the clip; a private graph is
+    // edited directly, so its node params ARE the values (no override layer).
     let liveNodes = null
-    const overrides = transition.params || {}
-    const eps = entry.exposedParams || []
+    const eps = entry?.exposedParams || []
     if (eps.length) {
+      const vals = overrides || {}
       liveNodes = {}
       for (let i = 0; i < eps.length; i++) {
         const ep = eps[i]
         const map = ep.mappings?.[0]
         if (!map) continue
-        const raw = overrides[i] ?? ep.value ?? ep.paramConfig?.default
+        const raw = vals[i] ?? ep.value ?? ep.paramConfig?.default
         const value = (typeof raw === 'number' && typeof map.scaleFactor === 'number')
           ? raw * map.scaleFactor + (map.offset || 0)
           : raw
-        const inner = entry.subGraph.nodes.find(n => n.id === map.nodeId)
+        const inner = subGraph.nodes.find(n => n.id === map.nodeId)
         const base = liveNodes[map.nodeId]?.params ?? inner?.params ?? {}
         liveNodes[map.nodeId] = { params: { ...base, [map.uniformName]: value } }
       }
     }
 
-    // The incoming clip owns the transition, so a TIME node inside it reads that
-    // clip's window (progress is available separately via TRANSITION_PROGRESS).
+    // The clip owns the transition, so a TIME node inside reads that clip's
+    // window (region progress is available separately via TRANSITION_PROGRESS).
     this._setClipTimeContext(standardState, clip, standardState.playhead ?? 0)
 
-    // Inner FBOs are namespaced per clip so two clips using the same library
-    // transition never collide (freed in releaseClipResources).
+    // Inner FBOs are namespaced per clip AND per edge, so a clip using the same
+    // transition on both ends doesn't have its head and tail fighting over one
+    // set of buffers. Freed by releaseClipResources (which matches on `tr~<id>~`).
     const resultFBO = executeTransitionCompound(
-      this, cached.chain, entry.subGraph, baseFBOId, toFBOId,
-      standardState, progress, `tr~${clip.id}~`, liveNodes
+      this, cached.chain, subGraph, fromFBOId, toFBOId,
+      standardState, progress, `tr~${clip.id}~${edge}~`, liveNodes
     )
     if (!resultFBO) return false
 
@@ -1666,11 +2155,12 @@ export class Renderer {
   }
 
   /**
-   * Blit an FBO to the screen using the passthrough shader.
+   * Blit an FBO to the screen (or to `dstFBOId`) using the passthrough shader.
    */
-  _blitToScreen(fboId) {
+  _blitToScreen(fboId, dstFBOId = null) {
     const gl = this.gl
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    if (dstFBOId) this.fbos.bind(dstFBOId)
+    else gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, this.width, this.height)
     gl.useProgram(this.passthroughProgram.program)
     this.fbos.bindTexture(fboId, 0)
@@ -1768,6 +2258,7 @@ export class Renderer {
       if (clip.fileType !== 'audio' && videoEl.readyState >= 2 && (!hasTexture || videoEl.currentTime !== videoEl._lastUploadedTime)) {
         this.textures.uploadVideoFrame(texId, videoEl)
         videoEl._lastUploadedTime = videoEl.currentTime
+        this._probeSourceAlpha(clip, texId)
       }
 
       if (clip.fileType === 'audio') {
@@ -1775,14 +2266,9 @@ export class Renderer {
         this._ensureDefaultFBO()
         this.fbos.blit('__default_input', inputFBOId, this.width, this.height)
       } else {
-        this.fbos.bind(inputFBOId)
-        gl.viewport(0, 0, this.width, this.height)
-        gl.useProgram(this.passthroughProgram.program)
-        gl.activeTexture(gl.TEXTURE0)
-        gl.bindTexture(gl.TEXTURE_2D, this.textures.getTexture(texId))
-        const loc = this.passthroughProgram.uniformLocations.u_texture
-        if (loc != null) gl.uniform1i(loc, 0)
-        this.drawQuad()
+        // Same alpha interpretation as the composited path, so keying a clip in
+        // the isolated editor and then watching it on the timeline agree.
+        this._drawSourceWithAlpha(clip, texId, inputFBOId)
       }
     }
 
@@ -1810,6 +2296,14 @@ export class Renderer {
       // Keyframes animate in the isolated view too, so authoring is WYSIWYG.
       const kfClipNodes = this._withKeyframes(buildNodeMap(clipGraph), clipId, playheadTime - clip.timelineStart)
 
+      // Like the full pipeline, the isolated view lands in an FBO and presents
+      // through _presentToScreen — so the transparency checkerboard and the
+      // alpha-matte view work HERE, which is where keying is actually done.
+      // Bars stay off in isolation (deliberate: a clip is not a delivery).
+      const isoId = '__isolated_present'
+      if (!this.fbos.getTexture(isoId)) this.fbos.create(isoId, this.width, this.height)
+      else this.fbos.resize(isoId, this.width, this.height)
+
       if (throughMaster) {
         const clipOutId = `clip_isolated_master_in_${clipId}`
         if (!this.fbos.getTexture(clipOutId)) this.fbos.create(clipOutId, this.width, this.height)
@@ -1821,19 +2315,14 @@ export class Renderer {
         }
         // The master pass renders its own full OUTPUT — no master tap is applied here.
         const kfMasterNodes = this._withKeyframes(buildNodeMap(masterGraph), 'master', playheadTime)
-        executeChain(this, this.masterChain.chain, clipOutId, null, standardState, {}, kfMasterNodes, this.masterChain.edges, null)
+        executeChain(this, this.masterChain.chain, clipOutId, isoId, standardState, {}, kfMasterNodes, this.masterChain.edges, null)
       } else {
-        executeChain(this, chain, inputFBOId, null, standardState, {}, kfClipNodes, edges, clipTap)
+        executeChain(this, chain, inputFBOId, isoId, standardState, {}, kfClipNodes, edges, clipTap)
       }
+      this._presentToScreen(isoId, null)
     } else {
-      // No graph — passthrough
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-      gl.viewport(0, 0, this.width, this.height)
-      gl.useProgram(this.passthroughProgram.program)
-      this.fbos.bindTexture(inputFBOId, 0)
-      const ptLoc = this.passthroughProgram.uniformLocations.u_texture
-      if (ptLoc != null) gl.uniform1i(ptLoc, 0)
-      this.drawQuad()
+      // No graph — present the source frame directly.
+      this._presentToScreen(inputFBOId, null)
     }
 
     this._needsRecompile = false

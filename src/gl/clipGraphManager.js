@@ -23,6 +23,12 @@ const TEXTURE_INPUT_SOCKETS = {
   input: 'u_texture',
   input_b: 'u_texture_b',
   disp_map: 'u_disp_map',
+  // The 3D / Depth family's shared depth input. Only nodes that actually declare
+  // u_depth_map pick this up (the loop below skips a uniform the program doesn't
+  // have), and an unwired socket falls back to the primary input — so a depth
+  // consumer dropped in bare reads the colour image's luma as a crude depth
+  // signal rather than sampling nothing.
+  depth_map: 'u_depth_map',
 }
 
 // The audio "driver" uniforms. These are auto-declared into every effect shader
@@ -31,6 +37,24 @@ const TEXTURE_INPUT_SOCKETS = {
 // wired in. Band ids match the splitter's output socket ids. (u_beat is handled
 // separately as an always-live standard uniform.)
 const AUDIO_DRIVERS_SOCKET = 'audio_drivers'
+
+// ── Scaled render targets ──
+// A node whose output is a LOW-FREQUENCY DATA MAP rather than a picture can be
+// rendered at a fraction of the canvas resolution for a 4×/16× saving, because
+// every consumer samples it with normalized UVs and gets a bilinear upsample for
+// free. `DEPTH` is the archetype: its cue stack is the most expensive thing in the
+// 3D family, its output is deliberately smooth, and downsampling actively HELPS
+// (the resample is a denoiser, and noisy depth is what makes parallax boil).
+//
+// This is opt-in per node type and driven by a real UI param, not a hidden
+// constant — running an image-chain node at half res would just look soft.
+const FBO_SCALE_STEPS = [1.0, 0.5, 0.25]
+
+function nodeFBOScale(node, liveParams) {
+  if (node.type !== 'DEPTH') return 1
+  const idx = Math.round(Number(liveParams?.u_dp_res ?? 1))
+  return FBO_SCALE_STEPS[Math.min(FBO_SCALE_STEPS.length - 1, Math.max(0, idx))]
+}
 
 /**
  * Live values for each audio driver band, read from the audio store.
@@ -396,9 +420,19 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
   // nodeId → { outputSocketId → FBO id } for multi-output producers (compounds).
   const nodeOutputBySocket = {}
 
-  const ensureFBO = (id) => {
-    if (!fbos.has(id)) fbos.create(id, renderer.width, renderer.height)
-    else fbos.resize(id, renderer.width, renderer.height)
+  // `scale` renders the node's pass at a fraction of the canvas size (see
+  // FBOManager.create). Because an FBO's scale is a property of the buffer,
+  // changing it means rebuilding — resize() re-applies the OLD ratio by design —
+  // so a changed Resolution param is detected here and the target recreated.
+  const ensureFBO = (id, scale = 1) => {
+    if (!fbos.has(id)) {
+      fbos.create(id, renderer.width, renderer.height, { scale })
+    } else if (fbos.getScale(id) !== scale) {
+      fbos.delete(id)
+      fbos.create(id, renderer.width, renderer.height, { scale })
+    } else {
+      fbos.resize(id, renderer.width, renderer.height)
+    }
     return id
   }
 
@@ -602,7 +636,10 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
       renderer.executePass(node, primaryInput, outId, standardState, customParams, prevFrameFBOId, extraTextures)
       pp.swap() // current now points at the buffer we just wrote
     } else {
-      outId = ensureFBO(nFBO(node.nodeId))
+      // Data-map nodes (DEPTH) may render at half / quarter res — see nodeFBOScale.
+      // Feedback nodes above are deliberately excluded: their output is their own
+      // history, so a scaled target would compound resampling every frame.
+      outId = ensureFBO(nFBO(node.nodeId), nodeFBOScale(node, liveParams))
       renderer.executePass(node, primaryInput, outId, standardState, customParams, null, extraTextures)
     }
 
@@ -1120,8 +1157,20 @@ export function getActiveClips(clips, trackId, time) {
     .sort((a, b) => a.timelineStart - b.timelineStart)
 }
 
+/**
+ * Map a timeline position to the clip's source-media time.
+ *
+ * `reversed` clips walk the source backwards (sourceEnd → sourceStart) over the
+ * same timeline span, so reversing is a pure remap: trim, speed, split, fades
+ * and keyframes all keep working untouched. Playback of a reversed clip is
+ * seek-driven (a media element can't run at a negative rate) — see
+ * Renderer._syncVideoPlayback.
+ */
 export function getClipSourceTime(clip, playheadTime) {
   const clipLocalTime = playheadTime - clip.timelineStart
-  const sourceTime = clip.sourceStart + clipLocalTime * (clip.speed || 1)
+  const elapsed = clipLocalTime * (clip.speed || 1)
+  const sourceTime = clip.reversed
+    ? clip.sourceEnd - elapsed
+    : clip.sourceStart + elapsed
   return Math.max(clip.sourceStart, Math.min(clip.sourceEnd, sourceTime))
 }

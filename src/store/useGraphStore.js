@@ -10,6 +10,7 @@ import { STARTER_TRANSITION_COMPOUND } from '../shaders/compoundPresets'
 import { removeNodeImage } from '../gl/imageRegistry'
 import { removeText } from '../gl/textRegistry'
 import { emitNodeRemoved } from '../gl/nodeLifecycle'
+import { transitionGraphKey, EDGES } from '../utils/clipTransitions'
 
 let nodeCounter = 0
 function newNodeId() {
@@ -24,6 +25,31 @@ function newEdgeId() {
 // flags, or source). Plain param/position/name edits are intentionally excluded
 // so dragging a slider doesn't recompile the graph every frame.
 const RECOMPILE_KEYS = ['bypassed', 'customShaderSource', 'shaderCode', 'type', 'subGraph']
+
+/**
+ * Deep-copy a { nodes, edges } graph with fresh ids, remapping edge endpoints.
+ * Shared by clip-graph duplication and transition-graph seeding: both need an
+ * independent copy, because a graph that still shared node ids with its source
+ * would collide in the renderer's per-node FBO keys.
+ */
+function cloneGraphWithNewIds(src, prefix) {
+  const stamp = Date.now()
+  let seq = 0
+  const idMap = {}
+  for (const n of src.nodes || []) idMap[n.id] = `node_${stamp}_${prefix}${++seq}`
+  const nodes = (src.nodes || []).map(n => {
+    const copy = JSON.parse(JSON.stringify(n)) // params, subGraph, bindings
+    copy.id = idMap[n.id]
+    return copy
+  })
+  const edges = (src.edges || []).map((e, i) => ({
+    ...e,
+    id: `edge_${stamp}_${prefix}${i}`,
+    fromNode: idMap[e.fromNode] || e.fromNode,
+    toNode: idMap[e.toNode] || e.toNode,
+  }))
+  return { nodes, edges, idMap }
+}
 
 function createDefaultMasterGraph() {
   const outputId = `node_master_output`
@@ -194,41 +220,36 @@ const useGraphStore = create((set, get) => ({
    */
   duplicateClipGraph: (sourceClipId, newClipId, clipName = 'Clip', clipType = 'video') => {
     set((state) => {
+      const next = { ...state.clipGraphs }
       const src = state.clipGraphs[sourceClipId]
+
       if (!src) {
-        return {
-          clipGraphs: { ...state.clipGraphs, [newClipId]: createClipGraph(clipName, clipType) },
-          topologyVersion: state.topologyVersion + 1,
+        next[newClipId] = createClipGraph(clipName, clipType)
+      } else {
+        const { nodes, edges, idMap } = cloneGraphWithNewIds(src, 'sp')
+        next[newClipId] = {
+          nodes,
+          edges,
+          tapPointNodeId: idMap[src.tapPointNodeId] || null,
+          compiledChain: [],
+          compileErrors: [],
         }
       }
-      const stamp = Date.now()
-      let seq = 0
-      const idMap = {}
-      for (const n of src.nodes) idMap[n.id] = `node_${stamp}_sp${++seq}`
-      const nodes = src.nodes.map(n => {
-        const copy = JSON.parse(JSON.stringify(n)) // params, subGraph, bindings
-        copy.id = idMap[n.id]
-        return copy
-      })
-      const edges = src.edges.map((e, i) => ({
-        ...e,
-        id: `edge_${stamp}_sp${i}`,
-        fromNode: idMap[e.fromNode] || e.fromNode,
-        toNode: idMap[e.toNode] || e.toNode,
-      }))
-      return {
-        clipGraphs: {
-          ...state.clipGraphs,
-          [newClipId]: {
-            nodes,
-            edges,
-            tapPointNodeId: idMap[src.tapPointNodeId] || null,
-            compiledChain: [],
-            compileErrors: [],
-          },
-        },
-        topologyVersion: state.topologyVersion + 1,
+
+      // Private transition graphs travel with the clip. Without this a split or
+      // duplicate would leave the copy pointing at a `type: 'graph'` transition
+      // whose graph doesn't exist, which renders as a hard cut — the effect
+      // would appear to vanish for no visible reason.
+      for (const edge of EDGES) {
+        const trSrc = state.clipGraphs[transitionGraphKey(sourceClipId, edge)]
+        if (!trSrc) continue
+        const { nodes, edges: trEdges } = cloneGraphWithNewIds(trSrc, `sp${edge}`)
+        next[transitionGraphKey(newClipId, edge)] = {
+          nodes, edges: trEdges, tapPointNodeId: null, compiledChain: [], compileErrors: [],
+        }
       }
+
+      return { clipGraphs: next, topologyVersion: state.topologyVersion + 1 }
     })
   },
 
@@ -240,15 +261,66 @@ const useGraphStore = create((set, get) => ({
   },
 
   /**
-   * Drop a removed clip's graph. The Renderer already frees the clip's GPU
-   * resources when it disappears from the timeline (releaseClipResources), but
-   * the graph entry itself lingers — which matters because the Media Pool
-   * derives its Images tab by scanning every clip graph for IMAGE_INPUT nodes,
-   * so an orphaned graph would keep resurrecting a deleted image card.
+   * Drop a removed clip's graph — and its two private transition graphs, which
+   * are clip-owned and would otherwise be unreachable garbage in the project
+   * file. The Renderer already frees the clip's GPU resources when it disappears
+   * from the timeline (releaseClipResources), but the graph entry itself
+   * lingers — which matters because the Media Pool derives its Images tab by
+   * scanning every clip graph for IMAGE_INPUT nodes, so an orphaned graph would
+   * keep resurrecting a deleted image card.
    * Emits removal for each node so any not-yet-freed FBOs are released too.
    */
   removeClipGraph: (clipId) => {
-    const graph = get().clipGraphs[clipId]
+    const state = get()
+    const keys = [clipId, ...EDGES.map(e => transitionGraphKey(clipId, e))]
+      .filter(k => state.clipGraphs[k])
+    if (keys.length === 0) return
+    for (const key of keys) {
+      for (const n of state.clipGraphs[key].nodes || []) {
+        removeNodeImage(n.id)
+        removeText(n.id)
+        emitNodeRemoved(n)
+      }
+    }
+    set((s) => {
+      const next = { ...s.clipGraphs }
+      for (const key of keys) delete next[key]
+      return { clipGraphs: next, topologyVersion: s.topologyVersion + 1 }
+    })
+  },
+
+  // ── Per-clip transition graphs ─────────────────────────────────────────────
+  // Stored in clipGraphs under a synthetic key (see utils/clipTransitions) so
+  // the Node Editor, every graph action and the serializer all handle them with
+  // no special cases — a transition graph is just a clip graph whose "clip" is
+  // one edge of a real clip.
+
+  /**
+   * Create (or replace) a clip edge's private transition graph, seeded from
+   * `seedSubGraph` — a compound-library entry's sub-graph, defaulting to the
+   * starter crossfade. Ids are freshened so the copy is independent of the
+   * seed: editing a clip's transition must never reach back into the library
+   * entry it was forked from, which is the whole reason these are per-clip.
+   * @returns {string} the clipGraphs key of the new graph
+   */
+  initTransitionGraph: (clipId, edge, seedSubGraph = null) => {
+    const seed = seedSubGraph || STARTER_TRANSITION_COMPOUND.subGraph
+    const key = transitionGraphKey(clipId, edge)
+    const { nodes, edges } = cloneGraphWithNewIds(seed, `tr${edge}`)
+    set((state) => ({
+      clipGraphs: {
+        ...state.clipGraphs,
+        [key]: { nodes, edges, tapPointNodeId: null, compiledChain: [], compileErrors: [] },
+      },
+      topologyVersion: state.topologyVersion + 1,
+    }))
+    return key
+  },
+
+  /** Drop one edge's transition graph (used when its transition is removed). */
+  removeTransitionGraph: (clipId, edge) => {
+    const key = transitionGraphKey(clipId, edge)
+    const graph = get().clipGraphs[key]
     if (!graph) return
     for (const n of graph.nodes || []) {
       removeNodeImage(n.id)
@@ -257,9 +329,42 @@ const useGraphStore = create((set, get) => ({
     }
     set((state) => {
       const next = { ...state.clipGraphs }
-      delete next[clipId]
+      delete next[key]
       return { clipGraphs: next, topologyVersion: state.topologyVersion + 1 }
     })
+  },
+
+  /**
+   * Copy a clip's transition graph into the shared compound library so it can be
+   * reused on other clips. The clip keeps its own private copy — promoting is a
+   * publish, not a move, so later tweaks to this clip don't silently rewrite
+   * every other clip that adopted the published version.
+   * @returns {string|null} the new library entry id
+   */
+  promoteTransitionGraph: (clipId, edge, name, color = '#00e5ff', description = '') => {
+    const key = transitionGraphKey(clipId, edge)
+    const graph = get().clipGraphs[key]
+    if (!graph || !graph.nodes?.length) return null
+    const id = `lib_tr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    const entry = {
+      id,
+      name: name || 'My Transition',
+      version: 1,
+      isUserCreated: true,
+      color,
+      description: description || 'Transition graph promoted from a clip.',
+      createdAt: new Date().toISOString(),
+      nodeCount: graph.nodes.length,
+      // Exposed params are a compound-surface concept; a promoted graph starts
+      // with none, and the user can expose them by editing the library entry.
+      exposedParams: [],
+      subGraph: {
+        nodes: JSON.parse(JSON.stringify(graph.nodes)),
+        edges: JSON.parse(JSON.stringify(graph.edges)),
+      },
+    }
+    set((state) => ({ compoundLibrary: [...state.compoundLibrary, entry] }))
+    return id
   },
 
   setCompiledChain: (graphLevel, clipId, chain, errors = []) => {

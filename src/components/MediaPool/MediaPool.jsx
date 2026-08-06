@@ -184,6 +184,23 @@ export default function MediaPool() {
           video.currentTime = 0
         }
 
+        // Say WHY a file won't play instead of importing a silently black clip.
+        // The common case is someone bringing in a transparent master from an
+        // NLE: ProRes 4444 and DNxHR 444 are the standard alpha codecs and no
+        // browser decodes either, so the .mov imports and renders nothing. The
+        // import still proceeds — the clip is a valid placeholder to relink —
+        // but the message names the fix.
+        if (!video.videoWidth) {
+          const isMov = /\.(mov|avi|mkv)$/i.test(file.name)
+          addToast({
+            message: isMov
+              ? `"${file.name}" can't be decoded in the browser. Pro codecs like ProRes 4444 and DNxHR aren't supported — re-encode to WebM (VP9) to keep an alpha channel, or MP4 (H.264) without one.`
+              : `"${file.name}" can't be decoded in the browser. Try re-encoding it as MP4 (H.264) or WebM (VP9).`,
+            type: 'warning',
+            duration: 9000,
+          })
+        }
+
         const entry = {
           id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
           filename: file.name,
@@ -1394,4 +1411,17 @@ const EFFECT_PRESETS = [
   { type: 'COSMIC', name: 'Cosmic', color: '#aa44ff', icon: '✦' },
   { type: 'WAVES', name: 'Waves', color: '#4488ff', icon: '≋' },
   { type: 'SPACE_DISTORTION', name: 'Distortion', color: '#ccaa44', icon: '↯' },
+  // 3D / Depth
+  { type: 'DEPTH', name: 'Depth', color: '#66ddff', icon: '◱' },
+  { type: 'NORMALS_3D', name: 'Normals', color: '#4fb8d8', icon: '◨' },
+  { type: 'RELIGHT_3D', name: 'Relight 3D', color: '#ffd9a0', icon: '☀' },
+  { type: 'AO_3D', name: 'Occlusion', color: '#7b8fa8', icon: '◕' },
+  { type: 'BOKEH_3D', name: 'Bokeh DOF', color: '#c9a8ff', icon: '❍' },
+  { type: 'FOG_3D', name: 'Fog', color: '#a8c4d8', icon: '☁' },
+  { type: 'CAMERA_3D', name: '3D Camera', color: '#5ce6c0', icon: '⬈' },
+  { type: 'MULTIPLANE', name: 'Multiplane', color: '#8ad9a0', icon: '▤' },
+  { type: 'STEREO_3D', name: 'Stereo 3D', color: '#ff8a8a', icon: '◑' },
+  { type: 'VOXEL_3D', name: 'Voxels', color: '#d8c86a', icon: '▩' },
+  { type: 'DEPTH_DISPLACE', name: 'Depth Displace', color: '#e08adf', icon: '⌇' },
+  { type: 'TIME_SLICE_3D', name: 'Time Slice', color: '#9a8cff', icon: '◷' },
 ]
