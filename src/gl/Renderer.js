@@ -28,13 +28,14 @@ import {
   ALPHA_IGNORE, ALPHA_MODE_INDEX, ALPHA_PROBE_SIZE, ALPHA_PROBE_MAX_ATTEMPTS,
   classifyAlphaSample, resolveAlphaMode, alphaSourceKey,
 } from '../utils/alphaModes.js'
+import { CLIP_TRANSFORM_NODE_ID, resolveClipTransform, isIdentityTransform, clipSupportsTransform } from '../utils/clipTransform.js'
 
 // Node types that are not effect passes (sources, outputs, audio routing). Used
 // to decide whether a graph actually has any effects worth running.
 // NOTE: the self-drawing sources — IMAGE_INPUT, TEXT_INPUT, SHAPE_INPUT — are
 // deliberately NOT listed: they produce pixels with no effect program, so a graph
 // containing only (say) a shape → OUTPUT still has something to render.
-const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE', 'TIME']
+const NON_EFFECT_TYPES = ['OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT', 'AUDIO_INPUT', 'AUDIO_SPLITTER', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT', 'CLIP_SOURCE', 'EFFECT_INPUT', 'TRANSITION_PROGRESS', 'ENVELOPE', 'RAMP', 'LFO']
 
 // Passthrough fragment shader — just copies input texture
 const PASSTHROUGH_FS = `#version 300 es
@@ -65,11 +66,6 @@ void main() {
     return;
   }
   if (u_alpha_mode == 2) {          // Premultiplied — undo src*a + matte*(1-a)
-    // Guarding the divisor rather than branching keeps this uniform-flow; a
-    // fully transparent pixel divides garbage but its alpha is 0, so the
-    // compositor discards the colour anyway. Clamped because a mis-set matte
-    // colour would otherwise push values far out of range and blow up the
-    // half-float FBOs downstream.
     float a = max(c.a, 1.0 / 255.0);
     vec3 straight = (c.rgb - u_alpha_matte * (1.0 - c.a)) / a;
     fragColor = vec4(clamp(straight, 0.0, 1.0), c.a);
@@ -98,22 +94,44 @@ void main() {
   }
   vec3 bg = vec3(0.0);
   if (u_backdrop == 1) {
-    // Checker cells are sized in CANVAS pixels, so they stay a constant size on
-    // screen and read as "background", not as part of the picture.
     vec2 cell = floor(v_uv * u_resolution / 16.0);
     bg = mix(vec3(0.38), vec3(0.26), mod(cell.x + cell.y, 2.0));
   } else if (u_backdrop == 2) {
     bg = vec3(1.0);
   }
-  // The accumulator is PREMULTIPLIED, so source-over is rgb + bg*(1-a).
   fragColor = vec4(c.rgb + bg * (1.0 - c.a), 1.0);
 }
 `
 
-// Un-premultiply for the alpha export path. The compositor's output is
-// premultiplied but the canvas is `premultipliedAlpha: false`, so the drawing
-// buffer must be handed STRAIGHT colour — otherwise every semi-transparent
-// pixel is multiplied by alpha a second time and exports too dark.
+// Present fragment shader — the compositor's LAST pass, screen-bound only.
+//
+// applyBlendMode accumulates in PREMULTIPLIED alpha: `composited = src * a +
+// base.rgb * (1 - a)` with `outA = a`, which is the numerically correct space
+// to composite in (and why the recursive base term isn't scaled by base.a).
+// The canvas, however, is created with `premultipliedAlpha: false`, so the
+// browser multiplies by alpha AGAIN when compositing the canvas onto the page.
+// On an opaque frame (a == 1) the two conventions agree, which is why this
+// never showed — it only bites on partial alpha, i.e. exactly a clip fading to
+// or from nothing, where a linear 50% dissolve landed at 25% brightness.
+//
+// Undoing the premultiply once, here, fixes it without touching any FBO or
+// blend mode: opaque pixels divide by 1.0 and come out bit-identical. Kept
+// separate from PASSTHROUGH_FS because that shader is also used for FBO→FBO
+// copies, where the premultiplied chain must be preserved.
+const PRESENT_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+out vec4 fragColor;
+void main() {
+  vec4 c = texture(u_texture, v_uv);
+  fragColor = c.a > 0.0001 ? vec4(c.rgb / c.a, c.a) : vec4(0.0);
+}
+`
+
+// Un-premultiply for the alpha export path. Same principle as PRESENT_FS
+// but kept separate because it runs with an alternate call path that reads
+// the drawing buffer outside the colour mask.
 const UNPREMULTIPLY_FS = `#version 300 es
 precision highp float;
 in vec2 v_uv;
@@ -121,7 +139,7 @@ uniform sampler2D u_texture;
 out vec4 fragColor;
 void main() {
   vec4 c = texture(u_texture, v_uv);
-  fragColor = vec4(c.rgb / max(c.a, 1.0 / 255.0), c.a);
+  fragColor = c.a > 0.0001 ? vec4(c.rgb / c.a, c.a) : vec4(0.0);
 }
 `
 
@@ -363,6 +381,10 @@ export class Renderer {
     const passResult = createShaderProgram(this.gl, PASSTHROUGH_FS)
     this.passthroughProgram = passResult
 
+    // Screen-bound present pass (un-premultiplies — see PRESENT_FS).
+    const presentResult = createShaderProgram(this.gl, PRESENT_FS)
+    this.presentProgram = presentResult
+
     const compResult = createShaderProgram(this.gl, COMPOSITE_FS)
     this.compositeProgram = compResult
 
@@ -393,6 +415,11 @@ export class Renderer {
     // in-graph node produce pixel-identical bars.
     const lbSrc = getShaderSource('LETTERBOX')
     if (lbSrc) this.barsProgram = createShaderProgram(this.gl, lbSrc)
+
+    // Per-clip Pan / Zoom — the TRANSFORM node's own shader again, so a clip's
+    // Inspector transform and an in-graph TRANSFORM node reframe identically.
+    const xfSrc = getShaderSource('TRANSFORM')
+    if (xfSrc) this.transformProgram = createShaderProgram(this.gl, xfSrc)
   }
 
   /**
@@ -1229,7 +1256,8 @@ export class Renderer {
       } else {
         this.renderTextNode(clip.id, inputFBOId, standardState, clip.params || {})
       }
-      return this._runClipGraph(clip, inputFBOId, graphState, standardState, playheadTime)
+      const xfId = this._applyClipTransform(clip, inputFBOId, standardState, playheadTime)
+      return this._runClipGraph(clip, xfId, graphState, standardState, playheadTime)
     }
 
     let videoEl = this._videoElements.get(clip.id)
@@ -1321,7 +1349,67 @@ export class Renderer {
     // the decoder handed us into the pipeline's straight-alpha convention.
     this._drawSourceWithAlpha(clip, texId, inputFBOId, isLiveStream)
 
-    return this._runClipGraph(clip, inputFBOId, graphState, standardState, playheadTime)
+    // Reframe (pan/zoom/rotate) before the clip's effect graph sees the frame.
+    const xfFBOId = this._applyClipTransform(clip, inputFBOId, standardState, playheadTime)
+    return this._runClipGraph(clip, xfFBOId, graphState, standardState, playheadTime)
+  }
+
+  /**
+   * Apply a clip's Pan / Zoom / Rotate framing to its source frame, BEFORE its
+   * effect graph runs — so effects operate on the picture you actually see (a
+   * glitch on a punched-in shot glitches the punched-in framing, not the wide).
+   *
+   * Returns the FBO the graph should read from: the untouched input FBO when the
+   * clip has no transform — the common case, costing no pass and no extra VRAM —
+   * or a dedicated `clip_xf_<id>` FBO holding the reframed picture.
+   *
+   * Note this magnifies a canvas-resolution FBO, so a large punch-in on video is
+   * a real upscale and will soften. Stills avoid that by zooming on the
+   * IMAGE_INPUT node instead, which samples the image at its native size.
+   *
+   * @param {object} clip
+   * @param {string} inputFBOId — FBO already holding the clip's source frame
+   * @param {object} standardState — per-frame standard uniform state
+   * @param {number} playheadTime — absolute timeline seconds
+   * @returns {string} FBO id to feed the clip graph
+   */
+  _applyClipTransform(clip, inputFBOId, standardState, playheadTime) {
+    if (!this.transformProgram || !this.transformProgram.program) return inputFBOId
+    if (!clipSupportsTransform(clip)) return inputFBOId
+
+    // Transform keyframes live under a reserved node id and, like every other
+    // clip keyframe, are clip-relative in time so they survive the clip moving.
+    const keyframes = this._getTimelineStore?.()?.keyframes
+    const kfVals = keyframes && keyframes.length > 0
+      ? evaluateKeyframes(keyframes, clip.id, playheadTime - clip.timelineStart)?.[CLIP_TRANSFORM_NODE_ID]
+      : null
+    if (!clip.transform && !kfVals) return inputFBOId
+
+    const params = resolveClipTransform(clip.transform, kfVals)
+    if (isIdentityTransform(params)) return inputFBOId
+
+    const gl = this.gl
+    const outFBOId = `clip_xf_${clip.id}`
+    if (!this.fbos.getTexture(outFBOId)) this.fbos.create(outFBOId, this.width, this.height)
+
+    // Transparent start: with the default "Transparent" edge mode, whatever the
+    // framing doesn't cover must composite as nothing, not black.
+    this.fbos.bind(outFBOId)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    gl.useProgram(this.transformProgram.program)
+    const locs = this.transformProgram.uniformLocations
+    this.fbos.bindTexture(inputFBOId, 0)
+    if (locs.u_texture != null) gl.uniform1i(locs.u_texture, 0)
+    uploadStandardUniforms(gl, locs, standardState)
+    uploadUniforms(gl, locs, this.transformProgram.uniformTypes, params)
+
+    this.drawQuad()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+
+    return outFBOId
   }
 
   /**
@@ -1569,6 +1657,12 @@ export class Renderer {
     let accumReadId = accumAId
     let accumWriteId = accumBId
 
+    // Scratch buffer for transition-OUT only: the "before" state of the frame
+    // (this clip already composited over the accumulator), which the transition
+    // reads as u_from while dissolving TO the bare accumulator. Created lazily
+    // on first use so a project with no transition-out never allocates it.
+    const scratchId = '__compositor_scratch'
+
     // Start from a fully transparent backdrop so uncovered regions / gaps read
     // as nothing (spec: a track with no active clip contributes vec4(0.0)).
     this.fbos.bind(accumReadId)
@@ -1679,6 +1773,7 @@ export class Renderer {
             clip, EDGE_TAIL, es.tailTransition, es.tailProgress, opacity, standardState, graphState
           )
         }
+
         if (!composited) {
           this._compositeTrack(accumReadId, accumWriteId, clipResultFBOId, blendIdx, opacity)
         }
@@ -1857,6 +1952,7 @@ export class Renderer {
   releaseClipResources(clipId, graphState = null) {
     this.textures.delete(`clip_${clipId}`)
     this.fbos.delete(`clip_input_${clipId}`)
+    this.fbos.delete(`clip_xf_${clipId}`)   // pan/zoom pass (only exists if used)
     this.fbos.delete(`clip_output_${clipId}`)
 
     // Generator clips (text/image) key their source raster/texture by clip id.
@@ -2150,7 +2246,7 @@ export class Renderer {
     )
     if (!resultFBO) return false
 
-    this._compositeTrack(baseFBOId, destFBOId, resultFBO, 0 /* Normal */, opacity)
+    this._compositeTrack(backdropFBOId, destFBOId, resultFBO, 0 /* Normal */, opacity)
     return true
   }
 
@@ -2159,12 +2255,13 @@ export class Renderer {
    */
   _blitToScreen(fboId, dstFBOId = null) {
     const gl = this.gl
+    const prog = this.passthroughProgram
     if (dstFBOId) this.fbos.bind(dstFBOId)
     else gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, this.width, this.height)
-    gl.useProgram(this.passthroughProgram.program)
+    gl.useProgram(prog.program)
     this.fbos.bindTexture(fboId, 0)
-    const loc = this.passthroughProgram.uniformLocations.u_texture
+    const loc = prog.uniformLocations.u_texture
     if (loc != null) gl.uniform1i(loc, 0)
     this.drawQuad()
   }
@@ -2196,7 +2293,10 @@ export class Renderer {
 
     const appState = this._getAppStore ? this._getAppStore() : {}
     const playheadTime = appState.playheadTime || 0
-    const inputFBOId = `clip_input_${clipId}`
+    // Reassigned below once the source frame exists: the clip's pan/zoom pass
+    // returns the FBO the graph should read, so the isolated view is framed the
+    // same way the timeline is (authoring effects on the real framing).
+    let inputFBOId = `clip_input_${clipId}`
     if (!this.fbos.getTexture(inputFBOId)) {
       this.fbos.create(inputFBOId, this.width, this.height)
     }
@@ -2271,6 +2371,8 @@ export class Renderer {
         this._drawSourceWithAlpha(clip, texId, inputFBOId)
       }
     }
+
+    inputFBOId = this._applyClipTransform(clip, inputFBOId, standardState, playheadTime)
 
     // Execute clip graph
     const clipGraph = graphState.clipGraphs?.[clipId]

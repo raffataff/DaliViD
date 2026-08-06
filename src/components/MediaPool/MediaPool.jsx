@@ -1370,6 +1370,7 @@ const EFFECT_PRESETS = [
   { type: 'IMAGE_INPUT', name: 'Image', color: '#44cc88', icon: '◳' },
   { type: 'TEXT_INPUT', name: 'Text', color: '#ffcc44', icon: 'T' },
   { type: 'SHAPE_INPUT', name: 'Shape', color: '#ff5588', icon: '★' },
+  { type: 'TRANSFORM', name: 'Pan / Zoom', color: '#8899aa', icon: '⤢' },
   { type: 'LETTERBOX', name: 'Letterbox', color: '#8899aa', icon: '▤' },
   { type: 'EDGE_DETECTION', name: 'Edge Detection', color: '#ff8844', icon: '◈' },
   { type: 'COLOR_INVERSION', name: 'Color / HSV', color: '#ff44cc', icon: '◐' },

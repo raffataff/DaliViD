@@ -6,7 +6,7 @@ import { parseParams } from '../../utils/paramParser'
 import { prepareImageDataURL } from '../../utils/imageProcessing'
 import { TEXT_FONTS } from '../../utils/textRenderer'
 import { getNodeSource, getShaderSource } from '../../shaders/shaderRegistry'
-import { getDataNodeParams } from '../../shaders/dataNodeParams'
+import { getDataNodeParams, visibleDataParams } from '../../shaders/dataNodeParams'
 import { SHAPE_PRESETS } from '../../utils/generatorClips'
 import { ASPECT_PRESETS } from '../../utils/aspectPresets'
 import { BLEND_MODE_NAMES } from '../../gl/BlendModes.glsl.js'
@@ -19,10 +19,17 @@ import {
 } from '../../utils/clipTransitions'
 import { keyAtTime } from '../../utils/keyframes'
 import {
+  EDGE_HEAD, EDGE_TAIL, edgeLabel, getEdgeTransition, setEdgeTransitionPatch,
+  findPrevOverlap, findNextOverlap, headRegion, tailRegion,
+  transitionGraphKey, GRAPH_TYPE, isGraphType, isCompoundType, compoundIdOf,
+} from '../../utils/clipTransitions'
+import { keyAtTime } from '../../utils/keyframes'
+import {
   ALPHA_AUTO, ALPHA_MODES, ALPHA_DETECTION_LABELS, ALPHA_PREMULTIPLIED,
   alphaSourceKey, resolveAlphaMode,
 } from '../../utils/alphaModes'
 import { getDetectedAlpha, onAlphaDetected } from '../../gl/alphaRegistry'
+import { CLIP_TRANSFORM_NODE_ID, getTransformConfigs, clipSupportsTransform } from '../../utils/clipTransform'
 import './Inspector.css'
 
 // Photoshop-style grouping of BLEND_MODE_NAMES (which is already in canonical
@@ -195,13 +202,19 @@ function NodeInspector({ nodeId, graphLevel, clipId }) {
   }
 
   const shaderSrc = getNodeSource(node)
-  // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) have no
-  // @param directives, so their controls come from the shared table — which also
-  // gives them Inspector-side keyframing, like every other param.
-  const paramConfigs = shaderSrc ? parseParams(shaderSrc) : getDataNodeParams(node.type)
+  // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / RAMP / LFO)
+  // have no @param directives, so their controls come from the shared table —
+  // which also gives them Inspector-side keyframing, like every other param.
+  const allParamConfigs = shaderSrc ? parseParams(shaderSrc) : getDataNodeParams(node.type)
   const isParamConnected = (paramName) => {
     return graph?.edges?.some(edge => edge.toNode === nodeId && edge.toSocket === paramName) || false
   }
+  // Hide controls a `showIf` rules out (Beats/Cycle with Beat Sync off, …), but
+  // never one that's wired — a connected param must stay inspectable.
+  const connectedParams = new Set(
+    (graph?.edges || []).filter(e => e.toNode === nodeId).map(e => e.toSocket)
+  )
+  const paramConfigs = visibleDataParams(allParamConfigs, node.params, connectedParams)
 
   return (
     <div className="inspector__section">
@@ -283,8 +296,8 @@ function CompoundInspector({ node, graphLevel, clipId, onUpdateExposedParam, onE
   // Gather all inner params grouped by node
   const innerParamsByNode = []
   for (const innerNode of innerNodes) {
-    // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME) get
-    // their configs from the shared table; everything else parses its shader.
+    // Shaderless data nodes (MATH / ENVELOPE / TRANSITION_PROGRESS / RAMP / LFO)
+    // get their configs from the shared table; everything else parses its shader.
     let params = getDataNodeParams(innerNode.type)
     if (!params.length) {
       const shaderSrc = getNodeSource(innerNode)
@@ -673,10 +686,6 @@ function ClipAlphaSection({ clip, onChange }) {
           {detected ? ALPHA_DETECTION_LABELS[detected] : 'Analysing…'}
         </span>
       </div>
-      {/* A matte colour only means anything for premultiplied sources: it is the
-          colour the footage was composited against before being multiplied.
-          Black covers almost everything; white matters for old QuickTime and
-          some render-farm output. */}
       {effective === ALPHA_PREMULTIPLIED && (
         <FieldColor
           label="Matte Colour"
@@ -693,6 +702,95 @@ function ClipAlphaSection({ clip, onChange }) {
   )
 }
 
+// Per-clip Pan / Zoom / Rotate. The controls are generated from the TRANSFORM
+// shader's own @param configs (utils/clipTransform.js) and the Renderer drives
+// that same compiled program, so this section and an in-graph TRANSFORM node can
+// never drift apart — add a @param to the shader and it shows up in both.
+//
+// Keyframes are stored against a reserved node id (CLIP_TRANSFORM_NODE_ID),
+// which is what lets a clip animate a punch-in with no node graph at all. For a
+// hands-off Ken Burns, a TIME node in the clip graph driving a TRANSFORM node's
+// Zoom is the alternative — that one re-times itself when the clip is trimmed.
+function ClipTransformEditor({ clip }) {
+  const updateClip = useTimelineStore(s => s.updateClip)
+  const keyframes = useTimelineStore(s => s.keyframes)
+  const addKeyframe = useTimelineStore(s => s.addKeyframe)
+  const removeKeyframe = useTimelineStore(s => s.removeKeyframe)
+  const clearNodeKeyframes = useTimelineStore(s => s.clearNodeKeyframes)
+  const playheadTime = useAppStore(s => s.playheadTime)
+  const fps = useAppStore(s => s.fps)
+
+  const configs = getTransformConfigs()
+  const t = clip.transform || {}
+  const localTime = Math.max(0, playheadTime - clip.timelineStart)
+  const tolerance = 0.5 / (fps || 30)
+
+  const getTrack = (paramName) => keyframes.find(
+    k => k.clipId === clip.id && k.nodeId === CLIP_TRANSFORM_NODE_ID && k.paramName === paramName
+  )
+  const setParam = (paramName, value) => {
+    updateClip(clip.id, { transform: { ...t, [paramName]: value } })
+    if (getTrack(paramName)) addKeyframe(clip.id, CLIP_TRANSFORM_NODE_ID, paramName, localTime, value)
+  }
+  const toggleKeyframe = (paramName, value) => {
+    const track = getTrack(paramName)
+    const existing = track && keyAtTime(track.keys, localTime, tolerance)
+    if (existing) removeKeyframe(clip.id, CLIP_TRANSFORM_NODE_ID, paramName, existing.time)
+    else addKeyframe(clip.id, CLIP_TRANSFORM_NODE_ID, paramName, localTime, value)
+  }
+
+  const hasKeys = keyframes.some(k => k.clipId === clip.id && k.nodeId === CLIP_TRANSFORM_NODE_ID)
+  const isDefault = (!clip.transform || Object.keys(clip.transform).length === 0) && !hasKeys
+
+  return (
+    <>
+      <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '0 8px 6px' }}>
+        Pan moves the <em>view</em>, so the picture slides the other way — like a camera.
+        Key ◆ Zoom and Pan at two points for a punch-in.
+      </div>
+      {configs.map(cfg => {
+        const keyframable = cfg.type === 'slider'
+        const track = keyframable ? getTrack(cfg.uniformName) : null
+        const keyHere = track ? keyAtTime(track.keys, localTime, tolerance) : null
+        const value = t[cfg.uniformName] ?? cfg.default
+        return (
+          <div key={cfg.uniformName} className="inspector__param-row">
+            {keyframable && (
+              <button
+                className={`inspector__kf-btn ${keyHere ? 'inspector__kf-btn--on' : ''} ${track && !keyHere ? 'inspector__kf-btn--track' : ''}`}
+                title={keyHere ? 'Remove keyframe at playhead' : (track ? 'Add keyframe at playhead (param is animated)' : 'Add keyframe at playhead')}
+                onClick={() => toggleKeyframe(cfg.uniformName, value)}
+              >
+                ◆
+              </button>
+            )}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <InspectorParam
+                nodeId={`xf_${clip.id}`}
+                param={cfg}
+                value={value}
+                onChange={(v) => setParam(cfg.uniformName, v)}
+                isConnected={false}
+              />
+            </div>
+          </div>
+        )
+      })}
+      <button
+        className="inspector__btn"
+        disabled={isDefault}
+        onClick={() => {
+          updateClip(clip.id, { transform: null })
+          clearNodeKeyframes(clip.id, CLIP_TRANSFORM_NODE_ID)
+        }}
+        style={{ margin: '4px 8px 0' }}
+      >
+        Reset Transform{hasKeys ? ' + Keys' : ''}
+      </button>
+    </>
+  )
+}
+
 function ClipInspector({ clipId }) {
   const clips = useTimelineStore(s => s.clips)
   const updateClip = useTimelineStore(s => s.updateClip)
@@ -701,7 +799,10 @@ function ClipInspector({ clipId }) {
   const clip = clips.find(c => c.id === clipId)
   if (!clip) return <div className="inspector__empty">No clip selected</div>
 
-  const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen'
+  // Transitions apply to anything with a picture — including the text / image /
+  // shape generators, which is where a blend-in matters most (a title card
+  // dissolving in from nothing). Audio clips have no picture, so they're out.
+  const supportsTransition = clipSupportsTransform(clip)
 
   // Merge one generator param into the clip, keeping the rest.
   const setParam = (key, value) => updateClip(clipId, { params: { ...clip.params, [key]: value } })
@@ -735,6 +836,32 @@ function ClipInspector({ clipId }) {
     [EDGE_TAIL]: tailRegion(clip, findNextOverlap(clip, clips)),
   }
   const nextOverlap = findNextOverlap(clip, clips)
+
+  // A later clip overlapping this clip's fade-out window. If it runs its own
+  // transition-in, that window is already spoken for and this clip's
+  // transition-out is suppressed (the renderer makes the same call per frame).
+  const fadeOutStart = clip.timelineEnd - Math.min(clip.fadeOut || 0, clip.timelineEnd - clip.timelineStart)
+  const nextOverlap = clips
+    .filter(c => c.trackId === clip.trackId && c.id !== clip.id && c.transition?.type &&
+      c.timelineStart > clip.timelineStart && c.timelineStart < clip.timelineEnd &&
+      c.timelineEnd > fadeOutStart)
+    .sort((a, b) => a.timelineStart - b.timelineStart)[0] || null
+  const nextOwnsWindow = !!nextOverlap
+
+  // Duration hints. In: the overlap if there is one, else the fade-in handle
+  // (blending in from whatever is underneath — the lower tracks, or nothing).
+  // Out: always the fade-out handle.
+  const inHint = overlapDur > 0.001
+    ? { ok: true, text: `Plays over the ${overlapDur.toFixed(2)}s overlap with “${prevOverlap.filename}”` }
+    : (clip.fadeIn > 0
+      ? { ok: true, text: `No overlap — blends in from whatever is underneath over the ${(clip.fadeIn).toFixed(2)}s fade-in handle` }
+      : { ok: false, text: 'Set a Fade In above (or drag the clip’s left fade handle) to give this a duration — or overlap the previous clip' })
+
+  const outHint = nextOwnsWindow
+    ? { ok: false, text: `“${nextOverlap.filename}” overlaps this clip’s end and runs its own transition-in, which owns that window` }
+    : (clip.fadeOut > 0
+      ? { ok: true, text: `Blends out to whatever is underneath over the ${(clip.fadeOut).toFixed(2)}s fade-out handle` }
+      : { ok: false, text: 'Set a Fade Out above (or drag the clip’s right fade handle) to give this a duration' })
 
   return (
     <div className="inspector__section">
@@ -790,6 +917,14 @@ function ClipInspector({ clipId }) {
           construction, and generator clips draw their own alpha. */}
       {clip.fileType === 'video' && (
         <ClipAlphaSection clip={clip} onChange={(patch) => updateClip(clipId, patch)} />
+      )}
+
+      {clipSupportsTransform(clip) && (
+        <>
+          <div className="inspector__section-header" style={{ marginTop: 12 }}>Transform (Pan / Zoom)</div>
+          <ClipTransformEditor clip={clip} />
+        </>
+      )}
       )}
 
       {clip.fileType === 'text' && (
@@ -851,6 +986,7 @@ function ClipInspector({ clipId }) {
 }
 
 /**
+/**
  * One of a clip's two edge transitions. Head and tail are the same control set —
  * the only differences are which region they read and what the region mixes
  * against, both of which come from utils/clipTransitions rather than being
@@ -881,8 +1017,6 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
       setTransition({ type: GRAPH_TYPE, params: {} })
       return
     }
-    // Built-ins start from registry defaults; compounds start empty — the
-    // entry's exposedParams carry their own.
     setTransition({ type: nextType, params: isCompoundType(nextType) ? {} : getTransitionDefaults(nextType) })
   }
 
@@ -914,21 +1048,18 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
         </select>
       </div>
 
-      {/* What this region mixes against, in plain words. This is the piece the
-          old UI never said out loud, and not saying it is what made transition
-          progress feel arbitrary. */}
       {!region ? (
         <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
           {edge === EDGE_TAIL
             ? (nextOverlap
-                ? `The next clip “${nextOverlap.filename}” overlaps this one — that cut belongs to its Transition In`
-                : 'No region — give Out Length a value (or drag the clip’s right fade handle)')
+                ? `The next clip "${nextOverlap.filename}" overlaps this one — that cut belongs to its Transition In`
+                : 'No region — give Out Length a value (or drag the clip\'s right fade handle)')
             : 'No region — give In Length a value, or overlap the previous clip for a crossfade'}
         </div>
       ) : (
         <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '2px 8px 6px' }}>
           {region.mode === 'crossfade'
-            ? `Crossfades with “${region.prev.filename}” over their ${region.dur.toFixed(2)}s overlap`
+            ? `Crossfades with "${region.prev.filename}" over their ${region.dur.toFixed(2)}s overlap`
             : edge === EDGE_TAIL
               ? `Plays out to whatever is behind this clip over ${region.dur.toFixed(2)}s — lower tracks, else black`
               : `Plays in from whatever is behind this clip over ${region.dur.toFixed(2)}s — lower tracks, else black`}
@@ -957,7 +1088,6 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
         </div>
       )}
 
-      {/* Built-in transitions: params parsed from the registry shader */}
       {type && !isGraphType(type) && !isCompoundType(type) && getTransitionParams(type).map(param => (
         <InspectorParam
           key={param.uniformName}
@@ -969,7 +1099,6 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
         />
       ))}
 
-      {/* Shared compounds: the entry's exposed params, keyed by index */}
       {compoundEntry && (compoundEntry.exposedParams || []).map((ep, i) => (
         <InspectorParam
           key={`${compoundEntry.id}_${i}`}
@@ -980,6 +1109,10 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
           isConnected={false}
         />
       ))}
+    </>
+  )
+}
+      )}
     </>
   )
 }

@@ -95,8 +95,10 @@ const NODE_CATALOG = [
   {
     category: 'Utility',
     items: [
+      { type: 'TRANSFORM', name: 'Transform (Pan / Zoom / Rotate)' },
       { type: 'MIX_BLEND', name: 'Mix / Blend' },
-      { type: 'TIME', name: 'Time / LFO' },
+      { type: 'RAMP', name: 'Ramp (0 → 1 over a clip)' },
+      { type: 'LFO', name: 'LFO (oscillator)' },
       { type: 'MATH', name: 'Math' },
       { type: 'TRANSITION_PROGRESS', name: 'Transition Progress' },
       { type: 'LETTERBOX', name: 'Letterbox / Widescreen Bars' },

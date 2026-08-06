@@ -324,6 +324,50 @@ section rather than reading whole).
 - When editing a function, provide the full function.
 - No new deps without reason; keep single-file artifacts/components consistent with the repo.
 
+## Pan / Zoom (added feature)
+
+- **`TRANSFORM` node** (Utility category) is a camera over the incoming frame: Zoom, Pan X/Y,
+  Rotation, Edges, Bass Zoom, Beat Punch. It's a plain effect node, so `DEFAULT_EFFECT_DEF` gives
+  it `hasParamInputs` and **every control gets a float socket for free** — a RAMP/LFO node, ENVELOPE,
+  splitter band or `MATH` can drive the zoom, and Inspector keyframes (◆) work with no extra code.
+  A `RAMP` (span `Clip`) with Start 1.0 / End 1.6 into Zoom is a push-in that re-times itself when
+  the clip is trimmed.
+- **Pan is CAMERA-relative**, not picture-relative: +Pan X moves the *view* right, so the picture
+  slides left. Units are frame-edge (±1 = half a frame) and **not divided by zoom**, so "Pan X 0.5"
+  means the same place in the source at every zoom level (dividing by zoom would make the slider
+  uselessly coarse when punched in). Shares SHAPE_INPUT's conventions otherwise: aspect-corrected
+  frame units, `v_uv.y` UP, rotation CCW-positive.
+- **Edges is explicit** (`Transparent` / `Clamp` / `Mirror` / `Tile`) because every FBO in the
+  pipeline is `CLAMP_TO_EDGE` + `LINEAR` — inheriting the wrap mode would smear the border pixel
+  into a streak the moment you pan past the frame. Transparent (default) feathers over ~1px via
+  `fwidth` so a rotated edge doesn't alias, and composites over the track below.
+- **Per-clip Transform** reuses that exact shader, the same way `masterBars` reuses `LETTERBOX`:
+  `Renderer._applyClipTransform` runs `this.transformProgram` over `clip_input_<id>` into
+  `clip_xf_<id>` and hands *that* FBO to `_runClipGraph`, so the clip's effects operate on the
+  reframed picture. Runs in `_renderClipToFBO` (both the generator and video branches) and in
+  `_renderClipGraphIsolated`; freed in `releaseClipResources`.
+  - **Identity transforms skip the pass entirely** (`isIdentityTransform`), so an untransformed
+    clip — most of them — costs zero extra passes and zero extra VRAM.
+  - `src/utils/clipTransform.js` is the shared definition: `getTransformConfigs()` parses the
+    TRANSFORM shader's `@param`s (so adding a `@param` adds a clip control with no UI edit),
+    `resolveClipTransform` merges stored + keyframed values over the defaults, and
+    `CLIP_TRANSFORM_NODE_ID` (`'__clip_transform'`) is the reserved keyframe `nodeId` — keyframes
+    are keyed by (clipId, nodeId, paramName) and a clip transform belongs to no graph node. That
+    reserved id is what makes an animated punch-in possible **without a node graph at all**.
+  - `clip.transform` **replaced a dead placeholder**: clips were created with
+    `{ x, y, scaleX, scaleY, rotation }` which was serialized but never read by anything. It is now
+    a uniform-keyed object (`{ u_xf_zoom, … }`) or `null`. `resolveClipTransform` only reads known
+    `u_xf_*` keys, so projects saved with the old shape load as identity.
+  - UI: Inspector → Clip → **Transform (Pan / Zoom)**, above the type-specific sections, for every
+    clip kind except audio (`clipSupportsTransform` — audio clips have no picture). Keyframe ◆ per
+    slider with auto-key while animated, plus a Reset that **also clears the keyframe tracks**
+    (`clearNodeKeyframes`) — leaving them would re-drive the transform and the reset would no-op.
+- **Known limit — video punch-ins soften.** `clip_input_<id>` is created at canvas resolution, so
+  zooming past 1.0 upscales canvas pixels; a 4K source on a 1080p canvas has already lost the
+  detail at upload. Stills don't have this problem — zoom on the `IMAGE_INPUT` node instead, which
+  samples `u_image` at its natural size (SHAPE is procedural, so it's sharp at any zoom). See the
+  backlog for the oversampled-clip-input idea.
+
 ## Recently completed
 
 - **3D / Depth node family (phases 1–4) — `3D_DEPTH_EFFECTS_PLAN.md` is the design doc.**
@@ -462,52 +506,6 @@ section rather than reading whole).
     against, and the fade sliders are relabelled In/Out Length.
   - Export audio parity: `ExportModal` now samples the same `clipEnvelopeGain` the renderer uses.
 
-- **Timeline clip right-click menu + clip reverse** — right-clicking a timeline clip opens the
-  shared `common/ContextMenu` (the same portal menu the Media Pool uses) with the full clip action
-  set: Reverse Clip, Reset Speed to 1×, Split at Playhead, Duplicate, Open Effects Graph, Mute Clip
-  Audio, Clear Fades, Remove Transition, Set In/Out to Clip, Playhead to Clip Start, Delete and
-  Ripple Delete. Items are built from *live* clip state each render, so `keepOpen` toggles (Reverse,
-  Mute) update their own ✓ in place.
-  - **`clip.reversed` is a pure source-time remap**, not a re-encode: `getClipSourceTime` walks
-    `sourceEnd → sourceStart` across the same timeline span, so trim / speed / fades / keyframes /
-    transitions all keep working untouched. Serialized in `projectSerializer`.
-  - **`splitClip` is reverse-aware** — a reversed clip cuts the other way round (left half keeps
-    `sourceEnd` and takes the split as its new `sourceStart`). Getting this wrong silently swaps
-    the two halves' content, which is why it's explicit in the store rather than at the call site.
-  - **Playback is seek-driven.** No browser supports a negative `playbackRate`, so
-    `Renderer._syncVideoPlayback` short-circuits for reversed clips: the element stays **paused**
-    and `currentTime` walks backwards, and a new seek is **never queued while one is in flight**
-    (the previous frame repeats instead, so the preview degrades to the decoder's seek rate rather
-    than falling progressively behind the playhead).
-  - **Audio: silent in preview, correct in export.** A paused element makes no sound, so reversed
-    clips are silent live; `ExportModal.renderTimelineAudio` reverses the decoded `AudioBuffer`
-    (cached per URL) and offsets from the tail (`offset = bufDuration - forwardSourceTime`), so the
-    rendered file has properly reversed audio. Stem analysis reuses `renderTimelineAudio`, so
-    export reactivity follows the reversal too. The Inspector toggle and the clip's `◀` badge both
-    spell this out.
-  - **Mid-seek frames are never sampled (this is what made reverse render BLACK).** Three coupled
-    rules in `_renderClipToFBO` / `_syncVideoPlayback`, all load-bearing:
-    1. The texture upload runs only when `!videoEl.seeking` — mid-seek, `currentTime` already
-       reports the target while the decoder still holds the old frame, so an upload gets a stale
-       or (on a paused element) blank picture. Holding the previous texture is correct AND is what
-       the eye expects. Only the bootstrap upload (no texture yet) is allowed mid-seek, and it
-       doesn't stamp `_lastUploadedTime`, so it is redone once the decoder catches up.
-    2. A reversed clip issues its next seek **only once the previous frame has been uploaded**
-       (`_lastUploadedTime === currentTime`). `_syncVideoPlayback` runs BEFORE the upload, so
-       seeking unconditionally left `seeking` true at upload time forever and the clip never
-       received a decoded frame at all. The handshake makes reverse alternate seek-frame /
-       upload-frame — self-throttling, with the decoder setting the pace.
-    3. A reversed clip never seeks to exactly `duration` (clamped to `duration - 0.04`): that
-       lands the element in `ended` with no frame to present. A reversed clip's first frame is
-       `sourceEnd` — usually the duration exactly — so every reversed clip started on black.
-    Rule 1 also fixes a **pre-existing** staleness bug in ordinary paused scrubbing.
-  - Supporting bits: `useTimelineStore.duplicateClip` / `rippleDeleteClip` (per-track ripple —
-    a global one would desync other tracks); `ContextMenu` gained `shortcut` (right-aligned key
-    hint) and `checked` (✓ + tinted row); right/middle mousedown on a clip, trim handle or fade
-    handle now **selects without arming a drag**, so the menu can't open over a sliding clip;
-    `ClipWaveform` mirrors its peaks for reversed clips; the menu **snapshots the playhead** on
-    open instead of subscribing to it (subscribing would re-render the Timeline 60×/s).
-
 - **Media Pool right-click menu (delete / add to timeline / add to master graph)** — new shared
   `src/components/common/ContextMenu.jsx` (+ `.css`): portal-rendered so a scrolling panel can't
   clip it, position clamped from the measured rect, closes on outside mousedown / Escape / wheel /
@@ -588,31 +586,71 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
 - **Per-clip audio** — `clip.audioMuted`/`volume` (Inspector "Audio" section, ♪× badge); audio
   follows fades and transition-crossfades (`Renderer._clipAudioGain` + `_audioGains` per frame);
   the export mixdown applies the same envelopes via per-clip GainNode value curves.
-- **TIME node (LFO / ramp — the keyframe replacement)** — shaderless CPU float source, peer to
-  MATH/ENVELOPE, evaluated in `resolveFloatConnections`. Two outputs: `value` (wave shaped and
-  remapped into Min…Max) and `seconds` (raw source time, for MATH). 4 sources × 9 waves:
-  - **Sources** — `Playhead` (default), `Clip Time`, `Clip Progress`, `Free Run`. The first three are
-    **deterministic** (functions of timeline position), so scrubbing shows the real animation and an
-    export is identical to the preview; `Free Run` is the render clock (keeps moving while paused).
-    **`Clip Progress` + `Saw Up` + rate 1 == a keyframe pair across the clip** (Min at the first
-    frame → Max at the last) that follows the clip when it's moved, trimmed or retimed.
-  - **Waves** — Sine (cosine form, so it starts at Min and rises), Triangle, Saw Up/Down, Square
-    (duty = Pulse Width), Bounce, Random Hold, Smooth Random, Linear (unbounded — continuous
-    rotation). Optional `Smooth` S-curve; `Beat Sync` makes a cycle N beats of the project BPM
-    (`useAppStore.bpm`/`beatOffset`). Random waves hash the cycle index, so they're frame-stable.
+- **RAMP + LFO nodes (the keyframe replacement) — split out of the old combined TIME node.**
+  Both are shaderless CPU float sources, peers of MATH/ENVELOPE, evaluated in
+  `resolveFloatConnections`. **TIME wore two jobs**, which is what made it hard to use: `Rate` meant
+  cycles/second, cycles-per-clip, or nothing at all depending on Source and Beat Sync, and all ten
+  controls rendered at once when at most six were ever live. The split is by *intent*:
+  - **`RAMP` — plays once across a span.** Outputs `value` (eased progress remapped into Start…End),
+    `progress` (raw un-eased 0→1, to fan one ramp out to several params at different ranges via
+    MATH) and `seconds` (elapsed in the span). Spans (`RAMP_SPANS`): **`Clip`** (default),
+    **`Timeline`** (0→1 over `useTimelineStore.calculateDuration()`) and **`In / Out Range`** (the
+    section a range export renders). All three are deterministic, so scrubbing shows the real
+    animation and an export is pixel-identical. **Defaults alone == a keyframe pair across the clip**
+    that re-times itself when the clip is moved/trimmed. `Cycles` repeats within the span,
+    `Ping-Pong` returns to Start, `Ease` is Linear/Smooth/Ease In/Ease Out, and End may sit *below*
+    Start (a countdown) — it's a remap, not a range.
+  - **`LFO` — oscillates forever.** Outputs `value` (Min…Max), `bipolar` (the same wave as −1…1, to
+    *add* to a param rather than replace it) and `seconds`. Time base is always seconds
+    (`LFO_BASES`: Playhead / Clip Time / Free Run), so **`Rate` has exactly one meaning** unless
+    `Beat Sync` swaps it for N beats of the project BPM (`useAppStore.bpm`/`beatOffset`). Same 9
+    waves as before — Sine (cosine form, so it starts at Min and rises), Triangle, Saw Up/Down,
+    Square (duty = Pulse Width), Bounce, Random Hold, Smooth Random, Linear (unbounded — continuous
+    rotation) — plus the optional `Smooth` S-curve. Random waves hash the cycle index, so they're
+    frame-stable.
+  - **Migration is exact and edge-preserving** (`migrateTimeNodeParams`, run over every graph depth
+    by `projectSerializer.migrateGraphNodes` — master, clips, compound interiors, the compound
+    library). TIME's `Clip Progress` was the span-normalised source → becomes a RAMP (its wave
+    becomes an ease / ping-pong, which is the job that wave was doing across a clip); the other
+    three sources were seconds bases → become an LFO with the wave verbatim. **Both new types keep
+    TIME's `value` and `seconds` socket ids**, which is why no saved graph needs rewiring.
+  - **Two latent bugs died in the split.** (1) `buildTimeCtx` used to fall back to *the clip graph
+    open in the editor* whenever `standardState.clipTime` was null — but the master pass sets it
+    null deliberately, so a master-graph TIME node's output depended on UI state (and was a constant
+    when no clip graph was open). `standardState` is now authoritative including its nulls; the
+    store lookup is reached only by the DOM param-display pass, which really has no exec context.
+    (2) `Clip Progress` silently ignored `Beat Sync` (the branch was unreachable) — structurally
+    impossible now, since RAMP has no Beat Sync and LFO's always applies.
+    Also: a ramp landing exactly on a cycle boundary at the end of its span wrapped to 0, snapping
+    back to Start on the clip's final frame — the one frame a punch-in-and-hold must not do.
   - `hasParamInputs: true` → every control gets a float socket, so a band/ENVELOPE can modulate the
-    LFO itself (bass → rate). Clip-local time reaches the evaluator via `standardState.clipTime`/
-    `clipDuration`, stamped per exec site by `Renderer._setClipTimeContext` (like `hasSource`) and
-    cleared (`null`) for the master pass. Float overrides already reach the image/text/shape
-    pre-passes, so a TIME node animates a shape's position/rotation with no keys.
-  - `resolveFloatConnections` now resolves MATH/ENVELOPE/**TIME** as one dependency-ordered fixpoint
-    (`DEFERRED_FLOAT_TYPES` + `producerPending`), which also fixes MATH → MATH reading a
+    generator itself (bass → LFO rate, envelope → RAMP End). Clip-local time reaches the evaluator
+    via `standardState.clipTime`/`clipDuration`, stamped per exec site by
+    `Renderer._setClipTimeContext` (like `hasSource`). Float overrides already reach the
+    image/text/shape pre-passes, so a RAMP animates a shape's position/rotation with no keys.
+  - `resolveFloatConnections` resolves MATH/ENVELOPE/**RAMP**/**LFO** as one dependency-ordered
+    fixpoint (`DEFERRED_FLOAT_TYPES` + `producerPending`), which also fixes MATH → MATH reading a
     one-frame-stale value when the nodes sat in an unlucky order in the graph array.
-  - **`src/shaders/dataNodeParams.js` is new and is now the single source of truth for the
-    shaderless nodes' param configs** (MATH / ENVELOPE / TRANSITION_PROGRESS / TIME). The same three
-    lists were previously hardcoded in `NodeCanvas`, `Inspector` and `compoundUtils` and had already
-    drifted; all three read the table now, so these nodes also gained Inspector controls (with
-    keyframe diamonds) and compound param exposure for free.
+  - **Perf note:** `ctx.timelineDuration` is a **lazy getter**. `calculateDuration()` walks every
+    clip and the context is built once per graph execution per frame (master + every clip + every
+    compound), so it must not be paid unless a RAMP actually spans the timeline.
+- **Conditional param visibility (`showIf`)** — a param config may carry
+  `showIf: { param, equals }` or `{ param, notEquals }` (operand may be an array; select params
+  compare by **label** but tolerate index storage, like `selectIndex`). `isParamVisible` /
+  `visibleDataParams` (dataNodeParams.js) are honoured by `NodeCard`, `Inspector` and
+  `estimateNodeHeight`. Hides LFO's Beats/Cycle when Beat Sync is off, Pulse Width on non-Square
+  waves, TRANSITION_PROGRESS's Preview vs Preview Speed.
+  - **Sockets stay unconditional** — `getNodeSockets` never sees `showIf`. A hidden param can still
+    legitimately be driven by a wire, and removing its socket would strand the noodle. Callers pass
+    the node's connected input ids as `alwaysShow`, so a **wired param always keeps its row** and
+    therefore a real DOM anchor for `NodeCanvas.getSocketPos`.
+  - `visibleDataParams` fast-paths (`configs.some(c => c.showIf)`) so shader-parsed configs — every
+    other node in the app — return the same array with no allocation.
+  - **`src/shaders/dataNodeParams.js` is the single source of truth for the shaderless nodes' param
+    configs** (MATH / ENVELOPE / TRANSITION_PROGRESS / RAMP / LFO). The same lists were previously
+    hardcoded in `NodeCanvas`, `Inspector` and `compoundUtils` and had already drifted; all three
+    read the table now, so these nodes also get Inspector controls (with keyframe diamonds) and
+    compound param exposure for free.
 - **ENVELOPE node** — CPU float follower (attack/release/threshold/gain), evaluated in
   `resolveFloatConnections` with per-node state (export-safe dt via `_timeOverride`).
 - **Float wiring works in every executing graph** — `resolveFloatConnections(renderer, nodes,
@@ -731,6 +769,7 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
 
 ## Backlog / potential improvements
 
+<<<<<<< HEAD
 - **Verify the 3D / Depth family in `npm run dev`** — written with the Cowork sandbox down, so
   `npm run lint` (ESLint + shader smoke test) and `npm run build` have NOT been run. Every static
   check the smoke test performs was audited by hand (structure, `@param`↔uniform 1:1 adjacency for
@@ -912,6 +951,82 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
   when the clip is trimmed; scrubbing the playhead moves the value (deterministic sources) while
   `Free Run` keeps going when paused; a short export matches the preview frame-for-frame; and a
   save/load round-trip keeps the node's params (they're plain `node.params`, so this should be free).
+- **Verify the transition in/out-of-nothing work in `npm run dev`** — written with the Cowork
+  sandbox down, so `npm run lint` and `npm run build` have NOT been run against it. Checks, highest
+  value first: (1) a lone clip on an empty timeline with Transition In = Crossfade and Fade In 1s
+  opens from black over exactly 1s, and is **not** double-faded (compare against Fade In 1s with no
+  transition — the transition version should be a linear fade, the old one unchanged);
+  (2) Transition Out = Circle Wipe + Fade Out 1s wipes the clip away to black, and the first frame
+  of the window matches the plain composite (no pop); (3) a clip on track 2 blends in over track 1
+  below it rather than over black; (4) **existing overlap transitions are unchanged** — open a
+  project with two overlapping clips and confirm identical timing; (5) a node-graph (compound)
+  transition works in the out direction, i.e. it dissolves TO the backdrop rather than leaving the
+  clip visible; (6) save/load round-trips `transitionOut`, and a project saved before this change
+  still loads; (7) a range export of a clip's first second is pixel-identical to the preview.
+- **Three screen exits still bypass the un-premultiply (`PRESENT_FS`).** `_blitToScreen` is fixed,
+  but the frame can also reach the canvas via: (1) a master graph WITH effects and bars OFF —
+  `executeChain(..., presentFBOId = null)` lets the last effect pass write straight to the default
+  framebuffer; (2) the widescreen-bars pass, where `barsProgram` (the LETTERBOX shader) is the last
+  write; (3) isolated clip view's no-graph passthrough. So turning on a master effect can currently
+  change how a fade-from-nothing reads. Fixing (1) means always routing through `__master_present`
+  (one extra full-frame pass for everyone — weigh against the perf rule) or teaching `executeChain`
+  to use PRESENT_FS for its final screen-bound pass; (2) needs an un-premultiply flag on LETTERBOX
+  that is OFF when it runs as a normal node (where it lives in premultiplied FBO space). Deferred
+  because the deeper issue is that **effect shaders emit straight alpha while the compositor emits
+  premultiplied** — picking one convention app-wide is the real fix, and it can't be done blind.
+- **Timeline fade wedge is drawn as a linear opacity ramp** even when a transition owns that handle,
+  where the actual curve is whatever the transition does. Cosmetic, but tinting the wedge (or
+  swapping it for a transition-specific glyph) when `transition`/`transitionOut` is set would stop
+  it implying a plain fade.
+
+- **Verify the Pan/Zoom work in `npm run dev`** — written with the Cowork sandbox down, so
+  `npm run lint` (ESLint + shader smoke test) and `npm run build` have NOT been run against it.
+  Checks, highest value first: (1) `TRANSFORM` compiles in a real WebGL2 context and a zoom of 2
+  with Pan X 0.5 centres on the point halfway to the right edge; (2) the four Edge modes behave
+  (Transparent shows the track below, Clamp smears, Mirror/Tile repeat) and a rotated Transparent
+  edge is smooth, not stair-stepped; (3) a clip Transform matches an equivalent `TRANSFORM` node
+  pixel-for-pixel; (4) ◆ Zoom at the clip's first and last frame produces a linear punch-in that
+  survives moving/trimming the clip; (5) Reset clears both values and keys; (6) save/load keeps
+  `clip.transform`, and a project saved *before* this change still loads (its legacy
+  `{ x, y, scaleX… }` object must resolve to identity, not junk); (7) an untransformed project
+  allocates no `clip_xf_*` FBO.
+- **On-canvas Pan/Zoom gizmo (the obvious next step).** The controls are sliders today.
+  `Preview/ShapeHandles.jsx` already solves the hard part — canvas-rect-derived geometry that
+  tracks preview pan/zoom, handles-only pointer events — so a sibling that draws the framing
+  rectangle for a selected `TRANSFORM` node / transformed clip (drag = pan, corners = zoom,
+  ○ = rotate) would reuse that machinery. Note the two interact: a shape clip that ALSO has a clip
+  transform will have its shape gizmo mis-registered, since the handles assume the shape's shader
+  coords map straight to the canvas.
+- **Oversampled clip input for sharp video punch-ins.** `clip_input_<id>` is canvas-resolution, so
+  zooming past ~1.5 on video visibly softens and a 4K source's detail is discarded at upload.
+  Rendering a transformed clip's input at N× canvas (only when its transform is non-identity, so
+  the cost is opt-in) would recover it. Costs VRAM per clip and touches `_renderClipToFBO`,
+  `_runClipGraph` and `releaseClipResources` — deliberately deferred.
+- **Keyframes don't survive a split.** `splitClip` copies `clip.transform` to the right half (it's
+  a plain field in the `{...clip}` spread) but NOT its keyframe tracks, which are keyed by clipId.
+  Pre-existing for node keyframes too; a split that also duplicated the tracks — re-basing key
+  times to the new clip start and dropping keys outside each half — would fix both at once.
+- **Verify the RAMP / LFO split in `npm run dev`** — written with the Cowork sandbox down, so
+  `npm run lint` (ESLint + shader smoke test) and `npm run build` have NOT been run against it.
+  Checks, highest value first:
+  1. **Migration.** Open a project saved with TIME nodes. A `Clip Progress` node must come back as a
+     **Ramp**, the other three sources as an **LFO**, *with every existing wire still attached*
+     (both types keep the `value`/`seconds` socket ids) and the same on-screen animation. Check a
+     TIME node nested inside a compound and one in the compound library, not just top level.
+  2. **The 0→1 range.** Drop a Ramp, wire `value` → a slider socket, leave every default: the param
+     must read Start on the clip's **first** frame and End on its **last** — including the final
+     frame, which used to snap back to Start. Trim the clip; it should re-time.
+  3. **New spans.** `Timeline` ramps 0→1 across the whole project; `In / Out Range` across the I/O
+     window and lines up with a range export.
+  4. **Master-graph fix.** A Ramp on the **master** graph with span `Clip` outputs a constant (there
+     is no clip) *regardless of which clip graph is open in the editor* — that coupling was the bug.
+     Span `Timeline` is the master-graph answer.
+  5. **`showIf`.** LFO hides Beats/Cycle until Beat Sync is ticked and Pulse Width until the wave is
+     Square; a **wired** hidden param keeps its row and its noodle stays anchored (that's the
+     `alwaysShow` path). Marquee-select over an LFO — `estimateNodeHeight` should now match the
+     shorter card.
+  6. Scrubbing moves the value on every deterministic source while `Free Run` keeps going when
+     paused; a short export matches the preview frame-for-frame.
 - **Verify the shape/bars work in `npm run dev`** — it was written while the Cowork Linux sandbox
   was down, so `npm run lint` (ESLint + shader smoke test) and `npm run build` have not been run
   against it. Highest-value checks: both new shaders compile in a real WebGL2 context
@@ -947,11 +1062,13 @@ Ideas surfaced but not yet built (roughly by value-to-effort).
 - **Measure real card heights.** `estimateNodeHeight` is now the single shared estimate, but
   expanded compounds / image nodes deviate from it — a DOM-measured height map (ResizeObserver on
   cards) would make marquee/fit/insert/minimap exact.
-- **Conditional param visibility.** The @param/dataNodeParams UI has no "show this control only
-  when …", so TIME shows Beats/Cycle with Beat Sync off and Pulse Width on non-square waves (SHAPE
-  has the same issue with sides / inner ratio). A `showIf: { param, equals }` field honoured by the
-  three renderers would clean up the tall cards.
+- **Extend `showIf` to shader `@param`s.** The mechanism exists and is honoured by NodeCard /
+  Inspector / `estimateNodeHeight`, but only `dataNodeParams` entries declare it — `paramParser`
+  has no `@param` syntax for a condition, so SHAPE still shows `sides` on a Rectangle and
+  `inner ratio` on a non-Star. A `@showIf u_shp_type == Polygon,Star` directive parsed into the
+  same `{ param, equals }` shape would reuse `isParamVisible` verbatim.
 - **Live output readout for float source nodes.** `data-node-param-display` only updates *input*
-  params, so a TIME/MATH/ENVELOPE card can't show what it's currently outputting. Exposing the
+  params, so a RAMP/LFO/MATH/ENVELOPE card can't show what it's currently outputting. Exposing the
   resolved `floatValues` (not just the per-consumer overrides) would let each card display its own
-  value — useful when tuning an LFO against the music.
+  value — useful when tuning an LFO against the music, and it would make RAMP's new `progress`
+  output visible while authoring.

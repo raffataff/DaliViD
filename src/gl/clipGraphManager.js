@@ -10,7 +10,7 @@ import { getNodeSource } from '../shaders/shaderRegistry.js'
 import { getExecutionOrder } from '../utils/topSort.js'
 import { hexToVec3 } from '../utils/paramParser.js'
 import { AUDIO_DRIVER_BANDS, injectAudioDrivers } from '../utils/audioDrivers.js'
-import { TIME_SOURCES, TIME_WAVES, selectIndex } from '../shaders/dataNodeParams.js'
+import { RAMP_SPANS, RAMP_EASINGS, LFO_BASES, LFO_WAVES, selectIndex } from '../shaders/dataNodeParams.js'
 
 // When true, the graph is evaluated as a true DAG (inputs resolved per-edge,
 // multi-input effects supported). Set to false to fall back to the legacy
@@ -213,7 +213,7 @@ export function compileGraph(gl, graph) {
     // Audio / data nodes — no shader, data-routing only (TRANSITION_PROGRESS is
     // a CPU float source consumed by the executor's progress injection;
     // ENVELOPE and TIME are evaluated CPU-side in resolveFloatConnections).
-    if (['AUDIO_INPUT', 'AUDIO_SPLITTER', 'MATH', 'TRANSITION_PROGRESS', 'ENVELOPE', 'TIME'].includes(node.type)) {
+    if (['AUDIO_INPUT', 'AUDIO_SPLITTER', 'MATH', 'TRANSITION_PROGRESS', 'ENVELOPE', 'RAMP', 'LFO'].includes(node.type)) {
       chain.push({ nodeId: node.id, type: node.type, program: null, uniformLocations: {}, params: node.params || {}, bypassed: node.bypassed || false, name: node.name, isAudio: true })
       continue
     }
@@ -840,43 +840,67 @@ function evaluateEnvelope(node, input, now) {
 // wait for them before reading their output. Used by the fixpoint loop below to
 // evaluate chains like TIME → MATH → ENVELOPE → param in dependency order
 // regardless of the order the nodes happen to sit in the graph array.
-const DEFERRED_FLOAT_TYPES = ['MATH', 'ENVELOPE', 'TIME']
+const DEFERRED_FLOAT_TYPES = ['MATH', 'ENVELOPE', 'RAMP', 'LFO']
 
 /**
- * Time context for TIME nodes. `standardState` (when the renderer is executing a
- * graph) is authoritative; without it — the DOM param-display pass — the values
- * come from the stores, using the clip whose graph is open in the editor so the
- * on-card readout matches what the preview shows.
+ * Time context for RAMP / LFO nodes.
  *
- * Note `free` is the render clock (moves while paused, frame-locked on export)
- * whereas `playhead`/`clipTime` are timeline positions: deterministic, so a TIME
- * node driven by them scrubs correctly and exports identically to the preview.
+ * `standardState` is present whenever the renderer is executing a graph, and it
+ * is AUTHORITATIVE — including its nulls. A null `clipTime` means "master graph,
+ * no clip window", so it must degenerate to the timeline rather than falling
+ * back to whatever clip graph happens to be open in the editor: that fallback
+ * made a master-graph node's output depend on UI state (and silently output a
+ * constant when no clip graph was open). The store lookup is now reached only by
+ * the DOM param-display pass, which genuinely has no execution context and does
+ * want the clip being edited, so the on-card readout matches the preview.
+ *
+ * `free` is the render clock (moves while paused, frame-locked on export);
+ * `playhead` / `clipTime` are timeline positions, so they're deterministic —
+ * they scrub correctly and export identically to the preview.
+ *
+ * `timelineDuration` is a lazy getter: `calculateDuration()` walks every clip,
+ * and this context is built once per graph execution per frame (master + every
+ * clip + every compound), so it must not be paid unless a RAMP actually spans
+ * the timeline.
  */
 function buildTimeCtx(renderer, standardState) {
   const app = renderer._getAppStore?.() || {}
+  const tl = renderer._getTimelineStore?.() || {}
   const playhead = standardState?.playhead ?? app.playheadTime ?? 0
   const free = standardState?.time ?? (renderer._timeOverride != null
     ? renderer._timeOverride
     : (performance.now() / 1000) - (renderer.startTime || 0))
 
-  let clipTime = standardState?.clipTime
-  let clipDuration = standardState?.clipDuration
-  if (clipTime == null || clipDuration == null) {
-    const tl = renderer._getTimelineStore?.() || {}
+  let clipTime
+  let clipDuration
+  if (standardState) {
+    clipTime = standardState.clipTime ?? playhead
+    clipDuration = standardState.clipDuration ?? 0
+  } else {
     const clip = (app.graphLevel === 'clip' && app.graphClipId)
       ? (tl.clips || []).find(c => c.id === app.graphClipId)
       : null
-    if (clip) {
-      clipTime = playhead - clip.timelineStart
-      clipDuration = Math.max(0, clip.timelineEnd - clip.timelineStart)
-    } else {
-      // Master graph: "clip" time degenerates to the timeline itself.
-      clipTime = clipTime ?? playhead
-      clipDuration = clipDuration ?? 0
-    }
+    clipTime = clip ? playhead - clip.timelineStart : playhead
+    clipDuration = clip ? Math.max(0, clip.timelineEnd - clip.timelineStart) : 0
   }
 
-  return { playhead, free, clipTime, clipDuration, bpm: app.bpm || 120, beatOffset: app.beatOffset || 0 }
+  let tlDuration = null
+  return {
+    playhead,
+    free,
+    clipTime,
+    clipDuration,
+    inPoint: tl.inPoint ?? null,
+    outPoint: tl.outPoint ?? null,
+    bpm: app.bpm || 120,
+    beatOffset: app.beatOffset || 0,
+    get timelineDuration() {
+      if (tlDuration == null) {
+        tlDuration = typeof tl.calculateDuration === 'function' ? tl.calculateDuration() : 0
+      }
+      return tlDuration
+    },
+  }
 }
 
 // Deterministic pseudo-random in 0..1 for the Random Hold / Smooth Random waves.
@@ -890,69 +914,128 @@ function hash01(n) {
 const clamp01 = (v) => v < 0 ? 0 : (v > 1 ? 1 : v)
 
 /**
- * Evaluate a TIME node: pick a time base, turn it into a cycle position, shape it
- * with the chosen wave and remap into Min…Max. This is the keyframe replacement —
- * one node drives a param forever, or exactly once across a clip.
+ * Shape a 0..1 cycle position with one of the LFO waves. `ph` is the unwrapped
+ * phase (`f` plus whole cycles) — the random waves hash the cycle index and
+ * Linear rides it unbounded, so both need it.
+ */
+function shapeWave(wave, f, ph, pw) {
+  switch (wave) {
+    // Cosine form so the wave STARTS at Min and rises — reads the way a slider
+    // animation should when you wire it up.
+    case 0: return 0.5 - 0.5 * Math.cos(f * Math.PI * 2)
+    case 1: return 1 - Math.abs(2 * f - 1)          // Triangle (up then down)
+    case 2: return f                                // Saw Up
+    case 3: return 1 - f                            // Saw Down
+    case 4: return f < pw ? 1 : 0                   // Square (duty = Pulse Width)
+    case 5: return Math.abs(Math.sin(f * Math.PI))  // Bounce (eased up/down)
+    case 6: return hash01(Math.floor(ph))           // Random Hold (steps per cycle)
+    case 7: {                                       // Smooth Random
+      const i = Math.floor(ph)
+      const a = hash01(i)
+      const b = hash01(i + 1)
+      const t = f * f * (3 - 2 * f)
+      return a + (b - a) * t
+    }
+    case 8: return ph                               // Linear (unbounded ramp)
+    default: return 0.5 - 0.5 * Math.cos(f * Math.PI * 2)
+  }
+}
+
+/** Shaping curves for RAMP. Index matches RAMP_EASINGS. */
+function applyEase(v, easeIdx) {
+  switch (easeIdx) {
+    case 1: return v * v * (3 - 2 * v)      // Smooth (smoothstep — eased both ends)
+    case 2: return v * v                    // Ease In
+    case 3: return 1 - (1 - v) * (1 - v)    // Ease Out
+    default: return v                       // Linear
+  }
+}
+
+/**
+ * Evaluate a RAMP node: normalise a time span to 0…1, shape it, remap it into
+ * Start…End. This is the keyframe replacement — with every default left alone it
+ * is exactly a key at the clip's first frame and another at its last, except it
+ * re-times itself when the clip is moved, trimmed or retimed.
  *
  * @param {object} p   — merged params (node params + any float-socket overrides)
  * @param {object} ctx — buildTimeCtx() result
- * @returns {{ value: number, seconds: number }}
+ * @returns {{ value: number, progress: number, seconds: number }}
  */
-function evaluateTimeNode(p, ctx) {
-  const srcIdx = selectIndex(p.source, TIME_SOURCES, 0)
-  const wave = selectIndex(p.wave, TIME_WAVES, 0)
-  const rate = Math.max(0, p.rate ?? 1)
+function evaluateRampNode(p, ctx) {
+  const spanIdx = selectIndex(p.span, RAMP_SPANS, 0)
+
+  let elapsed
+  let span
+  if (spanIdx === 1) {
+    elapsed = ctx.playhead
+    span = ctx.timelineDuration
+  } else if (spanIdx === 2) {
+    // In / Out range — the section being worked on, which is also what a range
+    // export renders, so the ramp lines up with the delivered file.
+    const a = ctx.inPoint ?? 0
+    const b = (ctx.outPoint != null && ctx.outPoint > a) ? ctx.outPoint : ctx.timelineDuration
+    elapsed = ctx.playhead - a
+    span = Math.max(0, b - a)
+  } else {
+    elapsed = ctx.clipTime
+    span = ctx.clipDuration
+  }
+
+  const base = span > 0 ? clamp01(elapsed / span) : 0
+  const cycles = Math.max(0, p.cycles ?? 1)
+  const total = base * cycles + (p.offset ?? 0)
+
+  let f = total - Math.floor(total)
+  // Landing exactly on a cycle boundary at the END of the span wraps to 0, which
+  // snapped the ramp back to Start on its final frame — the one frame a "punch in
+  // and hold" must not do. Report the top of the last cycle instead.
+  if (base >= 1 && total > 0 && f === 0) f = 1
+  if (cycles === 0) f = clamp01(p.offset ?? 0)
+
+  if (p.ping_pong) f = 1 - Math.abs(2 * f - 1)
+
+  const shaped = applyEase(f, selectIndex(p.ease, RAMP_EASINGS, 0))
+  const start = p.start ?? 0
+  const end = p.end ?? 1
+
+  return { value: start + (end - start) * shaped, progress: f, seconds: elapsed }
+}
+
+/**
+ * Evaluate an LFO node: turn a seconds-based time base into a cycle position,
+ * shape it with the chosen wave and remap into Min…Max.
+ *
+ * The time base is ALWAYS seconds here (that's the split from RAMP), so `Rate`
+ * has exactly one meaning — cycles per second — unless Beat Sync replaces it
+ * with a musical division.
+ *
+ * @param {object} p   — merged params (node params + any float-socket overrides)
+ * @param {object} ctx — buildTimeCtx() result
+ * @returns {{ value: number, bipolar: number, seconds: number }}
+ */
+function evaluateLfoNode(p, ctx) {
+  const baseIdx = selectIndex(p.base, LFO_BASES, 0)
+  const wave = selectIndex(p.wave, LFO_WAVES, 0)
   const lo = p.min ?? 0
   const hi = p.max ?? 1
   const pw = Math.min(0.99, Math.max(0.01, p.pulse_width ?? 0.5))
 
-  // Raw seconds of the chosen base. Clip Progress reports clip-local seconds too,
-  // so the Seconds output stays meaningful whichever source is picked.
-  const seconds = srcIdx === 3 ? ctx.free
-    : (srcIdx === 1 || srcIdx === 2) ? ctx.clipTime
-    : ctx.playhead
+  const seconds = baseIdx === 2 ? ctx.free : (baseIdx === 1 ? ctx.clipTime : ctx.playhead)
 
   // Cycle position in turns (1.0 = one full cycle of the wave).
   let turns
-  if (srcIdx === 2) {
-    // Clip Progress: one cycle spans the whole clip (× rate), so Saw Up + rate 1
-    // is exactly a keyframe pair from Min at the clip's first frame to Max at its
-    // last — with no keys, and it follows the clip when it's moved or retimed.
-    const prog = ctx.clipDuration > 0 ? clamp01(ctx.clipTime / ctx.clipDuration) : 0
-    turns = prog * rate
-  } else if (p.beat_sync) {
+  if (p.beat_sync) {
     // Beat-synced: a cycle is N beats of the project BPM, aligned to beatOffset.
     const cycle = Math.max(1e-4, (p.beats ?? 4) * (60 / Math.max(1, ctx.bpm)))
     turns = (seconds - ctx.beatOffset) / cycle
   } else {
-    turns = seconds * rate
+    turns = seconds * Math.max(0, p.rate ?? 1)
   }
 
   const ph = turns + (p.phase ?? 0)
   const f = ph - Math.floor(ph) // 0..1 within the cycle
 
-  let v
-  switch (wave) {
-    // Cosine form so the wave STARTS at Min and rises — reads the way a slider
-    // animation should when you wire it up.
-    case 0: v = 0.5 - 0.5 * Math.cos(f * Math.PI * 2); break
-    case 1: v = 1 - Math.abs(2 * f - 1); break            // Triangle (up then down)
-    case 2: v = f; break                                  // Saw Up
-    case 3: v = 1 - f; break                              // Saw Down
-    case 4: v = f < pw ? 1 : 0; break                     // Square (duty = Pulse Width)
-    case 5: v = Math.abs(Math.sin(f * Math.PI)); break     // Bounce (eased up/down)
-    case 6: v = hash01(Math.floor(ph)); break             // Random Hold (steps per cycle)
-    case 7: {                                             // Smooth Random
-      const i = Math.floor(ph)
-      const a = hash01(i)
-      const b = hash01(i + 1)
-      const t = f * f * (3 - 2 * f)
-      v = a + (b - a) * t
-      break
-    }
-    case 8: v = ph; break                                 // Linear (unbounded ramp)
-    default: v = 0.5 - 0.5 * Math.cos(f * Math.PI * 2)
-  }
+  let v = shapeWave(wave, f, ph, pw)
 
   // Optional S-curve — softens the corners of Triangle/Saw/Square. Skipped for
   // Linear, whose whole point is that it doesn't stay in 0..1.
@@ -961,7 +1044,7 @@ function evaluateTimeNode(p, ctx) {
     v = c * c * (3 - 2 * c)
   }
 
-  return { value: lo + (hi - lo) * v, seconds }
+  return { value: lo + (hi - lo) * v, bipolar: v * 2 - 1, seconds }
 }
 
 /**
@@ -1068,18 +1151,27 @@ export function resolveFloatConnections(renderer, nodesArg = null, edgesArg = nu
       if (!DEFERRED_FLOAT_TYPES.includes(node.type) || evaluated.has(node.id)) continue
       if (producerPending(node.id)) continue // dependency not ready — another pass is coming
 
-      // TIME: pure generator. Its own params can be modulated (rate by bass, …),
-      // so incoming float values are merged over the stored params first.
-      if (node.type === 'TIME') {
+      // RAMP / LFO: pure generators. Their own params can be modulated (an LFO's
+      // rate by bass, a RAMP's End by an ENVELOPE, …), so incoming float values
+      // are merged over the stored params before evaluating.
+      if (node.type === 'RAMP' || node.type === 'LFO') {
         const p = { ...(node.params || {}) }
         for (const edge of graph.edges) {
           if (edge.toNode !== node.id) continue
           const v = floatValues[`${edge.fromNode}.${edge.fromSocket}`]
           if (v !== undefined) p[edge.toSocket] = v
         }
-        const result = evaluateTimeNode(p, timeCtx)
-        floatValues[`${node.id}.value`] = result.value
-        floatValues[`${node.id}.seconds`] = result.seconds
+        if (node.type === 'RAMP') {
+          const result = evaluateRampNode(p, timeCtx)
+          floatValues[`${node.id}.value`] = result.value
+          floatValues[`${node.id}.progress`] = result.progress
+          floatValues[`${node.id}.seconds`] = result.seconds
+        } else {
+          const result = evaluateLfoNode(p, timeCtx)
+          floatValues[`${node.id}.value`] = result.value
+          floatValues[`${node.id}.bipolar`] = result.bipolar
+          floatValues[`${node.id}.seconds`] = result.seconds
+        }
         evaluated.add(node.id)
         progress = true
         continue

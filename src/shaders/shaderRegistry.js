@@ -876,6 +876,97 @@ void main() {
 }
 `)
 
+// ── Transform (Pan / Zoom / Rotate) ─────────────────────────────────────────
+// A camera over the incoming frame: Zoom punches in, Pan slides the view, and
+// Rotation tilts it. This is ALSO the shader behind the per-clip "Transform"
+// section in the Inspector (Renderer._applyClipTransform drives the same
+// program), so the node and the clip control can never drift apart — the same
+// single-source-of-truth trick LETTERBOX uses for the project bars.
+//
+// Conventions (shared with SHAPE_INPUT and the clip Transform UI):
+//   • Pan is CAMERA-relative in frame-edge units: ±1 pans the view a half-frame,
+//     so the PICTURE moves the opposite way. That is what "pan around the shot"
+//     means, and it makes a zoom-in + pan read as one moving camera.
+//   • v_uv.y is UP, so Pan Y +1 moves the view toward the top of the frame.
+//   • Rotation is counter-clockwise-positive on screen (same as the shape gizmo).
+//   • Aspect-corrected internally, so rotation never skews and a diagonal pan
+//     travels at the same speed on both axes.
+//
+// Zooming past 1.0 magnifies the incoming FBO, which is canvas-resolution — a
+// big punch-in on video is a genuine upscale and will soften. Stills don't have
+// that problem: zoom on the IMAGE_INPUT node instead, which samples the original
+// image at its native size.
+registerShader('TRANSFORM', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_audio_bands[8];   // always-live FFT bands
+uniform float u_beat;             // always-live beat trigger
+// @param name="Zoom" min=0.1 max=8.0 default=1.0 step=0.01
+uniform float u_xf_zoom;
+// @param name="Pan X" min=-2.0 max=2.0 default=0.0 step=0.005
+uniform float u_xf_pan_x;
+// @param name="Pan Y" min=-2.0 max=2.0 default=0.0 step=0.005
+uniform float u_xf_pan_y;
+// @param name="Rotation" min=-3.1416 max=3.1416 default=0.0 step=0.01
+uniform float u_xf_rot;
+// @param name="Edges" min=0 max=3 default=0 step=1 type=select options="Transparent,Clamp,Mirror,Tile"
+uniform int u_xf_edge;
+// @param name="Bass Zoom" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_xf_bass_zoom;
+// @param name="Beat Punch" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_xf_beat_punch;
+out vec4 fragColor;
+
+// Sample outside 0..1 the way the user asked. NOT left to the texture's wrap
+// mode: every FBO in the pipeline is CLAMP_TO_EDGE, so the default would smear
+// the border pixel into a streak the moment you pan past the frame.
+vec4 xfSample(vec2 uv) {
+  if (u_xf_edge == 1) {                        // Clamp — stretch the edge pixel
+    return texture(u_texture, clamp(uv, 0.0, 1.0));
+  }
+  if (u_xf_edge == 2) {                        // Mirror — ping-pong the frame
+    vec2 m = 1.0 - abs(fract(uv * 0.5) * 2.0 - 1.0);
+    return texture(u_texture, m);
+  }
+  if (u_xf_edge == 3) {                        // Tile — repeat the frame
+    return texture(u_texture, fract(uv));
+  }
+  // Transparent (default): fade out over ~1px so the border stays smooth when
+  // rotated, and composites over whatever is on the track below.
+  vec2 fw = fwidth(uv) + 1e-5;
+  vec2 lo = smoothstep(vec2(0.0), fw, uv);
+  vec2 hi = smoothstep(vec2(0.0), fw, vec2(1.0) - uv);
+  vec4 c = texture(u_texture, clamp(uv, 0.0, 1.0));
+  return vec4(c.rgb, c.a * lo.x * lo.y * hi.x * hi.y);
+}
+
+void main() {
+  float aspect = u_resolution.x / max(u_resolution.y, 1.0);
+
+  // Frame units: y ∈ [-0.5, 0.5], x scaled by aspect, so 1.0 == the frame HEIGHT
+  // on both axes and rotation stays circular.
+  vec2 p = vec2((v_uv.x - 0.5) * aspect, v_uv.y - 0.5);
+
+  // Inverse-map the output pixel back to the source. Pan is added AFTER the
+  // zoom divide, so it is measured in SOURCE-frame units: Pan X 0.5 always means
+  // "centre on the point halfway to the right edge of the original", whatever
+  // the zoom. That keeps the ±2 slider range meaningful at every zoom level —
+  // dividing pan by zoom instead would make it uselessly coarse when punched in.
+  float ca = cos(u_xf_rot), sa = sin(u_xf_rot);
+  p = mat2(ca, -sa, sa, ca) * p;   // R(-rot) on the query == content turns CCW
+
+  float bass = u_audio_bands[1];
+  float zoom = max(u_xf_zoom * (1.0 + bass * u_xf_bass_zoom * 1.5 + u_beat * u_xf_beat_punch * 0.5), 0.001);
+  p /= zoom;
+
+  p += vec2(u_xf_pan_x * 0.5 * aspect, u_xf_pan_y * 0.5);
+
+  fragColor = xfSample(vec2(p.x / aspect + 0.5, p.y + 0.5));
+}
+`)
+
 // ── Video Input (passthrough — texture uploaded externally by Renderer) ──
 registerShader('VIDEO_INPUT', `#version 300 es
 precision highp float;
@@ -3166,7 +3257,11 @@ void main() {
     float rt = t * 0.5;
     for (int i = 0; i < 12; i++) {
       p = z * rd;
-      p = rotate(p.xy, rt) + rotate(p.xz, rt * 0.7).xzy;
+      // Rotate the 3D sample point: yaw about Z, then about Y. Swizzling the
+      // vec2 that rotate() returns to 3 components is illegal GLSL, which is
+      // why this mode used to fail to compile.
+      p.xy = rotate(p.xy, rt);
+      p.xz = rotate(p.xz, rt * 0.7);
       float d = 0.0;
       for (float j = 1.0; j < 5.0; j++) {
         vec3 ap = abs(p) - j * 0.15;

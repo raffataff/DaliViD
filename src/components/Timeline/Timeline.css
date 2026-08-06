@@ -513,16 +513,23 @@
 }
 
 /* ── Clip Transition Badge ── */
+/* ⇄ badge — pinned to the end of the clip that carries the transition, so an
+   in and an out badge can coexist without overlapping. pointer-events are ON
+   (they were off, which silently killed the title tooltip) so hovering names
+   the transition; mousedown still bubbles to the clip body, so grabbing the
+   badge selects and drags the clip exactly like grabbing anywhere else. */
 .timeline__clip-transition-badge {
   position: absolute;
   bottom: 2px;
-  left: 4px;
   font-size: 9px;
   font-weight: 700;
   color: var(--accent-cyan);
   z-index: 3;
-  pointer-events: none;
+  cursor: inherit;
 }
+
+.timeline__clip-transition-badge--in { left: 4px; }
+.timeline__clip-transition-badge--out { right: 4px; }
 
 /* ── Clip Fade Ramps & Handles ── */
 .timeline__clip-fade {

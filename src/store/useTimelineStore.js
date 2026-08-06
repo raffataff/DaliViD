@@ -163,7 +163,12 @@ const useTimelineStore = create((set, get) => ({
       // transitionOut plays across fadeOut, out to whatever is behind the clip.
       transitionIn: null,
       transitionOut: null,
-      transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 },
+      // Pan / zoom / rotate framing, keyed by the TRANSFORM shader's uniforms
+      // ({ u_xf_zoom, u_xf_pan_x, … } — see utils/clipTransform.js). null means
+      // "no transform", which skips the GPU pass entirely, so the default clip
+      // costs nothing. Replaced the old unused { x, y, scaleX… } placeholder;
+      // projects saved with that shape resolve to identity on load.
+      transform: null,
       metadata: {
         width: clipData.width || 1920,
         height: clipData.height || 1080,
