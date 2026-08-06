@@ -1,5 +1,10 @@
 import { useState, useRef } from 'react'
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
+// WebM is the only container the browser will encode with an alpha channel:
+// H.264 has no alpha at all, and MP4/HEVC-with-alpha is a Safari decode-only
+// story. Same author and API shape as mp4-muxer above, so the two paths stay
+// symmetrical. (Both are superseded by `mediabunny` — see CLAUDE.md backlog.)
+import { Muxer as WebMMuxer, ArrayBufferTarget as WebMArrayBufferTarget } from 'webm-muxer'
 import useAppStore from '../../store/useAppStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import useAudioStore from '../../store/useAudioStore'
@@ -7,6 +12,10 @@ import useGraphStore from '../../store/useGraphStore'
 import { getAudioEngine } from '../../audio/AudioEngine'
 import { addToast } from '../common/Toast'
 import { IconClose } from '../common/Icons'
+import {
+  EDGE_HEAD, getEdgeTransition, findPrevOverlap, findNextOverlap,
+  clipEdgeState, clipEnvelopeGain,
+} from '../../utils/clipTransitions'
 import './ExportModal.css'
 
 /**
@@ -20,12 +29,11 @@ import './ExportModal.css'
  * (a clip already playing at rangeStart starts mid-source). Buffer time 0 =
  * timeline time rangeStart, matching the video frame loop's offset playhead.
  */
-async function renderTimelineAudio(durationSec, clips, tracks, rangeStart = 0) {
+async function renderTimelineAudio(durationSec, clips, tracks, rangeStart = 0, sampleRate = 44100) {
   if (!durationSec || durationSec <= 0) return null
   const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext
   if (!OfflineCtx) return null
 
-  const sampleRate = 44100
   const channels = 2
   const length = Math.ceil(durationSec * sampleRate)
   const offline = new OfflineCtx(channels, length, sampleRate)
@@ -45,35 +53,46 @@ async function renderTimelineAudio(durationSec, clips, tracks, rangeStart = 0) {
     return bufferCache.get(url)
   }
 
-  // Same-track ordering for transition crossfades (mirrors the renderer's
-  // getActiveClips ordering: earliest start first).
-  const clipsByTrack = {}
-  for (const c of clips) {
-    if (!clipsByTrack[c.trackId]) clipsByTrack[c.trackId] = []
-    clipsByTrack[c.trackId].push(c)
-  }
-  for (const id in clipsByTrack) clipsByTrack[id].sort((a, b) => a.timelineStart - b.timelineStart)
-
-  // The crossfade windows affecting a clip's audio: its own transition-in
-  // (gain ramps up with the picture) and any later clip transitioning in over
-  // it (gain ducks down). Matches Renderer._renderFullPipeline's audio logic.
-  const crossfadeWindows = (clip) => {
-    const windows = []
-    const mates = clipsByTrack[clip.trackId] || []
-    if (clip.transition && clip.transition.type) {
-      const prev = mates
-        .filter(m => m !== clip && m.timelineStart < clip.timelineStart && m.timelineEnd > clip.timelineStart)
-        .sort((a, b) => b.timelineStart - a.timelineStart)[0]
-      if (prev) {
-        const end = Math.min(prev.timelineEnd, clip.timelineEnd)
-        if (end - clip.timelineStart > 0.001) windows.push({ start: clip.timelineStart, end, dir: 1 })
-      }
+  // Reversed clips need a reversed copy of the decoded buffer — a BufferSource
+  // has no negative playbackRate either. Cached per URL alongside the forward
+  // buffer so several reversed clips off one file only pay for it once.
+  const reversedCache = new Map()
+  const decodeReversed = async (url) => {
+    if (!reversedCache.has(url)) {
+      reversedCache.set(url, (async () => {
+        const src = await decode(url)
+        const out = offline.createBuffer(src.numberOfChannels, src.length, src.sampleRate)
+        for (let ch = 0; ch < src.numberOfChannels; ch++) {
+          const from = src.getChannelData(ch)
+          const to = out.getChannelData(ch)
+          for (let i = 0, n = from.length; i < n; i++) to[i] = from[n - 1 - i]
+        }
+        return out
+      })())
     }
-    for (const nxt of mates) {
-      if (nxt === clip || !nxt.transition || !nxt.transition.type) continue
+    return reversedCache.get(url)
+  }
+
+  // Each clip's edge geometry, resolved once. The gain curve below is then just
+  // clipEnvelopeGain sampled over time — the SAME function the live renderer
+  // calls per frame, so an exported fade or transition can't drift from what
+  // was previewed.
+  const edgeContext = new Map() // clip → { prev, next }
+  for (const c of clips) {
+    edgeContext.set(c, { prev: findPrevOverlap(c, clips), next: findNextOverlap(c, clips) })
+  }
+
+  // Ducking the OUTGOING side of a crossfade is the one thing a clip's own
+  // envelope can't know, so it's collected here: any later clip whose head
+  // transition plays over this one ramps this clip's audio down.
+  const duckWindows = (clip) => {
+    const windows = []
+    for (const nxt of clips) {
+      if (nxt === clip || nxt.trackId !== clip.trackId) continue
+      if (!getEdgeTransition(nxt, EDGE_HEAD)?.type) continue
       if (nxt.timelineStart <= clip.timelineStart || nxt.timelineStart >= clip.timelineEnd) continue
       const end = Math.min(clip.timelineEnd, nxt.timelineEnd)
-      if (end - nxt.timelineStart > 0.001) windows.push({ start: nxt.timelineStart, end, dir: -1 })
+      if (end - nxt.timelineStart > 0.001) windows.push({ start: nxt.timelineStart, end })
     }
     return windows
   }
@@ -92,7 +111,7 @@ async function renderTimelineAudio(durationSec, clips, tracks, rangeStart = 0) {
 
     let audioBuf
     try {
-      audioBuf = await decode(clip.fileUrl)
+      audioBuf = clip.reversed ? await decodeReversed(clip.fileUrl) : await decode(clip.fileUrl)
     } catch (e) {
       // A video with no audio track throws here — that's fine, just skip it.
       console.warn('[Export] Could not decode audio for clip', clip.filename, e?.message)
@@ -113,8 +132,14 @@ async function renderTimelineAudio(durationSec, clips, tracks, rangeStart = 0) {
 
     const when = winStart - rangeStart
     const skipIntoClip = winStart - clip.timelineStart // timeline s skipped at the clip's head
+    // Forward source time at winStart. Reversed clips read the flipped buffer,
+    // where forward time t sits at (duration - t) — so the head of a reversed
+    // clip is the TAIL of the file.
+    const forwardAt = clip.reversed
+      ? (clip.sourceEnd || audioBuf.duration) - skipIntoClip * (clip.speed || 1)
+      : (clip.sourceStart || 0) + skipIntoClip * (clip.speed || 1)
     const offset = Math.min(
-      Math.max(0, (clip.sourceStart || 0) + skipIntoClip * (clip.speed || 1)),
+      Math.max(0, clip.reversed ? audioBuf.duration - forwardAt : forwardAt),
       audioBuf.duration
     )
 
@@ -127,19 +152,19 @@ async function renderTimelineAudio(durationSec, clips, tracks, rangeStart = 0) {
     src.connect(gainNode)
     gainNode.connect(offline.destination)
 
-    const baseVol = clip.volume == null ? 1 : Math.max(0, Math.min(1, clip.volume))
-    const windows = crossfadeWindows(clip)
+    const { prev, next } = edgeContext.get(clip) || {}
+    const ducks = duckWindows(clip)
     const steps = Math.max(2, Math.ceil(playDur * 30))
     const curve = new Float32Array(steps)
     for (let s = 0; s < steps; s++) {
       const tt = winStart + (s / (steps - 1)) * playDur
-      let g = baseVol
-      if (clip.fadeIn > 0) g *= Math.max(0, Math.min(1, (tt - clip.timelineStart) / clip.fadeIn))
-      if (clip.fadeOut > 0) g *= Math.max(0, Math.min(1, (clip.timelineEnd - tt) / clip.fadeOut))
-      for (const w of windows) {
-        const p = Math.max(0, Math.min(1, (tt - w.start) / (w.end - w.start)))
-        if (w.dir === 1) g *= p
-        else if (tt <= w.end) g *= (1 - p) // duck only while the incoming clip overlaps
+      // clipEnvelopeGain covers volume, mute, fade ramps AND transition-owned
+      // windows in both directions — including a tail transition fading the
+      // sound out to nothing alongside the picture.
+      let g = clipEnvelopeGain(clip, clipEdgeState(clip, prev, next, tt))
+      for (const w of ducks) {
+        if (tt > w.end) continue // duck only while the incoming clip overlaps
+        g *= 1 - Math.max(0, Math.min(1, (tt - w.start) / (w.end - w.start)))
       }
       curve[s] = g
     }
@@ -270,10 +295,14 @@ async function analyzeTimelineAudio(audioBuffer, fps, totalFrames) {
 }
 
 /**
- * Encode a rendered AudioBuffer into the muxer's AAC audio track. Feeds the PCM
- * to a WebCodecs AudioEncoder in planar-float chunks with sequential timestamps.
+ * Encode a rendered AudioBuffer into the muxer's audio track. Feeds the PCM to a
+ * WebCodecs AudioEncoder in planar-float chunks with sequential timestamps.
+ *
+ * `codecName` follows the container: AAC-LC for MP4, Opus for WebM (WebM cannot
+ * carry AAC). Opus is 48 kHz only in Chrome's encoder, which is why the WebM
+ * path renders its mixdown at 48 kHz — see AUDIO_SAMPLE_RATE_OPUS.
  */
-async function encodeAudioTrack(muxer, audioBuffer) {
+async function encodeAudioTrack(muxer, audioBuffer, codecName = 'aac') {
   const sampleRate = audioBuffer.sampleRate
   const numberOfChannels = audioBuffer.numberOfChannels
   const totalFrames = audioBuffer.length
@@ -283,7 +312,7 @@ async function encodeAudioTrack(muxer, audioBuffer) {
     error: (e) => console.error('AudioEncoder error:', e),
   })
   audioEncoder.configure({
-    codec: 'mp4a.40.2', // AAC-LC
+    codec: codecName === 'opus' ? 'opus' : 'mp4a.40.2', // Opus / AAC-LC
     sampleRate,
     numberOfChannels,
     bitrate: 192000,
@@ -353,6 +382,26 @@ function waitForEncoderQueue(encoder, max) {
 // encoder, so the modal warns and offers a one-click way to lower settings.
 const SAFE_PIXEL_RATE = 250_000_000
 
+// Chrome's Opus encoder only accepts 48 kHz, so a WebM export renders its
+// mixdown at 48 kHz rather than the MP4 path's 44.1 kHz.
+const AUDIO_SAMPLE_RATE_OPUS = 48000
+
+// The one alpha-capable encode path in any browser: VP9 Profile 0, 8-bit, in
+// WebM, with the encoder configured `alpha: 'keep'`. Chrome and Firefox decode
+// it; Safari does not (it wants HEVC-with-alpha, which no browser will encode).
+const VP9_ALPHA_CODEC = 'vp09.00.10.08'
+
+// Single source of truth for the codec dropdown AND the branching below.
+// `webCodecs` = frame-locked VideoEncoder path (deterministic, audio muxed in);
+// false = the legacy real-time MediaRecorder path.
+// `alpha` = carries transparency, which only the VP9/WebM combination can.
+const CODECS = [
+  { value: 'mp4-h264', label: 'MP4 (H.264 / AAC)', alpha: false, webCodecs: true },
+  { value: 'webm-vp9-alpha', label: 'WebM (VP9 + Alpha / Opus)', alpha: true, webCodecs: true },
+  { value: 'webm-vp9', label: 'WebM (VP9)', alpha: false, webCodecs: false },
+  { value: 'webm-vp8', label: 'WebM (VP8)', alpha: false, webCodecs: false },
+]
+
 /**
  * Export Modal — frame/video export with codec, resolution, quality settings.
  */
@@ -376,14 +425,20 @@ export default function ExportModal() {
   const [exportFps, setExportFps] = useState(fps)
   const [isExporting, setIsExporting] = useState(false)
   const [progress, setProgress] = useState(0)
+  // Transparent PNG for the Frame tab. Separate from the codec choice because a
+  // still has no codec to constrain it — PNG always supports alpha.
+  const [transparentFrame, setTransparentFrame] = useState(false)
 
   const exportActiveRef = useRef(false)
 
+  const codecInfo = CODECS.find(c => c.value === codec) || CODECS[0]
+  const alphaExport = exportType === 'video' && codecInfo.alpha
+
   // Encoder-load guard: warn when width × height × fps exceeds the safe budget so
-  // users don't start an H.264 export likely to choke the GPU/encoder. Only the
-  // WebCodecs (mp4-h264) path is gated; the WebM MediaRecorder path differs.
+  // users don't start an export likely to choke the GPU/encoder. Only the
+  // WebCodecs paths are gated; the WebM MediaRecorder path differs.
   const pixelRate = exportWidth * exportHeight * exportFps
-  const overBudget = exportType === 'video' && codec === 'mp4-h264' && pixelRate > SAFE_PIXEL_RATE
+  const overBudget = exportType === 'video' && codecInfo.webCodecs && pixelRate > SAFE_PIXEL_RATE
 
   if (!exportModalOpen) return null
 
@@ -393,10 +448,14 @@ export default function ExportModal() {
 
     // Capture the final OUTPUT, not a live preview tap. Render one clean frame
     // with the tap suppressed, then restore so the on-screen preview is unaffected.
+    // `_presentAlpha` additionally keeps the drawing buffer's alpha channel (and
+    // un-premultiplies it) so uncovered regions land in the PNG as transparent
+    // rather than as black.
     const renderer = canvas._renderer
     const prevTap = renderer?.previewTapEnabled
     if (renderer) {
       renderer.previewTapEnabled = false
+      renderer._presentAlpha = transparentFrame
       renderer._renderFrame()
     }
 
@@ -407,16 +466,27 @@ export default function ExportModal() {
 
     if (renderer) {
       renderer.previewTapEnabled = prevTap ?? true
+      renderer._presentAlpha = false
       renderer._renderFrame()
     }
 
     setExportModalOpen(false)
-    addToast({ message: 'Frame saved as PNG successfully!', type: 'success' })
+    addToast({
+      message: transparentFrame
+        ? 'Frame saved as a transparent PNG.'
+        : 'Frame saved as PNG successfully!',
+      type: 'success',
+    })
   }
 
+  // Mirrors clipGraphManager.getClipSourceTime (reversed clips walk the source
+  // backwards) but clamps to the media's real duration, which is what the
+  // export's seek-and-wait loop needs.
   const getClipSourceTime = (clip, playheadTime) => {
-    const elapsed = playheadTime - clip.timelineStart
-    const sourceTime = clip.sourceStart + elapsed * clip.speed
+    const elapsed = (playheadTime - clip.timelineStart) * clip.speed
+    const sourceTime = clip.reversed
+      ? clip.sourceEnd - elapsed
+      : clip.sourceStart + elapsed
     return Math.max(0, Math.min(clip.metadata.duration || clip.sourceEnd, sourceTime))
   }
 
@@ -486,7 +556,7 @@ export default function ExportModal() {
     // Exports must always come from the OUTPUT node — never a live preview tap.
     renderer.previewTapEnabled = false
 
-    if (codec === 'mp4-h264') {
+    if (codecInfo.webCodecs) {
       if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') {
         addToast({ message: 'WebCodecs API (VideoEncoder) is not supported in this browser. Please use a Chromium-based browser.', type: 'error' })
         renderer.previewTapEnabled = true
@@ -507,13 +577,16 @@ export default function ExportModal() {
         // Temporarily resize renderer to target export resolution
         renderer.setResolution(exportWidth, exportHeight)
 
-        // Find the best codec configuration supported by hardware
-        let selectedCodecString = 'avc1.4d0034' // Main Profile
-        const configsToTry = [
-          'avc1.4d0034', // Main Profile
-          'avc1.64002a', // High Profile
-          'avc1.42001f', // Baseline Profile
-        ]
+        // Find the best codec configuration supported by hardware.
+        // The alpha path has exactly one candidate — VP9 is the only codec any
+        // browser will encode with an alpha channel — and `alpha: 'keep'` is
+        // part of the support probe, not just the config: an encoder can
+        // support VP9 and still refuse alpha, and we need to find that out
+        // BEFORE rendering several thousand frames.
+        const configsToTry = codecInfo.alpha
+          ? [VP9_ALPHA_CODEC]
+          : ['avc1.4d0034' /* Main */, 'avc1.64002a' /* High */, 'avc1.42001f' /* Baseline */]
+        let selectedCodecString = configsToTry[0]
 
         let supportedConfig = null
         for (const testCodec of configsToTry) {
@@ -523,6 +596,7 @@ export default function ExportModal() {
             height: exportHeight,
             bitrate: Math.round(quality * 10000000),
             framerate: exportFps,
+            ...(codecInfo.alpha ? { alpha: 'keep' } : {}),
           }
           try {
             const support = await VideoEncoder.isConfigSupported(testConfig)
@@ -537,7 +611,12 @@ export default function ExportModal() {
         }
 
         if (!supportedConfig) {
-          addToast({ message: 'The selected resolution or frame rate is not supported by your H.264 encoder.', type: 'error' })
+          addToast({
+            message: codecInfo.alpha
+              ? 'This browser will not encode VP9 with an alpha channel at these settings. Try a lower resolution, or export a transparent PNG from the Frame tab.'
+              : 'The selected resolution or frame rate is not supported by your H.264 encoder.',
+            type: 'error',
+          })
           renderer.previewTapEnabled = true
           setIsExporting(false)
           return
@@ -558,11 +637,15 @@ export default function ExportModal() {
         const exportDuration = Math.max(0.1, rangeEnd - rangeStart)
 
         // Render the timeline audio offline so it can be muxed alongside the video.
+        // WebM carries Opus, not AAC, and Chrome's Opus encoder is 48 kHz-only —
+        // so the container decides the mixdown rate, not the other way round.
         const { clips: allClips, tracks: allTracks } = timelineState
+        const audioCodec = codecInfo.alpha ? 'opus' : 'aac'
+        const audioRate = audioCodec === 'opus' ? AUDIO_SAMPLE_RATE_OPUS : 44100
         let audioBuffer = null
         if (typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined') {
           try {
-            audioBuffer = await renderTimelineAudio(exportDuration, allClips, allTracks, rangeStart)
+            audioBuffer = await renderTimelineAudio(exportDuration, allClips, allTracks, rangeStart, audioRate)
           } catch (e) {
             console.warn('[Export] Audio mixdown failed, exporting video only:', e?.message)
           }
@@ -570,22 +653,43 @@ export default function ExportModal() {
         const hasAudio = !!audioBuffer
 
         // Initialize Muxer — declare the audio track up front when present.
-        let muxer = new Muxer({
-          target: new ArrayBufferTarget(),
-          video: {
-            codec: 'avc',
-            width: exportWidth,
-            height: exportHeight,
-          },
-          ...(hasAudio ? {
-            audio: {
-              codec: 'aac',
-              numberOfChannels: audioBuffer.numberOfChannels,
-              sampleRate: audioBuffer.sampleRate,
+        // `alpha: true` on the WebM video track is what makes the muxer write the
+        // encoder's side-data alpha plane into the file; without it the encoder
+        // still produces alpha and the container silently drops it.
+        let muxer = codecInfo.alpha
+          ? new WebMMuxer({
+            target: new WebMArrayBufferTarget(),
+            video: {
+              codec: 'V_VP9',
+              width: exportWidth,
+              height: exportHeight,
+              frameRate: exportFps,
+              alpha: true,
             },
-          } : {}),
-          fastStart: 'in-memory',
-        })
+            ...(hasAudio ? {
+              audio: {
+                codec: 'A_OPUS',
+                numberOfChannels: audioBuffer.numberOfChannels,
+                sampleRate: audioBuffer.sampleRate,
+              },
+            } : {}),
+          })
+          : new Muxer({
+            target: new ArrayBufferTarget(),
+            video: {
+              codec: 'avc',
+              width: exportWidth,
+              height: exportHeight,
+            },
+            ...(hasAudio ? {
+              audio: {
+                codec: 'aac',
+                numberOfChannels: audioBuffer.numberOfChannels,
+                sampleRate: audioBuffer.sampleRate,
+              },
+            } : {}),
+            fastStart: 'in-memory',
+          })
 
         // Setup VideoEncoder
         let encoder = new VideoEncoder({
@@ -604,8 +708,16 @@ export default function ExportModal() {
           height: exportHeight,
           bitrate: Math.round(quality * 10000000),
           framerate: exportFps,
-          avc: { format: 'avc' }
+          ...(codecInfo.alpha
+            ? { alpha: 'keep' }
+            : { avc: { format: 'avc' } }),
         })
+
+        // Make the renderer present with a real alpha channel for the whole
+        // frame loop: no opaque clear, no colour mask, and the premultiplied
+        // accumulator un-premultiplied on its way to the drawing buffer (which
+        // is `premultipliedAlpha: false`, so it wants straight colour).
+        renderer._presentAlpha = !!codecInfo.alpha
 
         const totalFrames = Math.ceil(exportDuration * exportFps)
 
@@ -655,7 +767,11 @@ export default function ExportModal() {
             try {
               const rawClips = allClips
                 .filter(c => c.filename === name)
-                .map(c => ({ ...c, audioMuted: false, volume: 1, fadeIn: 0, fadeOut: 0, transition: null }))
+                .map(c => ({
+                  ...c,
+                  audioMuted: false, volume: 1, fadeIn: 0, fadeOut: 0,
+                  transitionIn: null, transitionOut: null, transition: null,
+                }))
               const rawTracks = allTracks.map(t => ({ ...t, muted: false, solo: false }))
               const stemBuf = await renderTimelineAudio(exportDuration, rawClips, rawTracks, rangeStart)
               if (stemBuf) {
@@ -718,9 +834,15 @@ export default function ExportModal() {
           // Step 4: Wait a microtick to guarantee WebGL drawing buffer is populated
           await new Promise(resolve => requestAnimationFrame(resolve))
 
-          // Create VideoFrame from WebGL canvas
+          // Create VideoFrame from WebGL canvas. `alpha: 'keep'` is explicit
+          // rather than relying on the default, because the default differs by
+          // source type and silently discarding here would produce a perfectly
+          // valid VP9-alpha file with a fully opaque alpha plane.
           const timestamp = Math.round((frame * 1000000) / exportFps)
-          const videoFrame = new VideoFrame(canvas, { timestamp })
+          const videoFrame = new VideoFrame(canvas, {
+            timestamp,
+            ...(codecInfo.alpha ? { alpha: 'keep' } : {}),
+          })
 
           const keyFrame = frame % 30 === 0
           encoder.encode(videoFrame, { keyFrame })
@@ -741,10 +863,10 @@ export default function ExportModal() {
         if (exportActiveRef.current) {
           await encoder.flush()
 
-          // Encode the mixed audio into the muxer's AAC track before finalizing.
+          // Encode the mixed audio into the muxer's audio track before finalizing.
           if (hasAudio) {
             try {
-              await encodeAudioTrack(muxer, audioBuffer)
+              await encodeAudioTrack(muxer, audioBuffer, audioCodec)
             } catch (e) {
               console.error('[Export] Audio encode failed, finalizing video only:', e)
             }
@@ -752,30 +874,39 @@ export default function ExportModal() {
 
           muxer.finalize()
 
+          const ext = codecInfo.alpha ? 'webm' : 'mp4'
           const { buffer } = muxer.target
-          const blob = new Blob([buffer], { type: 'video/mp4' })
+          const blob = new Blob([buffer], { type: codecInfo.alpha ? 'video/webm' : 'video/mp4' })
           const url = URL.createObjectURL(blob)
 
           const link = document.createElement('a')
           const projName = useAppStore.getState().projectName || 'Untitled Project'
-          link.download = `${projName.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}.mp4`
+          link.download = `${projName.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}.${ext}`
           link.href = url
           link.click()
 
           URL.revokeObjectURL(url)
-          addToast({ message: 'Video exported successfully as seekable MP4!', type: 'success' })
+          addToast({
+            message: codecInfo.alpha
+              ? 'Exported a transparent WebM (VP9 + alpha). Chrome and Firefox show the transparency; Safari does not.'
+              : 'Video exported successfully as seekable MP4!',
+            type: 'success',
+          })
           setExportModalOpen(false)
         } else {
           addToast({ message: 'Export cancelled.', type: 'info' })
         }
       } catch (err) {
-        console.error('MP4 Export failed:', err)
+        console.error('Export failed:', err)
         addToast({ message: `Export failed: ${err.message}`, type: 'error' })
       } finally {
         // Clear the export overrides and resume the live audio analysis loop before
         // restoring the on-screen preview (so the restore render uses live values).
         renderer._timeOverride = null
         renderer._frameOverride = null
+        // Must be cleared before the restore render below, or the preview comes
+        // back with an un-premultiplied, unmasked present.
+        renderer._presentAlpha = false
         useAudioStore.getState().resetToSilence()
         try { getAudioEngine().startAnalysis(() => useAudioStore.getState()) } catch { /* ok */ }
 
@@ -912,11 +1043,21 @@ export default function ExportModal() {
               <div className="export-modal__field">
                 <label>Codec</label>
                 <select value={codec} onChange={(e) => setCodec(e.target.value)} disabled={isExporting}>
-                  <option value="mp4-h264">MP4 (H.264 / AAC)</option>
-                  <option value="webm-vp9">WebM (VP9)</option>
-                  <option value="webm-vp8">WebM (VP8)</option>
+                  {CODECS.map(c => (
+                    <option key={c.value} value={c.value}>{c.label}</option>
+                  ))}
                 </select>
               </div>
+              {/* Say plainly what alpha costs and where it works — the usual
+                  failure is someone exporting "transparent" H.264 and only
+                  finding out at the other end that no such thing exists. */}
+              {alphaExport && (
+                <div className="export-modal__hint" style={{ fontSize: 11, lineHeight: 1.5, opacity: 0.75, margin: '-4px 0 8px' }}>
+                  Transparency is preserved. Areas with no clip export as transparent
+                  rather than black. Plays with alpha in Chrome, Edge and Firefox;
+                  Safari shows black instead. VP9 encodes more slowly than H.264.
+                </div>
+              )}
               <div className="export-modal__field">
                 <label>Range</label>
                 {(() => {
@@ -958,6 +1099,21 @@ export default function ExportModal() {
                 </select>
               </div>
             </>
+          )}
+
+          {exportType === 'frame' && (
+            <div className="export-modal__field">
+              <label>Background</label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={transparentFrame}
+                  onChange={(e) => setTransparentFrame(e.target.checked)}
+                  disabled={isExporting}
+                />
+                Transparent (PNG alpha)
+              </label>
+            </div>
           )}
 
           <div className="export-modal__field">

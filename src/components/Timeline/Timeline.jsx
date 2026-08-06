@@ -4,9 +4,22 @@ import useTimelineStore from '../../store/useTimelineStore'
 import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import { IconChevronDown, IconPlus, IconLock } from '../common/Icons'
+import ContextMenu from '../common/ContextMenu'
 import { makeImageClipParams, makeTextClipParams, makeShapeClipParams, DEFAULT_GENERATOR_DURATION } from '../../utils/generatorClips'
-import { getTransitionLabel } from '../../shaders/transitionRegistry'
+import {
+  EDGE_HEAD, EDGE_TAIL, edgeLabel, getEdgeTransition, setEdgeTransitionPatch,
+  findPrevOverlap, findNextOverlap, headRegion, tailRegion,
+  edgeHasEffect, edgeDisplaySeconds,
+  transitionGraphKey, GRAPH_TYPE, isGraphType, isCompoundType, compoundIdOf,
+} from '../../utils/clipTransitions'
+import { TRANSITION_TYPES, getTransitionLabel, getTransitionDefaults } from '../../shaders/transitionRegistry'
+import { isTransitionCompound } from '../../utils/compoundUtils'
 import './Timeline.css'
+
+// Default length given to an edge with no region yet when the user assigns a
+// transition to it. Without this, picking an effect on a clip whose fade handle
+// is still at zero would appear to do nothing at all.
+const DEFAULT_EDGE_SECONDS = 1
 
 /**
  * Human-readable name for a clip transition, for the ⇄ badge tooltip.
@@ -40,6 +53,8 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const addClip = useTimelineStore(s => s.addClip)
   const splitClip = useTimelineStore(s => s.splitClip)
   const removeClip = useTimelineStore(s => s.removeClip)
+  const duplicateClip = useTimelineStore(s => s.duplicateClip)
+  const rippleDeleteClip = useTimelineStore(s => s.rippleDeleteClip)
   const timelineZoom = useTimelineStore(s => s.timelineZoom)
   const setTimelineZoom = useTimelineStore(s => s.setTimelineZoom)
   const timelineScrollLeft = useTimelineStore(s => s.timelineScrollLeft)
@@ -278,6 +293,11 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     e.stopPropagation()
     selectClip(clip.id)
 
+    // Right/middle press selects but must NOT arm a drag — otherwise the
+    // context menu opens with a live mousemove handler attached and the clip
+    // slides out from under the menu.
+    if (e.button !== 0) return
+
     const startX = e.clientX
     const originalStart = clip.timelineStart
     const duration = clip.timelineEnd - clip.timelineStart
@@ -377,6 +397,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   // Trim handle drag (left or right edge). Edge snaps to targets; Shift disables.
   const handleTrimMouseDown = useCallback((e, clip, edge) => {
     e.stopPropagation()
+    if (e.button !== 0) return // right-click belongs to the context menu
     e.preventDefault()
     selectClip(clip.id)
 
@@ -407,6 +428,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   // longer); the fade-out handle at the start of its ramp (drag left = longer).
   const handleFadeMouseDown = useCallback((e, clip, side) => {
     e.stopPropagation()
+    if (e.button !== 0) return // right-click belongs to the context menu
     e.preventDefault()
     selectClip(clip.id)
 
@@ -564,6 +586,461 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     if (!selectedClipId) return
     removeClip(selectedClipId)
   }, [selectedClipId, removeClip])
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Clip right-click menu
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // The playhead is SNAPSHOTTED into the menu state on open rather than
+  // subscribed: playheadTime changes every frame during playback, and
+  // subscribing would re-render the entire Timeline 60×/s just to keep one
+  // menu item's enabled state fresh. The menu is modal-ish and short-lived, so
+  // a snapshot is both cheaper and more predictable.
+  // `view` drives which item list the one menu renders: the clip's actions, one
+  // edge's actions, or that edge's effect picker. Re-using a single menu (the
+  // Media Pool's confirm-step pattern) rather than nesting fly-outs keeps the
+  // interaction one-handed — the pointer never has to traverse a submenu.
+  const [clipMenu, setClipMenu] = useState(null) // { x, y, clipId, playhead, view, edge }
+
+  /**
+   * Right-click on a clip. Landing inside a fade wedge opens THAT edge's menu
+   * directly — the wedge is the transition, so right-clicking it should talk
+   * about the transition, not about the clip. Anywhere else opens the clip menu.
+   */
+  const openClipMenu = useCallback((e, clip) => {
+    e.preventDefault()
+    e.stopPropagation()
+    selectClip(clip.id)
+
+    // Hit-test against the DRAWN wedges (edgeDisplaySeconds), not the raw
+    // regions — otherwise right-clicking a visible wedge whose transition is
+    // currently inert would fall through to the clip menu.
+    const all = useTimelineStore.getState().clips
+    const headSecs = edgeDisplaySeconds(clip, EDGE_HEAD, headRegion(clip, findPrevOverlap(clip, all)))
+    const tailSecs = edgeDisplaySeconds(clip, EDGE_TAIL, tailRegion(clip, findNextOverlap(clip, all)))
+    const rect = e.currentTarget.getBoundingClientRect()
+    const t = clip.timelineStart + ((e.clientX - rect.left) / Math.max(1, rect.width)) *
+      (clip.timelineEnd - clip.timelineStart)
+
+    let edge = null
+    if (headSecs > 0 && t < clip.timelineStart + headSecs) edge = EDGE_HEAD
+    else if (tailSecs > 0 && t >= clip.timelineEnd - tailSecs) edge = EDGE_TAIL
+
+    setClipMenu({
+      x: e.clientX,
+      y: e.clientY,
+      clipId: clip.id,
+      playhead: useAppStore.getState().playheadTime,
+      view: edge ? 'edge' : 'clip',
+      edge: edge || EDGE_HEAD,
+    })
+  }, [selectClip])
+
+  const closeClipMenu = useCallback(() => setClipMenu(null), [])
+  const setMenuView = useCallback((view, edge) => {
+    setClipMenu(m => (m ? { ...m, view, edge: edge || m.edge } : m))
+  }, [])
+
+  // Duplicate: the copy needs its own deep-copied effect graph (same reasoning
+  // as split) — otherwise the two clips would share one graph object.
+  const handleDuplicateClip = useCallback((clip) => {
+    const newId = duplicateClip(clip.id)
+    if (!newId) return
+    useGraphStore.getState().duplicateClipGraph(
+      clip.id, newId,
+      clip.filename || 'Clip',
+      clip.fileType === 'audio' ? 'audio' : 'video'
+    )
+    selectClip(newId)
+  }, [duplicateClip, selectClip])
+
+  // Split at an explicit time (the menu's snapshotted playhead), so the result
+  // matches what the user saw when they opened the menu.
+  const handleSplitClipAt = useCallback((clip, time) => {
+    const rightId = splitClip(clip.id, time)
+    if (rightId) {
+      useGraphStore.getState().duplicateClipGraph(
+        clip.id, rightId,
+        clip.filename || 'Clip',
+        clip.fileType === 'audio' ? 'audio' : 'video'
+      )
+    }
+  }, [splitClip])
+
+  const handleRemoveClip = useCallback((clipId, ripple) => {
+    if (ripple) rippleDeleteClip(clipId)
+    else removeClip(clipId)
+    // Drop the orphaned graph too — the Media Pool derives its Images tab by
+    // scanning clip graphs, so a lingering one resurrects deleted cards.
+    useGraphStore.getState().removeClipGraph(clipId)
+  }, [removeClip, rippleDeleteClip])
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Edge transitions (the fade wedges)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** The live region for one edge, recomputed from current clip positions. */
+  const edgeRegionOf = useCallback((clip, edge) => {
+    const all = useTimelineStore.getState().clips
+    return edge === EDGE_TAIL
+      ? tailRegion(clip, findNextOverlap(clip, all))
+      : headRegion(clip, findPrevOverlap(clip, all))
+  }, [])
+
+  /**
+   * Assign an effect to one edge. Two things have to happen together or the
+   * result looks broken: the region needs a non-zero length (assigning a
+   * transition to an edge whose handle is still at 0 would otherwise be a
+   * no-op), and a 'graph' type needs its graph to exist before the renderer
+   * looks for it.
+   */
+  const setEdgeType = useCallback((clip, edge, type) => {
+    const patch = {}
+
+    // Give the edge a default length if it has none. A head region backed by an
+    // overlap already has its length from the overlap, so it's left alone.
+    const region = edgeRegionOf(clip, edge)
+    if (!region) {
+      const maxLen = Math.max(0.1, (clip.timelineEnd - clip.timelineStart) / 2)
+      const len = Math.min(DEFAULT_EDGE_SECONDS, maxLen)
+      patch[edge === EDGE_TAIL ? 'fadeOut' : 'fadeIn'] = len
+    }
+
+    if (!type) {
+      // "Fade" — hand the window back to the plain opacity ramp. The private
+      // graph is deliberately kept: switching effects to compare them shouldn't
+      // throw away a graph the user built.
+      Object.assign(patch, setEdgeTransitionPatch(edge, null))
+      updateClip(clip.id, patch)
+      return
+    }
+
+    if (isGraphType(type)) {
+      const key = transitionGraphKey(clip.id, edge)
+      if (!useGraphStore.getState().clipGraphs[key]) {
+        // Seed from the compound this edge was already using, if any, so
+        // "Crossfade → Node Graph" opens on the thing you were just looking at.
+        const prev = getEdgeTransition(clip, edge)
+        const seed = isCompoundType(prev?.type)
+          ? compoundLibrary.find(c => c.id === compoundIdOf(prev.type))?.subGraph
+          : null
+        useGraphStore.getState().initTransitionGraph(clip.id, edge, seed || null)
+      }
+      Object.assign(patch, setEdgeTransitionPatch(edge, { type: GRAPH_TYPE, params: {} }))
+    } else {
+      // Built-ins start from their registry defaults; compounds start empty —
+      // the library entry's exposedParams carry their own defaults.
+      const params = isCompoundType(type) ? {} : getTransitionDefaults(type)
+      Object.assign(patch, setEdgeTransitionPatch(edge, { type, params }))
+    }
+
+    updateClip(clip.id, patch)
+  }, [updateClip, edgeRegionOf, compoundLibrary])
+
+  /** Open this edge's node graph in the editor, converting to one if needed. */
+  const openEdgeGraph = useCallback((clip, edge) => {
+    const tr = getEdgeTransition(clip, edge)
+    if (!isGraphType(tr?.type)) setEdgeType(clip, edge, GRAPH_TYPE)
+
+    // Park the playhead mid-region so the editor opens on the transition
+    // half-way through — the frame where you can actually see what it does.
+    // Read the region AFTER setEdgeType, which may have just created it.
+    const clipNow = useTimelineStore.getState().clips.find(c => c.id === clip.id) || clip
+    const region = edgeRegionOf(clipNow, edge)
+    if (region) setPlayheadTime(region.start + region.dur * 0.5)
+
+    enterClipGraph(transitionGraphKey(clip.id, edge))
+  }, [setEdgeType, edgeRegionOf, enterClipGraph, setPlayheadTime])
+
+  /** Clear the edge entirely: no effect, no ramp, no graph. */
+  const clearEdge = useCallback((clip, edge) => {
+    updateClip(clip.id, {
+      ...setEdgeTransitionPatch(edge, null),
+      [edge === EDGE_TAIL ? 'fadeOut' : 'fadeIn']: 0,
+    })
+    useGraphStore.getState().removeTransitionGraph(clip.id, edge)
+  }, [updateClip])
+
+  const promoteEdgeGraph = useCallback((clip, edge) => {
+    const name = `${clip.filename || 'Clip'} ${edgeLabel(edge)}`
+    useGraphStore.getState().promoteTransitionGraph(clip.id, edge, name)
+  }, [])
+
+  // Built fresh each render from live clip state, so a toggle (Reverse, Mute)
+  // updates its own ✓ without closing the menu.
+  const menuClip = clipMenu ? clips.find(c => c.id === clipMenu.clipId) : null
+  // Library compounds usable as a transition (≥ 2 image inputs to bind FROM/TO).
+  const transitionCompounds = compoundLibrary.filter(isTransitionCompound)
+
+  /** Human name for whatever effect an edge currently carries. */
+  const edgeEffectLabel = (clip, edge) => {
+    const tr = getEdgeTransition(clip, edge)
+    if (!tr?.type) return 'Fade (opacity ramp)'
+    if (isGraphType(tr.type)) return 'Node Graph (this clip)'
+    if (isCompoundType(tr.type)) {
+      return compoundLibrary.find(c => c.id === compoundIdOf(tr.type))?.name || 'Missing compound'
+    }
+    return getTransitionLabel(tr.type)
+  }
+
+  // ── Menu view: one edge's actions ──
+  const edgeMenuItems = (clip, edge) => {
+    const tr = getEdgeTransition(clip, edge)
+    const region = edgeRegionOf(clip, edge)
+    const isGraph = isGraphType(tr?.type)
+    const hasGraph = !!clipGraphs[transitionGraphKey(clip.id, edge)]
+    const items = []
+
+    if (!region) {
+      items.push({
+        label: 'No region yet',
+        icon: '◺',
+        disabled: true,
+        hint: edge === EDGE_TAIL
+          ? 'Drag the right fade handle (or pick an effect below — one will be created)'
+          : 'Overlap the previous clip, drag the left fade handle, or pick an effect below',
+      })
+    } else if (region.mode === 'crossfade') {
+      items.push({
+        label: `Crossfade with “${region.prev.filename}”`,
+        icon: '⇄',
+        disabled: true,
+        hint: 'The overlap between the two clips sets this transition’s length — drag either clip to change it',
+      })
+    } else {
+      items.push({
+        label: edge === EDGE_TAIL ? 'Out to nothing' : 'In from nothing',
+        icon: '◺',
+        disabled: true,
+        hint: 'Mixes with whatever is behind this clip — lower tracks, else black',
+      })
+    }
+    items.push({ separator: true })
+
+    items.push({
+      label: `Effect: ${edgeEffectLabel(clip, edge)}`,
+      icon: '⇄',
+      hint: 'Choose what plays across this region',
+      keepOpen: true, // switches this menu to the picker rather than dismissing
+      onSelect: () => setMenuView('edgeType', edge),
+    })
+    items.push({
+      label: isGraph ? 'Open Node Graph' : (hasGraph ? 'Back to Node Graph' : 'Convert to Node Graph'),
+      icon: '❖',
+      hint: 'Build this transition from nodes — FROM and TO are wired in, Transition Progress drives it',
+      onSelect: () => openEdgeGraph(clip, edge),
+    })
+    if (isGraph) {
+      items.push({
+        label: 'Save to Library',
+        icon: '⇪',
+        hint: 'Publish a copy other clips can use. This clip keeps its own editable version.',
+        onSelect: () => promoteEdgeGraph(clip, edge),
+      })
+    }
+    items.push({ separator: true })
+
+    if (tr?.type) {
+      items.push({
+        label: 'Remove Effect',
+        icon: '↺',
+        hint: 'Keep the region, hand it back to the plain opacity ramp',
+        onSelect: () => setEdgeType(clip, edge, null),
+      })
+    }
+    items.push({
+      label: 'Clear This Edge',
+      icon: '✕',
+      danger: true,
+      hint: 'Remove the effect and collapse the region to zero',
+      onSelect: () => clearEdge(clip, edge),
+    })
+    items.push({ separator: true })
+    items.push({
+      label: `Other edge: ${edgeLabel(edge === EDGE_TAIL ? EDGE_HEAD : EDGE_TAIL)}`,
+      icon: '⇥',
+      onSelect: () => setMenuView('edge', edge === EDGE_TAIL ? EDGE_HEAD : EDGE_TAIL),
+      keepOpen: true,
+    })
+    items.push({
+      label: 'Clip Actions…',
+      icon: '☰',
+      onSelect: () => setMenuView('clip'),
+      keepOpen: true,
+    })
+    return items
+  }
+
+  // ── Menu view: effect picker for one edge ──
+  const edgeTypeMenuItems = (clip, edge) => {
+    const current = getEdgeTransition(clip, edge)?.type || null
+    const items = [{
+      label: 'Fade (opacity ramp)',
+      icon: '◺',
+      checked: !current,
+      hint: 'The default — a straight linear ramp across the region',
+      onSelect: () => setEdgeType(clip, edge, null),
+    }, { separator: true }]
+
+    for (const t of TRANSITION_TYPES) {
+      items.push({
+        label: getTransitionLabel(t),
+        icon: '⇄',
+        checked: current === t,
+        onSelect: () => setEdgeType(clip, edge, t),
+      })
+    }
+
+    items.push({ separator: true })
+    items.push({
+      label: 'Node Graph (this clip)',
+      icon: '❖',
+      checked: isGraphType(current),
+      hint: 'A graph owned by this clip edge — edit it without touching anything else',
+      onSelect: () => openEdgeGraph(clip, edge),
+    })
+    for (const c of transitionCompounds) {
+      items.push({
+        label: c.name,
+        icon: '❖',
+        checked: current === `compound:${c.id}`,
+        hint: c.description || 'Shared transition from the compound library',
+        onSelect: () => setEdgeType(clip, edge, `compound:${c.id}`),
+      })
+    }
+    return items
+  }
+
+  // ── Menu view: the clip's own actions ──
+  const clipActionItems = (clip, playhead) => {
+    const isMedia = clip.fileType === 'video' || clip.fileType === 'audio' // file-backed, seekable
+    const hasAudio = isMedia
+    const canSplit = playhead > clip.timelineStart + 0.001 && playhead < clip.timelineEnd - 0.001
+    const items = []
+
+    if (isMedia) {
+      items.push({
+        label: 'Reverse Clip',
+        icon: '◀',
+        checked: !!clip.reversed,
+        keepOpen: true,
+        hint: clip.reversed
+          ? 'Play forwards again'
+          : 'Play this clip backwards. Preview is seek-driven and silent; the export renders reversed audio.',
+        onSelect: () => updateClip(clip.id, { reversed: !clip.reversed }),
+      })
+    }
+    if ((clip.speed || 1) !== 1) {
+      items.push({
+        label: 'Reset Speed to 1×',
+        icon: '⏱',
+        onSelect: () => updateClip(clip.id, { speed: 1 }),
+      })
+    }
+    if (items.length) items.push({ separator: true })
+
+    items.push({
+      label: 'Split at Playhead',
+      icon: '⑂',
+      shortcut: 'S',
+      disabled: !canSplit,
+      hint: canSplit ? '' : 'Move the playhead inside this clip first',
+      onSelect: () => handleSplitClipAt(clip, playhead),
+    })
+    items.push({
+      label: 'Duplicate',
+      icon: '⧉',
+      hint: 'Copy the clip (and its effect graph) directly after it',
+      onSelect: () => handleDuplicateClip(clip),
+    })
+    items.push({ separator: true })
+
+    items.push({
+      label: 'Open Effects Graph',
+      icon: '❖',
+      hint: 'Same as double-clicking the clip',
+      onSelect: () => { enterClipGraph(clip.id); setPlayheadTime(clip.timelineStart) },
+    })
+    if (hasAudio) {
+      items.push({
+        label: 'Mute Clip Audio',
+        icon: '♪',
+        checked: !!clip.audioMuted,
+        keepOpen: true,
+        onSelect: () => updateClip(clip.id, { audioMuted: !clip.audioMuted }),
+      })
+    }
+    items.push({ separator: true })
+
+    // The two edges, each showing what it currently carries. Right-clicking the
+    // wedge itself lands on the same view — this is the discoverable route in.
+    for (const edge of [EDGE_HEAD, EDGE_TAIL]) {
+      items.push({
+        label: `${edgeLabel(edge)}: ${edgeEffectLabel(clip, edge)}`,
+        icon: edge === EDGE_TAIL ? '◹' : '◺',
+        hint: 'Or right-click the fade wedge on the clip itself',
+        onSelect: () => setMenuView('edge', edge),
+        keepOpen: true,
+      })
+    }
+    if ((clip.fadeIn || 0) > 0 || (clip.fadeOut || 0) > 0) {
+      items.push({
+        label: 'Clear Both Edges',
+        icon: '✕',
+        hint: 'Zero both regions and drop their effects',
+        onSelect: () => { clearEdge(clip, EDGE_HEAD); clearEdge(clip, EDGE_TAIL) },
+      })
+    }
+    items.push({ separator: true })
+
+    items.push({
+      label: 'Set In/Out to Clip',
+      icon: '⇥',
+      hint: 'Scope playback and range exports to this clip',
+      onSelect: () => { setInPoint(clip.timelineStart); setOutPoint(clip.timelineEnd) },
+    })
+    items.push({
+      label: 'Playhead to Clip Start',
+      icon: '↦',
+      onSelect: () => setPlayheadTime(clip.timelineStart),
+    })
+    items.push({ separator: true })
+
+    items.push({
+      label: 'Delete',
+      icon: '✕',
+      shortcut: 'Del',
+      danger: true,
+      onSelect: () => handleRemoveClip(clip.id, false),
+    })
+    items.push({
+      label: 'Ripple Delete',
+      icon: '⇤',
+      danger: true,
+      hint: 'Delete and pull later clips on this track back to close the gap',
+      onSelect: () => handleRemoveClip(clip.id, true),
+    })
+
+    return items
+  }
+
+  const clipMenuItems = (() => {
+    if (!menuClip) return []
+    if (clipMenu.view === 'edge') return edgeMenuItems(menuClip, clipMenu.edge)
+    if (clipMenu.view === 'edgeType') return edgeTypeMenuItems(menuClip, clipMenu.edge)
+    return clipActionItems(menuClip, clipMenu.playhead)
+  })()
+
+  const clipMenuHeader = (() => {
+    if (!menuClip) return ''
+    const name = menuClip.filename || 'Clip'
+    if (clipMenu.view === 'edge') {
+      const r = edgeRegionOf(menuClip, clipMenu.edge)
+      return `${edgeLabel(clipMenu.edge)} — ${r ? `${r.dur.toFixed(2)}s` : 'no region'} · ${name}`
+    }
+    if (clipMenu.view === 'edgeType') return `${edgeLabel(clipMenu.edge)} effect · ${name}`
+    return name
+  })()
 
   // Keyboard shortcuts for timeline
   useEffect(() => {
@@ -836,8 +1313,16 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                         // compositor's opacity ramp applies to all of them.
                         const isVideoClip = clip.fileType === 'video' || clip.fileType === 'camera' || clip.fileType === 'screen'
                         const supportsFades = isVideoClip || clip.fileType === 'image' || clip.fileType === 'text' || clip.fileType === 'shape'
-                        const fadeInW = Math.min(width, (clip.fadeIn || 0) * pxPerSec)
-                        const fadeOutW = Math.min(width, (clip.fadeOut || 0) * pxPerSec)
+                        // Wedge lengths come from edgeDisplaySeconds, which
+                        // resolves the region-vs-ramp question the same way the
+                        // compositor does — so the wedge is always exactly the
+                        // window that will actually be processed.
+                        const headR = supportsFades ? headRegion(clip, findPrevOverlap(clip, clips)) : null
+                        const tailR = supportsFades ? tailRegion(clip, findNextOverlap(clip, clips)) : null
+                        const headFx = supportsFades && edgeHasEffect(clip, EDGE_HEAD, headR)
+                        const tailFx = supportsFades && edgeHasEffect(clip, EDGE_TAIL, tailR)
+                        const fadeInW = Math.min(width, edgeDisplaySeconds(clip, EDGE_HEAD, headR) * pxPerSec)
+                        const fadeOutW = Math.min(width, edgeDisplaySeconds(clip, EDGE_TAIL, tailR) * pxPerSec)
                         return (
                           <div
                             key={clip.id}
@@ -849,6 +1334,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                               borderColor: `${track.color}55`,
                             }}
                             onMouseDown={(e) => handleClipMouseDown(e, clip)}
+                            onContextMenu={(e) => openClipMenu(e, clip)}
                             onDoubleClick={() => {
                               enterClipGraph(clip.id)
                               setPlayheadTime(clip.timelineStart)
@@ -874,51 +1360,76 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                                 style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: 0.35, pointerEvents: 'none', borderRadius: 'inherit' }}
                               />
                             )}
-                            {/* Fade ramps: shaded wedge = attenuated region, diagonal = the opacity ramp */}
-                            {supportsFades && fadeInW > 1 && (
+                            {/* Edge regions. Plain ramp = shaded wedge + diagonal.
+                                A region owned by a transition is tinted and drops
+                                the diagonal (the ramp isn't what's happening any
+                                more) and names its effect, so you can read the
+                                whole edge model straight off the timeline. */}
+                            {fadeInW > 1 && (
                               <svg
-                                className="timeline__clip-fade"
+                                className={`timeline__clip-fade ${headFx ? 'timeline__clip-fade--transition' : ''}`}
                                 style={{ left: 0, width: fadeInW }}
                                 viewBox="0 0 1 1"
                                 preserveAspectRatio="none"
                               >
                                 <polygon points="0,0 1,0 0,1" />
-                                <line x1="0" y1="1" x2="1" y2="0" vectorEffect="non-scaling-stroke" />
+                                {!headFx && <line x1="0" y1="1" x2="1" y2="0" vectorEffect="non-scaling-stroke" />}
                               </svg>
                             )}
-                            {supportsFades && fadeOutW > 1 && (
+                            {fadeOutW > 1 && (
                               <svg
-                                className="timeline__clip-fade"
+                                className={`timeline__clip-fade ${tailFx ? 'timeline__clip-fade--transition' : ''}`}
                                 style={{ right: 0, width: fadeOutW }}
                                 viewBox="0 0 1 1"
                                 preserveAspectRatio="none"
                               >
                                 <polygon points="0,0 1,0 1,1" />
-                                <line x1="0" y1="0" x2="1" y2="1" vectorEffect="non-scaling-stroke" />
+                                {!tailFx && <line x1="0" y1="0" x2="1" y2="1" vectorEffect="non-scaling-stroke" />}
                               </svg>
                             )}
-                            {/* Fade handles (visible on hover/selection) */}
+                            {headFx && fadeInW > 34 && (
+                              <div className="timeline__clip-edge-label" style={{ left: 3, maxWidth: fadeInW - 6 }}>
+                                {edgeEffectLabel(clip, EDGE_HEAD)}
+                              </div>
+                            )}
+                            {tailFx && fadeOutW > 34 && (
+                              <div className="timeline__clip-edge-label" style={{ right: 3, maxWidth: fadeOutW - 6, textAlign: 'right' }}>
+                                {edgeEffectLabel(clip, EDGE_TAIL)}
+                              </div>
+                            )}
+                            {/* Region handles (visible on hover/selection). The
+                                head handle is hidden only while a CROSSFADE is
+                                actually running there: the overlap sets that
+                                length, so a handle editing fadeIn would move
+                                nothing visible and read as broken. Move either
+                                clip to retime a crossfade. */}
                             {supportsFades && width > 24 && (
                               <>
-                                <div
-                                  className="timeline__clip-fade-handle"
-                                  style={{ left: Math.max(1, Math.min(width - 11, fadeInW - 5)) }}
-                                  onMouseDown={(e) => handleFadeMouseDown(e, clip, 'in')}
-                                  title={clip.transition?.type
-                                    ? `Transition in: ${(clip.fadeIn || 0).toFixed(2)}s — drag to set the duration`
-                                    : `Fade in: ${(clip.fadeIn || 0).toFixed(2)}s — drag`}
-                                />
+                                {!(headFx && headR?.mode === 'crossfade') && (
+                                  <div
+                                    className="timeline__clip-fade-handle"
+                                    style={{ left: Math.max(1, Math.min(width - 11, fadeInW - 5)) }}
+                                    onMouseDown={(e) => handleFadeMouseDown(e, clip, 'in')}
+                                    title={`Transition in: ${(clip.fadeIn || 0).toFixed(2)}s (${edgeEffectLabel(clip, EDGE_HEAD)}) — drag to retime, right-click the wedge to change the effect`}
+                                  />
+                                )}
                                 <div
                                   className="timeline__clip-fade-handle"
                                   style={{ left: Math.max(1, Math.min(width - 11, width - fadeOutW - 5)) }}
                                   onMouseDown={(e) => handleFadeMouseDown(e, clip, 'out')}
-                                  title={clip.transitionOut?.type
-                                    ? `Transition out: ${(clip.fadeOut || 0).toFixed(2)}s — drag to set the duration`
-                                    : `Fade out: ${(clip.fadeOut || 0).toFixed(2)}s — drag`}
+                                  title={`Transition out: ${(clip.fadeOut || 0).toFixed(2)}s (${edgeEffectLabel(clip, EDGE_TAIL)}) — drag to retime, right-click the wedge to change the effect`}
                                 />
                               </>
                             )}
                             <div className="timeline__clip-header" style={{ backgroundColor: `${track.color}33` }}>
+                              {clip.reversed && (
+                                <span
+                                  className="timeline__clip-reversed"
+                                  title="Reversed — plays the source backwards (preview audio is silent; the export renders reversed audio)"
+                                >
+                                  ◀
+                                </span>
+                              )}
                               <span className="timeline__clip-name">{clip.filename}</span>
                               {clip.speed && clip.speed !== 1 && (
                                 <span className="timeline__clip-speed mono">{clip.speed.toFixed(1)}×</span>
@@ -931,19 +1442,11 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                             {(hasGraph || clip.hasEffects) && (
                               <div className="timeline__clip-fx-badge" style={{ color: track.color }}>FX</div>
                             )}
-                            {/* ⇄ marks the end that carries a transition. In sits
-                                left, out sits right, so a clip that blends in AND
-                                out reads at a glance. */}
-                            {clip.transition?.type && (
+                            {/* Fallback marker for wedges too narrow to fit a label. */}
+                            {((headFx && fadeInW <= 34) || (tailFx && fadeOutW <= 34)) && (
                               <div
-                                className="timeline__clip-transition-badge timeline__clip-transition-badge--in"
-                                title={`Transition in: ${transitionBadgeLabel(clip.transition.type, compoundLibrary)} — plays over the overlap with the previous clip, or over the fade-in handle when there is none`}
-                              >⇄</div>
-                            )}
-                            {clip.transitionOut?.type && (
-                              <div
-                                className="timeline__clip-transition-badge timeline__clip-transition-badge--out"
-                                title={`Transition out: ${transitionBadgeLabel(clip.transitionOut.type, compoundLibrary)} — plays over the fade-out handle`}
+                                className="timeline__clip-transition-badge"
+                                title={`Edge transitions — in: ${edgeEffectLabel(clip, EDGE_HEAD)}, out: ${edgeEffectLabel(clip, EDGE_TAIL)}`}
                               >⇄</div>
                             )}
                             {clip.audioMuted && (
@@ -985,6 +1488,16 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
           </div>
         </div>
       )}
+
+      {clipMenu && menuClip && (
+        <ContextMenu
+          x={clipMenu.x}
+          y={clipMenu.y}
+          header={clipMenuHeader}
+          items={clipMenuItems}
+          onClose={closeClipMenu}
+        />
+      )}
     </>
   )
 }
@@ -1016,13 +1529,17 @@ function ClipWaveform({ clip, width, color }) {
     const srcSpan = Math.max(0.001, srcEnd - srcStart)
     const mid = h / 2
     for (let x = 0; x < w; x += 2) {
-      const t = srcStart + (x / w) * srcSpan
+      // Reversed clips read the source tail-first, so the drawn waveform has to
+      // mirror too — otherwise the peaks wouldn't line up with what you hear.
+      const t = clip.reversed
+        ? srcEnd - (x / w) * srcSpan
+        : srcStart + (x / w) * srcSpan
       const bucket = Math.min(peaks.length - 1, Math.floor((t / duration) * peaks.length))
       const p = peaks[bucket] || 0
       const barH = Math.max(1, p * (h - 2))
       ctx.fillRect(x, mid - barH / 2, 1.5, barH)
     }
-  }, [wf, width, color, clip.sourceStart, clip.sourceEnd])
+  }, [wf, width, color, clip.sourceStart, clip.sourceEnd, clip.reversed])
 
   if (!wf) return null
   return <canvas ref={canvasRef} className="timeline__clip-waveform-canvas" />

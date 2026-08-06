@@ -143,22 +143,25 @@ const useTimelineStore = create((set, get) => ({
       sourceStart: clipData.sourceStart || 0,
       sourceEnd: clipData.sourceEnd || 10,
       speed: 1.0,
+      // Play the source backwards: sourceEnd → sourceStart across the clip's
+      // timeline span. Purely a source-time mapping (see getClipSourceTime), so
+      // trimming/moving/splitting keep working unchanged.
+      reversed: false,
       opacity: 1.0,
       volume: 1.0,       // clip audio gain (0..1); multiplied by fades/transitions
       audioMuted: false, // hard-mute this clip's own audio (video sound, etc.)
       // 'Inherit' = use the track's blend mode; any concrete name (incl. 'Normal') overrides it.
       blendMode: 'Inherit',
-      fadeIn: 0,  // seconds of linear opacity ramp at the clip's start
-      fadeOut: 0, // seconds of linear opacity ramp at the clip's end
-      // Transition-in: { type, params } from transitionRegistry (or
-      // "compound:<libId>" for a node-graph one). Plays across the overlap with
-      // the previous clip on the track; with no overlap it plays across the
-      // `fadeIn` handle instead, transitioning in FROM whatever is underneath
-      // (the lower tracks, or nothing at all). null = hard cut/blend.
-      transition: null,
-      // Transition-out: same shape, played across the `fadeOut` handle at the
-      // clip's end — the clip transitions away TO whatever is underneath. Kept
-      // as its own field so a clip can blend in and out differently.
+      // Edge regions. fadeIn/fadeOut are the region LENGTHS in seconds and, on
+      // their own, a plain linear opacity ramp. Give the matching edge a
+      // transition and that shader/graph owns the window instead — same handle,
+      // same duration, richer effect (see utils/clipTransitions.js).
+      fadeIn: 0,
+      fadeOut: 0,
+      // { type, params } | null. transitionIn plays across the overlap with the
+      // previous clip when there is one, otherwise across fadeIn from nothing;
+      // transitionOut plays across fadeOut, out to whatever is behind the clip.
+      transitionIn: null,
       transitionOut: null,
       // Pan / zoom / rotate framing, keyed by the TRANSFORM shader's uniforms
       // ({ u_xf_zoom, u_xf_pan_x, … } — see utils/clipTransform.js). null means
@@ -263,29 +266,88 @@ const useTimelineStore = create((set, get) => ({
     if (splitTime <= clip.timelineStart || splitTime >= clip.timelineEnd) return
 
     const rightId = `clip_${Date.now()}_${++clipCounter}`
-    const splitSourceTime = clip.sourceStart + (splitTime - clip.timelineStart) * clip.speed
+    const elapsed = (splitTime - clip.timelineStart) * clip.speed
+    // A reversed clip walks the source backwards, so the cut lands the OTHER way
+    // round: the left half plays sourceEnd → split, the right half split →
+    // sourceStart. Getting this wrong silently swaps the two halves' content.
+    const splitSourceTime = clip.reversed
+      ? clip.sourceEnd - elapsed
+      : clip.sourceStart + elapsed
 
     set((state) => ({
       clips: state.clips.map(c => {
         if (c.id !== clipId) return c
-        // Fades belong to the outer edges: the left half keeps the fade-in and
-        // loses the fade-out (the cut is now its end), and vice versa — so a
-        // split doesn't introduce a dip at the cut point. Transitions follow
-        // their fade handle, since that handle is what times them.
-        return { ...c, timelineEnd: splitTime, sourceEnd: splitSourceTime, fadeOut: 0, transitionOut: null }
+        // Edges belong to the OUTER boundaries: the left half keeps the head
+        // region and loses the tail (the cut is now its end), the right half
+        // vice versa — so a split doesn't introduce a dip, or replay a
+        // transition, at the cut point.
+        const left = { timelineEnd: splitTime, fadeOut: 0, transitionOut: null }
+        return c.reversed
+          ? { ...c, ...left, sourceStart: splitSourceTime }
+          : { ...c, ...left, sourceEnd: splitSourceTime }
       }).concat({
         ...clip,
         id: rightId,
         timelineStart: splitTime,
-        sourceStart: splitSourceTime,
+        ...(clip.reversed ? { sourceEnd: splitSourceTime } : { sourceStart: splitSourceTime }),
         fadeIn: 0,
-        // The right half starts at a hard cut — a transition-in belongs to the
-        // original clip's start, so it stays with the left half only.
-        transition: null,
+        transitionIn: null,
+        transition: null, // legacy field — never let a stale copy resurrect
       }),
     }))
 
     return rightId
+  },
+
+  /**
+   * Duplicate a clip, dropping the copy immediately after the original on the
+   * same track (the NLE convention — no overlap, no hunting for a free slot).
+   * Returns the new id so the caller can clone the clip's effect graph too.
+   */
+  duplicateClip: (clipId) => {
+    const clip = get().clips.find(c => c.id === clipId)
+    if (!clip) return null
+    const newId = `clip_${Date.now()}_${++clipCounter}`
+    const duration = clip.timelineEnd - clip.timelineStart
+
+    set((state) => ({
+      clips: [...state.clips, {
+        ...clip,
+        id: newId,
+        timelineStart: clip.timelineEnd,
+        timelineEnd: clip.timelineEnd + duration,
+        // The copy butts up against the original, so it starts on a hard cut —
+        // a head transition here would play over its own source clip. The tail
+        // is still the sequence's outer edge, so it comes along.
+        transitionIn: null,
+        transition: null,
+      }],
+    }))
+
+    return newId
+  },
+
+  /**
+   * Ripple delete: remove a clip and close the gap by pulling every LATER clip
+   * on the same track back by its duration. Only that track shifts, matching
+   * Premiere/Resolve's per-track ripple (a global ripple would desync other
+   * tracks against the audio).
+   */
+  rippleDeleteClip: (clipId) => {
+    const clip = get().clips.find(c => c.id === clipId)
+    if (!clip) return
+    const duration = clip.timelineEnd - clip.timelineStart
+
+    set((state) => ({
+      clips: state.clips
+        .filter(c => c.id !== clipId)
+        .map(c => (
+          c.trackId === clip.trackId && c.timelineStart >= clip.timelineEnd
+            ? { ...c, timelineStart: c.timelineStart - duration, timelineEnd: c.timelineEnd - duration }
+            : c
+        )),
+      keyframes: state.keyframes.filter(k => k.clipId !== clipId),
+    }))
   },
 
   /**

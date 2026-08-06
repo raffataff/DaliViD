@@ -108,6 +108,14 @@ export class TextureManager {
 
     // HTML elements are top-down, WebGL expects bottom-up
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true)
+    // Ask for STRAIGHT (unassociated) alpha. This was previously left at
+    // whatever the context default happened to be, which only ever mattered
+    // once alpha video became a supported source — an opaque frame is identical
+    // either way. Setting it explicitly makes the upload deterministic; how the
+    // resulting values are INTERPRETED is then decided per clip by the alpha
+    // pass in Renderer._renderClipToFBO (see utils/alphaModes), because browsers
+    // do not agree on whether they honour this hint for <video>.
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
 
     if (entry.width === sourceWidth && entry.height === sourceHeight) {
       gl.texSubImage2D(
@@ -126,6 +134,7 @@ export class TextureManager {
 
     // Reset state
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
 
     entry.lastUsed = this.frameCounter
   }

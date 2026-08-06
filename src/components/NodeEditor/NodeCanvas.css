@@ -95,6 +95,16 @@
 }
 
 /* ── Master FX preview toggle (clip graph only) ── */
+/* Static hint shown in place of the Master FX toggle while editing a transition
+   graph (which always previews through the full pipeline). */
+.node-canvas__transition-hint {
+  margin-right: var(--space-xs);
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-secondary, #9aa);
+  white-space: nowrap;
+}
+
 .node-canvas__masterfx-toggle {
   margin-right: var(--space-xs);
   padding: 2px 8px;

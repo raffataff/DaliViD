@@ -73,6 +73,27 @@
   white-space: nowrap;
 }
 
+/* Right-aligned key hint. Dimmed and non-interactive — it's a label, not a
+   second action, and it must never win the eye over the item name. */
+.ctx-menu__shortcut {
+  flex-shrink: 0;
+  padding-left: var(--space-sm);
+  font-size: 10px;
+  color: var(--text-disabled);
+}
+.ctx-menu__item:hover .ctx-menu__shortcut { color: var(--text-secondary); }
+
+/* Active toggle: tinted row + ✓, so state reads at a glance without the item's
+   own icon (and therefore its identity) changing when you flip it. */
+.ctx-menu__item--checked { color: var(--accent-cyan); }
+.ctx-menu__item--checked:hover { color: var(--accent-cyan); }
+.ctx-menu__check {
+  flex-shrink: 0;
+  padding-left: var(--space-xs);
+  font-size: 11px;
+  color: var(--accent-cyan);
+}
+
 .ctx-menu__item--danger { color: #ff5566; }
 .ctx-menu__item--danger:hover {
   background: rgba(255, 85, 102, 0.12);

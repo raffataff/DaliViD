@@ -34,6 +34,10 @@ export default function Toolbar() {
   const masterBars = useAppStore(s => s.masterBars)
   const toggleMasterBars = useAppStore(s => s.toggleMasterBars)
   const setMasterBars = useAppStore(s => s.setMasterBars)
+  const previewBackdrop = useAppStore(s => s.previewBackdrop)
+  const cyclePreviewBackdrop = useAppStore(s => s.cyclePreviewBackdrop)
+  const previewAlphaView = useAppStore(s => s.previewAlphaView)
+  const togglePreviewAlphaView = useAppStore(s => s.togglePreviewAlphaView)
 
   const projectName = useAppStore(s => s.projectName)
 
@@ -311,6 +315,37 @@ export default function Toolbar() {
             ))}
           </select>
         )}
+
+        {/* Transparency display. Black is the delivery-accurate default; the
+            checkerboard is how you tell "this area is a hole" from "this area
+            is black picture", which is otherwise unknowable by looking. The
+            matte view (α) shows the alpha channel itself. Both are view-only —
+            neither affects the render or the export. */}
+        <button
+          className={`toolbar__toggle-btn ${previewBackdrop !== 'black' ? 'toolbar__toggle-btn--active' : ''}`}
+          onClick={cyclePreviewBackdrop}
+          data-tooltip={`Transparency backdrop: ${previewBackdrop} — click for ${
+            previewBackdrop === 'black' ? 'checkerboard' : previewBackdrop === 'checker' ? 'white' : 'black'
+          }`}
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <rect x="1" y="1" width="12" height="12" rx="1.5" />
+            <rect x="1" y="1" width="6" height="6" fill="currentColor" stroke="none" opacity="0.75" />
+            <rect x="7" y="7" width="6" height="6" fill="currentColor" stroke="none" opacity="0.75" />
+          </svg>
+        </button>
+
+        <button
+          className={`toolbar__toggle-btn ${previewAlphaView ? 'toolbar__toggle-btn--active toolbar__toggle-btn--cyan' : ''}`}
+          onClick={togglePreviewAlphaView}
+          data-tooltip={previewAlphaView
+            ? 'Alpha matte view ON — showing the alpha channel, not the picture'
+            : 'View alpha channel as a matte (white = opaque)'}
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3">
+            <path d="M8.6 4.2v5.6M8.6 5.6a2.6 2.6 0 1 0 0 2.8" strokeLinecap="round" />
+          </svg>
+        </button>
 
         <button
           className={`toolbar__toggle-btn ${audioReactiveEnabled ? 'toolbar__toggle-btn--active toolbar__toggle-btn--cyan' : ''}`}

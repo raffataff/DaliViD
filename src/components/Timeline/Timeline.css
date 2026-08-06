@@ -544,6 +544,26 @@
   stroke: rgba(255, 255, 255, 0.45);
   stroke-width: 1;
 }
+/* A region owned by a transition reads as cyan rather than a plain shadow, so
+   "this window has an effect on it" is visible at a glance without hovering. */
+.timeline__clip-fade--transition {
+  fill: rgba(0, 229, 255, 0.22);
+}
+
+/* Effect name printed inside a wide enough region. */
+.timeline__clip-edge-label {
+  position: absolute;
+  bottom: 2px;
+  font-size: 8px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: var(--accent-cyan);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none; /* the clip body owns the right-click, see openClipMenu */
+  z-index: 3;
+}
 .timeline__clip-fade-handle {
   position: absolute;
   top: 2px;
@@ -571,6 +591,16 @@
   font-size: 8px;
   color: var(--accent-amber);
   margin-left: 4px;
+  flex-shrink: 0;
+}
+
+/* Reversed marker — leads the clip name so the direction reads before the
+   filename does, and never shrinks away on a narrow clip. */
+.timeline__clip-reversed {
+  font-size: 8px;
+  line-height: 1;
+  color: var(--accent-amber);
+  margin-right: 3px;
   flex-shrink: 0;
 }
 

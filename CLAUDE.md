@@ -33,6 +33,12 @@ section rather than reading whole).
   Parsed for `@param` directives that become the node's UI sliders. `getNodeSource(node)`
   resolves custom edits → attached `shaderCode` → registry default.
 - `src/shaders/nodeDefinitions.js` — socket layouts (`inputs`/`outputs`) per node type + helpers.
+- `src/shaders/lib3d.glsl.js` — `LIB3D`, the shared GLSL header for the 3D/Depth family
+  (depth sampling, normal reconstruction, Vogel disc sampling, aperture warp, ring probe).
+  Concatenated into each shader at `registerShader` time, so `getNodeSource`, Monaco and the
+  smoke test all see the assembled source. **Invariant: no helper in it references a `u_*`
+  uniform** — everything is passed as an argument, which keeps the header order-independent and
+  keeps the smoke test's undeclared-uniform check meaningful.
 - `src/gl/clipGraphManager.js` — `compileGraph` (topo-sort → executable chain) and
   `executeGraphDAG` (the DAG executor: each node writes its own FBO, reads inputs via
   `resolveProducer`/`resolveSocket`). **Compounds recurse through `executeGraphDAG`**, their inner
@@ -94,6 +100,161 @@ section rather than reading whole).
   sub-graph (inner FBOs namespaced by `scopeId`), so inner image sources, multi-input effects and
   branching work. `EFFECT_INPUT` terminals are sources that map to the compound's input(s);
   terminals tagged `audioBand` drive inner `audio_drivers`.
+- **The present pass masks alpha off, and this is load-bearing.** The compositor's output is
+  PREMULTIPLIED but the canvas is `premultipliedAlpha: false`, so writing the accumulator's alpha
+  to the drawing buffer made the browser multiply RGB by alpha a *second* time when compositing the
+  canvas onto the page — a linear fade rendered as a quadratic one. `_presentToScreen` clears the
+  screen to opaque black and wraps its draw in `gl.colorMask(true,true,true,false)`, which makes the
+  present exactly "composite over black" at zero cost. Do not "simplify" this away.
+- **Edge transitions (`src/utils/clipTransitions.js`) are the single source of truth for fades AND
+  transitions** — Renderer, Timeline, Inspector and ExportModal all derive region geometry from it,
+  so picture, audio and export can't drift. See the section below.
+- **The 3D/Depth family is one producer + many consumers, wired through `depth_map`.** `DEPTH`
+  estimates depth; `RELIGHT_3D` / `AO_3D` / `FOG_3D` / `BOKEH_3D` consume it via a second texture
+  socket registered in `TEXTURE_INPUT_SOCKETS`. Three things fall out of that and all three are
+  load-bearing:
+  - **Depth is GREYSCALE RGB, 0 = near / 1 = far — not packed with normals.** Packing would save a
+    pass and break everything else: `TEXTURE_INPUT_SOCKETS` falls an unwired secondary input back
+    to the *primary* input, so with greyscale a bare consumer reads the colour image's luma and
+    still does something sensible, whereas a packed buffer would read colour as normals. Greyscale
+    also stays viewable while tuning, feeds `DISPLACEMENT`, and lets a painted `SHAPE_INPUT`
+    gradient / a real depth-map video / a luma matte all serve as depth sources.
+  - Normals are **recomputed per consumer** (`d3_normalFromDepth`, 4 taps) rather than plumbed
+    through. Only three nodes want them, and it keeps each node self-contained.
+  - `topSort` uses *all* edges, so a depth edge orders `DEPTH` before its consumers automatically,
+    and the DAG evaluates one `DEPTH` node once no matter how many consumers read it.
+- **`d3_normalFromDepth` picks the SMALLER-magnitude one-sided difference on each axis.** Across a
+  silhouette one of the two differences straddles the depth discontinuity and returns a huge bogus
+  gradient, which smears the normal — and therefore the lighting — across the edge. Don't
+  "simplify" it to a central difference.
+- **Constant-tap sampling is the house rule for anything with a radius.** `d3_vogel` (golden-angle
+  disc) + `d3_ign` (per-pixel rotation) means tap count is independent of radius. `BOKEH_3D`,
+  `AO_3D` and (now) `DEPTH_BLUR` all use it. Do not add another `for x { for y { } }` radius loop:
+  that is O(r²) and `DEPTH_BLUR` used to hit ~1369 fetches/pixel because of one.
+- **A pass's viewport comes from its bound FBO, never from the canvas.** `FBOManager.bind` sets
+  `gl.viewport` from the target's own dimensions; `Renderer.executePass` only falls back to
+  `this.width/height` when there is no target (drawing to the screen). Re-adding an unconditional
+  `gl.viewport(0, 0, this.width, this.height)` after a `bind` would break every scaled FBO by
+  making it render into a corner of itself. `FBOManager.create`'s `scale` option is how a pass opts
+  into half/quarter res, `resize` re-applies that ratio on canvas resize, and changing a scale
+  requires **destroy + recreate** (`ensureFBO`), because the ratio belongs to the buffer.
+  `nodeFBOScale` (clipGraphManager) is the single place that decides which node types may scale —
+  only `DEPTH` today, driven by its Resolution param. Feedback (`u_prev_frame`) nodes must never
+  scale: their output is their own history, so resampling would compound every frame.
+
+## Edge transitions — fades and transitions are one model
+
+- Every clip has a HEAD region at its start and a TAIL region at its end; each region **is** the
+  fade wedge on the clip corner. No effect on a region = a plain linear opacity ramp (what fades
+  always were). Assign `clip.transitionIn` / `clip.transitionOut` = `{ type, params }` and a shader
+  or node graph owns that window instead, driven by `u_progress` 0 → 1 across it.
+- **What a region mixes against** (the thing the old UI never said, which is why transition progress
+  felt arbitrary):
+  - HEAD with a previous clip overlapping the start → **crossfade**; the region IS the overlap
+    (NLE convention), `u_from` = everything composited so far.
+  - HEAD with nothing before it → **from nothing**; the region is `fadeIn`, `u_from` = the backdrop
+    behind the clip (lower tracks, else black).
+  - TAIL → **to nothing**; the region is `fadeOut`, `u_to` = the backdrop. This is the direction the
+    old overlap-only model could not express at all: `clip.transition` lived on the INCOMING clip,
+    so the last clip in a sequence had no way to wipe out.
+- Head and tail are the **same composite pass** with the sides swapped (`_compositeEdgeTransition`).
+  `TRANSITION_HEADER` gained `u_backdrop`, bound separately from `u_from`, because on a tail
+  `u_from` is the clip itself — falling back toward it at low opacity would make a vanishing clip
+  reappear. Head passes bind both to the accumulator, so their output is unchanged.
+- **A transition suppresses its edge's plain ramp for the whole clip**, not just inside the region
+  (`clipEdgeState`). Suppressing per-frame was wrong: `fadeIn` and the region need not be the same
+  length, so the ramp would resume the instant a shorter crossfade finished and snap the picture
+  back down. This suppression is also the fix for the old double-dip where a clip carrying both a
+  fade handle and a transition got both.
+- A tail is **suppressed while a later clip overlaps it** — that cut already belongs to the incoming
+  clip's head. The `fadeOut` ramp still applies there (fading the outgoing clip under the incoming
+  one is valid); only the transition is blocked. `edgeDisplaySeconds` resolves region-vs-ramp the
+  same way the compositor does, so the wedge drawn is always the window actually processed.
+- Region neighbours are found with `findPrevOverlap` / `findNextOverlap` over the **full** clip
+  list, never from `getActiveClips`. Overlap is a property of the timeline, not of the instant — a
+  neighbour entering/leaving the active set mid-region made progress jump.
+- **`type` values:** a built-in key from `transitionRegistry`, `compound:<libId>` (shared library
+  entry), or `'graph'` — a graph **private to that clip edge**, stored in `useGraphStore.clipGraphs`
+  under the synthetic key `` `${clipId}::tr:${edge}` ``. That key is the trick that makes the whole
+  feature cheap: every graph action and the entire Node Editor are already keyed by
+  `(graphLevel, clipId)`, so a transition graph is editable through existing plumbing with no new
+  branches, and the serializer (which maps `clipGraphs` generically) persists it for free.
+  `initTransitionGraph` seeds one from `STARTER_TRANSITION_COMPOUND` (or the compound it was forked
+  from) with fresh ids; `promoteTransitionGraph` publishes a **copy** to the library.
+- Editing a transition graph keeps the **full pipeline** on screen (`_renderFrame` checks
+  `isTransitionGraphKey`) — a transition is meaningless in isolation. Opening one parks the playhead
+  mid-region so you land on a frame that shows the effect.
+- Right-clicking a clip inside a wedge opens that **edge's** menu; anywhere else opens the clip
+  menu. One `ContextMenu` swaps between `clip` / `edge` / `edgeType` views rather than nesting
+  fly-outs.
+- **Migration:** `clip.transition` → `clip.transitionIn` on load (`deserializeProject`);
+  `getEdgeTransition` still reads the legacy field so in-memory/undo-restored clips keep rendering.
+
+## Alpha channel — import interpretation, preview, transparent export
+
+- **`src/utils/alphaModes.js` is the model** (pure, no GL): the four modes
+  (`auto`/`ignore`/`straight`/`premultiplied`), `ALPHA_MODE_INDEX` (must match
+  `ALPHA_INTERPRET_FS`'s `u_alpha_mode`), `resolveAlphaMode`, `alphaSourceKey`, and
+  `classifyAlphaSample` — the detector. `src/gl/alphaRegistry.js` is the tiny
+  registry (peer of `cameraRegistry`/`imageRegistry`) holding *detected* modes.
+- **The pipeline is STRAIGHT alpha end to end**, so a source is converted exactly once,
+  in `Renderer._drawSourceWithAlpha` (the video → `clip_input_` pass, which used to be a
+  bare passthrough). Nothing downstream knows or cares where the pixels came from.
+- **Detection rests on one invariant:** premultiplied colour can never exceed its own
+  alpha, because it was produced by multiplying by it. `_probeSourceAlpha` point-samples
+  a frame into a 64×64 RGBA8 FBO and reads it back; a sample with bright colour behind
+  low alpha proves *straight*. Deliberately **not** averaged — averaging destroys the
+  very relationship being measured. The converse isn't provable (straight footage whose
+  translucent pixels are dark looks premultiplied), hence the manual override.
+  - The probe is driven off the **upload**, not the frame loop, so successive attempts
+    see different pictures (a logo can fade in from an opaque first frame). Budgeted at
+    `ALPHA_PROBE_MAX_ATTEMPTS`, stops the instant it finds alpha, cached by **filename**
+    so splits/duplicates share it, and cleared on project load (a different project can
+    have a different `logo.webm`).
+  - Its FBO is created `fixedSize: true` — new `FBOManager` option. `resizeAll` would
+    otherwise inflate the 64×64 sample grid to canvas size and the readback would cover
+    one corner of the frame instead of all of it.
+- `TextureManager.uploadVideoFrame` now sets `UNPACK_PREMULTIPLY_ALPHA_WEBGL` explicitly
+  (it was whatever the context default happened to be). It only ever mattered once alpha
+  video was a supported source; browsers disagree about honouring the hint for `<video>`,
+  which is why interpretation is decided by the shader pass, not by the upload.
+- **Every frame now presents through `_presentToScreen`.** `_renderFullPipeline` always
+  renders the master chain into `__master_present`, and the isolated clip view into
+  `__isolated_present`. Before this, a master graph *with effects* and bars *off* had
+  `executeChain` blit straight to the drawing buffer — bypassing the present entirely,
+  including the load-bearing alpha colour-mask, which is why the fade-out fix only ever
+  worked on some projects. Cost is one full-screen blit, i.e. what a bars-on frame
+  already paid.
+- **Preview backdrop** (`useAppStore.previewBackdrop`: black/checker/white) and
+  **alpha-matte view** (`previewAlphaView`) run in `_applyPreviewBackdrop`, which returns
+  its *input unchanged* for plain black — the colour-masked present is already exactly
+  "composite over black", so the default costs nothing. Both are gated on
+  `previewTapEnabled`, the renderer's existing "this frame is for output, not for the
+  eye" flag: every export reads the same canvas, so without that gate an export started
+  with the checkerboard on would bake a checkerboard into the file. View state only —
+  deliberately not serialized.
+- **Transparent export.** `renderer._presentAlpha` makes the present keep real alpha:
+  `_renderFrame` clears the screen transparent, no colour mask, and `_presentAlphaToScreen`
+  **un-premultiplies** on the way to the drawing buffer (the compositor is premultiplied,
+  the canvas is `premultipliedAlpha: false`, so it wants straight colour — get this
+  backwards and every soft edge exports too dark).
+  - PNG: Export → Frame → "Transparent".
+  - Video: **WebM (VP9 + Alpha)** — `VideoEncoder` with `alpha: 'keep'`, `VideoFrame`
+    with `alpha: 'keep'`, muxed by **`webm-muxer`** (new dep) with `alpha: true` on the
+    video track. `alpha: 'keep'` is part of the `isConfigSupported` probe, not just the
+    config: an encoder can support VP9 and still refuse alpha, and that must surface
+    *before* rendering thousands of frames.
+  - WebM carries **Opus, not AAC**, and Chrome's Opus encoder is 48 kHz-only — so
+    `renderTimelineAudio` gained a `sampleRate` argument and the container picks it.
+  - H.264 has no alpha at all; HEVC-with-alpha is Safari **decode**-only. VP9/WebM is the
+    only encode path any browser offers.
+- Per-clip UI: Inspector → **Alpha Channel** (video clips only — live streams are opaque,
+  generators draw their own alpha). Shows the detected mode live via `useSyncExternalStore`
+  on the registry (detection happens inside the render loop; a Zustand write there would
+  re-render the app every frame). Matte colour appears only for premultiplied.
+- MediaPool import now says *why* a file won't decode instead of importing a silently
+  black clip — the common case is a ProRes 4444 / DNxHR `.mov` transparent master, which
+  no browser decodes.
 
 ## Image source node (added feature)
 
@@ -151,6 +312,14 @@ section rather than reading whole).
 
 ## Code style
 
+- **Never use a backtick inside a shader's GLSL source.** Every shader in
+  `shaderRegistry.js` / `transitionRegistry.js` lives in a JS template literal, so a stray
+  backtick in a GLSL comment silently *closes the string* and the rest of the shader is parsed
+  as JavaScript. The failure looks nothing like the cause — ESLint reports a bare
+  `Parsing error: Unexpected token <identifier>` at whatever word follows the backtick, hundreds
+  of lines from anything you edited, and only the FIRST such error. Write `acc`, not
+  `` `acc` ``, when quoting an identifier in a GLSL comment. (Backticks are fine in JS-level
+  comments *between* `registerShader` calls, which is why some exist in these files.)
 - Match existing style: ES modules, hooks, concise comments explaining *why*.
 - When editing a function, provide the full function.
 - No new deps without reason; keep single-file artifacts/components consistent with the repo.
@@ -201,55 +370,141 @@ section rather than reading whole).
 
 ## Recently completed
 
-- **Transition in from / out to NOTHING (fade handles as the transition window)** — a transition
-  used to require an overlap with another clip, so there was no way to open on a blend-in or end on
-  a blend-out. Now the **fade handles double as the transition window**:
-  - **`clip.transitionOut`** is a new field, same `{ type, params }` shape as `clip.transition`, so
-    a clip can blend in one way and out another. Both are serialized; a project saved before this
-    loads with `transitionOut: null` (explicit default ahead of the spread in `deserializeProject`).
-    `splitClip` sends `transition` with the left half and `transitionOut` with the right — each
-    follows the fade handle that times it.
-  - **Precedence (deliberate, keeps old projects pixel-identical):** an overlap with the previous
-    clip still wins and defines the transition-in window; only with **no overlap** does it fall back
-    to `fadeIn`, with `u_from` = the accumulator (lower tracks, or transparent = nothing).
-    Transition-out always uses `fadeOut`, with `u_to` = the bare accumulator.
-  - **Transition-out costs one extra pass** and a lazily-created `__compositor_scratch` FBO: the
-    clip is first composited over the accumulator into scratch (the "before" frame), then the
-    transition dissolves FROM scratch TO the bare accumulator. At `progress 0` that is
-    pixel-identical to the plain composite, so the hand-off is seamless. Doing it in one pass isn't
-    possible — the shader needs both "with clip" and "without clip" as textures.
-  - **`_compositeNodeTransition` gained `transition` / `direction` / `backdropFBOId` params.**
-    `backdropFBOId` is separate from `fromFBOId` precisely because of the out case: FROM is scratch
-    but the result must composite over the *bare* accumulator, otherwise the outgoing clip stays
-    visible wherever the sub-graph's output is transparent. `direction` namespaces inner FBOs
-    (`tr~<clipId>~in~` / `~out~`) so one clip can use the same library compound at both ends;
-    `releaseClipResources` still frees both via the `tr~<clipId>~` prefix match.
-  - **The opacity ramp is dropped when a transition owns a handle** (`inOwnsFadeIn` /
-    `outOwnsFadeOut`) — otherwise the reveal and the ramp compound into a visible double-fade.
-    Dropping the whole term is exact, not an approximation: outside the window the ramp is 1.0, and
-    inside it a transition always runs. When both windows collide (fadeIn + fadeOut > clip length)
-    the nearer end owns the frame (`elapsed <= remaining`), so neither end is ever left uncovered.
-  - A transition-out is **suppressed when a later overlapping clip runs its own transition-in** —
-    that window is already spoken for and two transitions over the same frames read as a bug.
-  - **Audio needs no new code**: handle-timed transitions ride the existing `fadeIn`/`fadeOut` audio
-    ramps in `_clipAudioGain` (and the export's matching value curves). Only overlap-timed
-    transitions still apply the extra crossfade.
-  - **Fixed a pre-existing alpha bug this feature exposed.** `applyBlendMode` accumulates in
-    **premultiplied** alpha (`composited = src * a + base.rgb * (1 - a)`, `outA = a` — which is why
-    the recursive base term isn't scaled by `base.a`), but the canvas is created
-    `premultipliedAlpha: false`, so the browser multiplied by alpha a *second* time on the way to
-    the page. Opaque frames (a == 1) agree under both conventions, which is why it never showed —
-    it only bites on partial alpha, i.e. exactly a clip fading to/from nothing, where a linear 50%
-    dissolve landed at 25% brightness. New **`PRESENT_FS`** (`this.presentProgram`) undoes the
-    premultiply once in `_blitToScreen`. Kept separate from `PASSTHROUGH_FS` because that shader
-    also does FBO→FBO copies, where the premultiplied chain must be preserved; opaque pixels divide
-    by 1.0 and are bit-identical. See the backlog for the three screen exits this does NOT cover.
-  - UI: Inspector gains a **Transition Out** section; both are now one shared `ClipTransitionEditor`
-    (the built-in-vs-compound branching was too fiddly to copy). Each carries a live hint naming
-    what times it, or why it won't play; the Fade sliders relabel to "Fade In → Transition" when a
-    transition owns them. Transitions now show for **generator clips too** (text/image/shape — a
-    title dissolving in from nothing is the main use), gated by `clipSupportsTransform`. The
-    timeline ⇄ badge is per-end (left/right) and its tooltip names the transition.
+- **3D / Depth node family (phases 1–4) — `3D_DEPTH_EFFECTS_PLAN.md` is the design doc.**
+  12 nodes, 63 primary modes, 152 params, one shared GLSL header. The architecture is the point:
+  one estimator, many consumers, wired over a `depth_map` socket (see Key conventions above).
+  - **Phase 4 — geometry and time:**
+    - **`DEPTH_DISPLACE`** — displacement along the surface NORMAL rather than in the plane, so
+      things inflate, melt, shatter and ripple *volumetrically*. 6 modes. `Depth Glitch` quantises
+      depth into slabs and tears each on its own hashed schedule — far more interesting than a flat
+      glitch because foreground and background break apart separately. `Ripple by Depth` sends the
+      wave through DEPTH, so it reads as a shockwave travelling toward camera.
+    - **`VOXEL_3D`** — the frame rebuilt as extruded blocks. Depth is quantised in **both** axes
+      (grid cells laterally, discrete levels vertically) and then marched. Quantising is what makes
+      it cheap AND is the entire look. **Face shading is free:** a march step that lands on a
+      *taller* cell means the ray is grazing that block's side rather than its top, so the two
+      facts the march already knows are enough to shade faces — no normals, no lights, no geometry.
+      Cells are square in **pixels**, not UV. Heaviest node in the family (one depth fetch per
+      step, capped at 24).
+    - **`TIME_SLICE_3D`** — z is **age**, not distance. The design doc wanted a 4×4 atlas of past
+      frames; it isn't needed. Declaring `u_prev_frame` makes the executor hand the node its own
+      ping-pong pair (the `isFeedback` branch in `executeGraphDAG`), and every mode is expressible
+      as `f(live frame, my own last output, depth)` — **the output IS the accumulator**, so history
+      costs one FBO the renderer already manages. `Depth Freeze` is the mode that matters: a
+      per-pixel hash makes each pixel's refresh *discrete* with probability falling off by depth, so
+      the far field literally lags in time behind the near field. Discrete is the point — a smooth
+      blend (`Time Smear`) just looks like motion blur.
+    - Presets: **Bass Voxels**, **Time Corridor**, **Liquid Depth**.
+    - `HEIGHTFIELD_3D` (video as raymarched terrain) was **dropped, not deferred**: it overlaps
+      `VOXEL_3D` visually for strictly more cost, and `VOXEL_3D`'s quantisation is what buys the
+      cheap analytic face shading a smooth heightfield can't have.
+  - **Phase 3 — parallax / true 2.5D:**
+    - **`CAMERA_3D`** — a virtual camera over the depth field. `d3_camVector` handles pan, dolly
+      and orbit with **one** formula (a Z translation produces parallax proportional to distance
+      from the principal point — that *is* a dolly), and `d3_pom` marches the view ray through the
+      depth field so near objects genuinely **occlude** far ones. 8 built-in motions
+      (Sway/Dolly/Orbit/Handheld/Crane/Figure-8/Manual) so it moves with nothing wired; Manual is
+      last precisely so the default index 0 is alive on drop.
+      - **Cost is adaptive off one number.** `travelPx = length(P * u_resolution)` — how far the
+        parallax actually travels in pixels — drives both the early-out (`< 1px` → one fetch,
+        return) and the step count (`clamp(travelPx / 3, 4, 12|24)`). A subtle drift costs 4 taps.
+      - **Disocclusion detection is free.** `d3_pom` returns the largest height discontinuity the
+        ray crossed as an out-param; the samples were taken anyway. That single number *is*
+        "did this pixel come from across a silhouette", and it drives the three Reveal Fill modes
+        (Stretch / Smear / Void). Void only touches **alpha** — the pipeline is straight alpha, so
+        scaling rgb there would double-darken at the present pass.
+    - **`STEREO_3D`** — Anaglyph (naive + **Dubois** least-squares matrices), Side-by-Side,
+      Over-Under, Interlaced, and **Wiggle** (flip eyes ~5×/s; the brain reads depth with no
+      glasses, and only ONE eye is sampled per frame). Deliberately **single-tap, not POM**:
+      stereo parallax is *signed* around a convergence plane, which is a different problem from
+      marching down into a heightfield, and per-eye occlusion error is sub-pixel. SBS/OU pass a
+      corrected `aspect` (×2 / ×0.5) so one Interaxial value means the same thing in every mode.
+    - **`MULTIPLANE`** — depth quantised into ≤ 8 bands, each with its own parallax, composited
+      far→near. 2 fetches per slice, no marching, and the hard band edges are the *point*
+      (paper diorama / anime background). `acc` leaves the slice loop **premultiplied**, so the
+      backdrop goes in as `acc.rgb + gap * (1 - acc.a)` — a second `mix()` by `acc.a` would
+      multiply coverage in twice and darken every soft plane edge.
+    - Presets: **3D Photo (Parallax)**, **Paper Diorama**, **Anaglyph Retro**, **Wiggle 3D**.
+      All four smooth depth harder than the phase-2 rigs (`u_dp_smooth` 9–12): parallax is where a
+      noisy depth estimate shows up worst, because the eye reads boiling geometry as broken in a
+      way it never does in fog or lighting.
+  - **`DEPTH`** — monocular estimator. Not ML: a weighted stack of classical cues (luma, local
+    contrast/focus, aerial desaturation + blue shift, horizon, radial), each a slider so it's
+    tunable per shot. 7 modes incl. `External Map` for a real depth video. Its `d3_ringProbe`
+    takes **one 8-tap ring and returns two results** — an edge-preserving (joint bilateral)
+    smoothed colour AND the local luma contrast. Sharing the ring is the trick: both are questions
+    about the same neighbourhood, so asking separately would cost 16 taps for the same
+    information. It smooths the colour the cues are computed FROM, because bilaterally filtering
+    finished depth would mean re-running the cue stack at every tap.
+  - **`NORMALS_3D`** — normal map / curvature / slope. Standalone because a normal map is useful
+    outside the family (wire it into `DISPLACEMENT` to bump-map footage).
+  - **`RELIGHT_3D`** — deferred lighting on flat footage. 6 modes (Studio 3-point, Single Key,
+    Rim Only, Toon/Cel, Metal, Wet/Subsurface). ~10 flops per light and **zero extra texture
+    fetches** beyond the 4 the normal costs — the best value-per-flop in the family.
+  - **`AO_3D`** — SSAO / Curvature / Cavity / Contact Shadow. The SSAO spiral is range-checked
+    (`smoothstep(range, range*2.5, diff)`): without it a much-nearer neighbour is a different
+    object, not a crease, and you get dark halos instead of occlusion. Curvature/Cavity use a
+    4-tap Laplacian rather than a spiral — concavity is a second derivative, so the immediate
+    neighbourhood is all there is to ask.
+  - **`BOKEH_3D`** — real DOF. 3 focus fields (Depth Map / Tilt-Shift / Radial — the latter two
+    synthesise their focus field from screen position, so DOF works with no depth at all), plus
+    aperture blades, anamorphic squeeze, Petzval swirl and highlight bokeh. Each tap's weight is
+    `clamp((tapCoC - dist) * 0.5 + 1, 0, 1)`: a tap contributes only if **its own** circle of
+    confusion reaches this pixel, which is what stops a sharp foreground smearing outward over a
+    blurred background. 2 fetches per sample (colour + that tap's depth) — unavoidable in a
+    gather DOF.
+  - **`FOG_3D`** — Linear / Exponential / Exponential² / Height Fog / Aerial Perspective / Depth
+    Tint. Aerial Perspective desaturates and blue-shifts *before* adding fog colour, so haze reads
+    as atmosphere instead of a grey scrim.
+  - **`DEPTH_BLUR` was a real perf bug and is fixed in place.** Its nested `x`/`y` loop reached a
+    37×37 kernel — ~1369 texture fetches per pixel at radius 18. Now a 24-tap Vogel spiral with a
+    Gaussian disc falloff: constant cost at any radius. **Params are byte-identical** so saved
+    projects keep their values and just get faster, and Rec.601 luma is kept (not `lib3d`'s
+    Rec.709) so the depth estimate — and the look — doesn't shift.
+  - Presets: **Cinematic Depth** (one depth → fog + DOF + key light, demonstrating the fan-out),
+    **Sculpted Light**, **Miniature (Tilt-Shift)** (no depth node at all — a miniature is faked by
+    *ignoring* real depth), **Depth Reactor** (bass → fog + aperture). Presets deliberately leave
+    each node's primary `input` unwired: `executeGraphDAG` resolves an unwired texture input to the
+    chain input, so `DEPTH` and the head of the image chain both pick up the incoming video with
+    no edge.
+  - **Scaled (half / quarter-res) render targets** — `FBOManager.create` takes a `scale` option
+    (sibling of `fixedSize`), `resize` re-applies `entry.scale` so a 0.5× target stays 0.5× across
+    a canvas resize, and `getScale` lets the executor notice a changed Resolution param and
+    rebuild (resize deliberately *cannot* change an existing FBO's ratio).
+    - **The blocker was one line.** `Renderer.executePass` did
+      `this.fbos.bind(id); gl.viewport(0, 0, this.width, this.height)` — and `FBOManager.bind`
+      had *already* set the viewport from the target's own dimensions, so the second line silently
+      overrode it and any scaled pass would have written a corner of its buffer. It is now
+      `if (!outputFBOId) gl.viewport(...)`, which only covers drawing straight to the screen.
+      Provably identical for every existing FBO (they are all canvas-sized) — and that one line is
+      also the rollback if anything looks wrong.
+    - **Opt-in per node type via a real UI param, not a hidden constant** (`nodeFBOScale`).
+      Only `DEPTH` uses it (Resolution: Full/Half/**Half by default**/Quarter): its output is a
+      low-frequency data map, every consumer samples it with normalized UVs and gets a bilinear
+      upsample free, and downsampling actively *helps* because the resample is a denoiser and
+      noisy depth is what makes parallax boil. An image-chain node at half res would just look soft.
+    - **Feedback nodes are excluded on purpose** — their output IS their history, so a scaled
+      target would compound resampling every frame into mush.
+
+- **Transitions + blending pass: edge transitions, out-to-nothing, editable transition graphs.**
+  New `src/utils/clipTransitions.js` is the shared model (see the section above); `clip.transition`
+  became `clip.transitionIn` and gained a `clip.transitionOut` peer.
+  - **The fade-out bug was an alpha bug, not a fade bug.** Premultiplied compositor output was being
+    written to a `premultipliedAlpha: false` canvas, so every fade was applied twice (quadratic).
+    Fade-in read as an intentional ease; fade-out read as the picture dropping out early and never
+    landing on black. Fixed in `_presentToScreen` with an opaque-black clear + alpha colour mask.
+  - **Transitions can now run at both ends and against nothing** — the old model only ever
+    transitioned INTO a clip from an overlapping predecessor. `_compositeEdgeTransition` runs head
+    and tail through one pass with the sides swapped; `TRANSITION_FOOTER` mixes toward a separate
+    `u_backdrop` so a tail's opacity fallback is what's behind the clip, not the clip itself.
+  - **Per-clip transition node graphs** (`type: 'graph'`) stored under synthetic `clipGraphs` keys,
+    editable in the Node Editor with the full pipeline previewing live, promotable to the library.
+  - **New `DIP_COLOR` built-in** ("Dip to Color") — the classic dip-to-black, and a true fade-out
+    when used on a tail.
+  - UI: wedges are the transition (tinted + named when one is assigned), right-clicking a wedge
+    opens that edge's menu, the Inspector shows both edges and states in words what each mixes
+    against, and the fade sliders are relabelled In/Out Length.
+  - Export audio parity: `ExportModal` now samples the same `clipEnvelopeGain` the renderer uses.
 
 - **Media Pool right-click menu (delete / add to timeline / add to master graph)** — new shared
   `src/components/common/ContextMenu.jsx` (+ `.css`): portal-rendered so a scrolling panel can't
@@ -514,6 +769,188 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
 
 ## Backlog / potential improvements
 
+<<<<<<< HEAD
+- **Verify the 3D / Depth family in `npm run dev`** — written with the Cowork sandbox down, so
+  `npm run lint` (ESLint + shader smoke test) and `npm run build` have NOT been run. Every static
+  check the smoke test performs was audited by hand (structure, `@param`↔uniform 1:1 adjacency for
+  all 79 params, select-default ranges, hex colour formats, uniform declaration coverage,
+  delimiter balance), but only a real WebGL2 context proves the GLSL. Checks by how much they'd
+  hurt if broken:
+  1. **`npm run smoke:shaders` first** — 6 new shaders and a rewritten `DEPTH_BLUR`, all now
+     carrying the concatenated `LIB3D` header. If the header is malformed every one of them fails
+     at once, which makes this the fastest possible signal.
+  2. **Nothing regressed.** `DEPTH_BLUR` is the only *existing* node touched. Open a project that
+     uses it: the picture should look near-identical (soft Gaussian disc, not a hard bokeh disc)
+     and the frame time at a large Max Blur should drop enormously. Its 4 sliders must behave
+     exactly as before.
+  3. **Bare drop-in.** Drop `RELIGHT_3D` alone on a video with nothing wired to `Depth`. It must
+     still light the shot (reading colour luma as depth via the `TEXTURE_INPUT_SOCKETS` fallback),
+     not render black. Same for `FOG_3D` / `AO_3D` / `BOKEH_3D`.
+  4. **The real rig.** Media Pool → Presets → **Cinematic Depth**. Confirm one `DEPTH` node feeds
+     three consumers, and that `DEPTH`'s Output → *Colorized (Preview)* shows plausible depth
+     (subject warm/near, background cool/far). Tune Focus Weight and Smooth Radius and watch it.
+  5. **Lighting reads as 3D.** `RELIGHT_3D` → Studio, then sweep Key Angle 0→360. The shading must
+     travel around the subject; if it smears across silhouettes, `d3_normalFromDepth`'s
+     smaller-gradient selection is the place to look.
+  6. **AO has no halos.** `AO_3D` → SSAO at a large Radius. Look at a hard foreground/background
+     edge: creases should darken, but there must be no dark outline tracing the subject. Depth
+     Range is the knob (it's the range check).
+  7. **DOF doesn't bleed.** `BOKEH_3D` with a sharp foreground over a blurred background — the
+     foreground edge must stay crisp. Then Blades = 6 and Highlight Bokeh up on footage with
+     speculars: expect hexagonal bokeh balls. Output → *CoC (Preview)* shows what's being blurred.
+  8. **Tilt-shift needs no depth.** Preset → **Miniature**. Should work with the depth socket
+     empty, and Tilt Angle should rotate the focus band.
+  9. **Audio hooks are neutral until wired.** With no Audio Splitter connected, every one of these
+     nodes must look static — the gated bands are 0. Then wire bass → `FOG_3D` Audio Drivers and
+     confirm the fog pumps.
+  10. **Round trip + cleanup.** Save/load keeps all params (they're plain `node.params`, so this
+      should be free); deleting a `DEPTH` node with three consumers attached must not leak FBOs
+      (`releaseNodeResources` handles `__n_` keys generically) and the consumers should fall back
+      to reading colour luma rather than going black.
+  11. **Phase 3 — parallax.** Preset → **3D Photo**. The frame should push in with near objects
+      *covering* far ones, not sliding over them; switch Quality to *Single Tap* to see the
+      difference (that is the rubber-sheet look). Set Reveal Fill to *Void* and confirm the
+      revealed strip goes transparent (checker backdrop on) rather than black — if it darkens
+      instead, something is scaling rgb as well as alpha. Sweep Depth Scale up until it breaks;
+      Edge Threshold is the knob for how eagerly disocclusion is detected.
+  12. **Parallax is cheap when still.** With Motion = Manual and Camera X/Y/Z at 0, `CAMERA_3D`
+      must cost essentially nothing (the `travelPx < 1.0` early-out) — watch the frame time as
+      you drag Camera X off zero and it should rise smoothly, not jump.
+  13. **Stereo.** Preset → **Anaglyph Retro** with red/cyan glasses: depth should read correctly,
+      not inverted (if it does, Swap Eyes, and check `Convergence` — content at that depth should
+      sit *on* the screen plane). Then **Wiggle 3D** with no glasses. Check Side-by-Side halves
+      look identically separated to the anaglyph (that's the `aspect * 2.0` correction).
+  14. **Multiplane.** Preset → **Paper Diorama**. Expect discrete sliding cutout layers; raise
+      Feather and they should melt together, raise Separation and the stack should pull apart. At
+      Gaps = *Transparent* the holes between planes must be truly transparent with no dark
+      fringing (that's the premultiplied composite).
+  15. **Phase 4 — `TIME_SLICE_3D` is the one to check first**, because it is the only node in the
+      family that depends on renderer machinery rather than pure arithmetic. Drop it and confirm the
+      executor gave it a ping-pong (it should accumulate over several frames rather than showing a
+      static frame). Preset → **Time Corridor**: the background should visibly lag behind the
+      foreground with a grainy dither, and the grain must be *stable* per pixel, not crawling
+      everywhere at once. Then check `Slit Scan (Rows)` fills from black over a second or two —
+      starting black is correct, the history buffer begins empty. Resize the preview and confirm
+      history clears without artefacts, and delete the node to confirm no FBO leak (`__npp_` keys).
+  16. **`TIME_SLICE_3D` export parity.** `Depth Freeze` hashes on `floor(u_time * 60.0)`, and export
+      frame-locks `u_time` via `_timeOverride` — so a rendered file should match the preview. Worth
+      one short MP4 to confirm, since a feedback node's history depends on frame *order*, not just
+      on the current time.
+  17. **`VOXEL_3D` frame time.** It is the heaviest node here. Watch the frame time as Height goes
+      up (that raises travel distance, hence step count, up to the 24 cap) — it should plateau, not
+      climb without limit. Then Grid to 160 and confirm block edges stay crisp rather than
+      staircasing (if they staircase, the `travelPx / 2.0` step rule is the knob).
+  18. **`DEPTH_DISPLACE` anchors.** Sweep Depth Bias: content at the bias depth must stay *still*
+      while everything else moves. If the whole frame slides, `rel = d - bias` is being ignored
+      somewhere. Then Chroma Split up and confirm the dispersion follows the displacement direction.
+- **Verify scaled FBOs in `npm run dev` — this is the highest-risk change in the depth work,
+  because the viewport line it removes ran for every node every frame.** Checks:
+  1. **Nothing regressed at all.** Open any existing project with effects. Every pass still writes
+     a canvas-sized FBO, so the picture must be byte-identical. If the whole frame is suddenly
+     drawing into one corner (or is stretched), the `if (!outputFBOId)` guard in
+     `Renderer.executePass` is the only suspect — restoring the unconditional
+     `gl.viewport(0, 0, this.width, this.height)` there is the one-line rollback.
+  2. **`DEPTH` at Half (the new default).** Drop a `DEPTH` node, Output → *Colorized*. It should
+     fill the frame, not a corner. Then Full / Half / Quarter: the map should get softer and the
+     frame time should drop ~4× per step, with the *framing identical* in all three.
+  3. **Consumers are unaffected by the producer's resolution.** With `RELIGHT_3D` reading a
+     Quarter-res `DEPTH`, lighting must still be full-res sharp — only the depth is coarse.
+  4. **Resolution changes rebuild the target.** Toggle Half → Full → Quarter repeatedly while
+     playing. `resize` deliberately preserves an FBO's own scale, so `ensureFBO` must notice the
+     change and recreate; if it doesn't you'd see the map stuck at the old size.
+  5. **Canvas resize preserves the ratio.** Change export/preview resolution with `DEPTH` on Half
+     and confirm it stays half of the NEW size (that's `resize` re-applying `entry.scale`).
+  6. **No leak.** Delete a scaled `DEPTH` node and confirm its `__n_` FBO is freed as before.
+- **`npm i` then verify the alpha work in `npm run dev`** — written with the Cowork
+  sandbox down, so `npm install` (the new `webm-muxer` dep), `npm run lint` and
+  `npm run build` have NOT been run. **Install first or the Export modal will fail to
+  import.** Checks, roughly by how much they'd hurt if broken:
+  1. **Nothing regressed.** The present-path change touches every frame. Open an existing
+     project with a master graph that has effects and bars off — picture should be
+     identical, and a fade-out should still land cleanly on black (that path previously
+     skipped the colour mask, so if anything it should look *better*).
+  2. **Import.** Bring in a VP9-alpha WebM (Chrome/Firefox decode it). Put it on track 2
+     over another clip: the transparent regions should show the lower clip, with no dark
+     or bright halo at the edges. Inspector → Alpha Channel should read
+     "Detected: Premultiplied" (or Straight) within a second of the clip rendering.
+  3. **Detection is right.** Flip Interpret As between Straight and Premultiplied and
+     watch the edges: one of the two will fringe. Auto should match the clean one. If it
+     doesn't, `classifyAlphaSample`'s `STRONG_OVERSHOOT` is the knob.
+  4. **Backdrop + matte view.** Toolbar checker button cycles black → checker → white;
+     the α button shows the alpha as greyscale. Neither should change FPS meaningfully,
+     and turning them off must restore the exact previous image.
+  5. **Neither leaks into output.** With the checkerboard ON, export a PNG and an MP4 —
+     both must come back with a black background, not a checkerboard. (This is the
+     `previewTapEnabled` gate.)
+  6. **Transparent PNG.** Export → Frame → Transparent, on a project with a keyed clip
+     over nothing. Open it over a coloured background; edges should be clean, not dark.
+  7. **Transparent WebM.** Export → WebM (VP9 + Alpha). Play it in Chrome over a coloured
+     page. Check audio is present and in sync (it's Opus at 48 kHz now, a different path
+     from MP4/AAC). Confirm it also opens back in DaliVid and re-detects as alpha.
+  8. **Round trip.** Set a clip's Interpret As to Premultiplied with a white matte, save,
+     reload — both should persist. An untouched clip should save no `alphaMode` at all.
+  9. **The probe budget.** Scrub a long opaque clip and watch the frame time: probes must
+     stop after `ALPHA_PROBE_MAX_ATTEMPTS`, so there should be no sustained readPixels
+     stall. Also resize the preview / change export resolution and confirm detection
+     still works (the `fixedSize` FBO guard).
+- **`webm-muxer` and `mp4-muxer` are both deprecated** in favour of `mediabunny` (same
+  author). Nothing is broken and neither has an open advisory, but a single migration to
+  `mediabunny` would replace both and is the obvious next dependency cleanup.
+- **Alpha for the MediaRecorder WebM paths.** `webm-vp9` / `webm-vp8` go through
+  `canvas.captureStream()`, which discards alpha. They're kept for the real-time path;
+  anyone wanting transparency should use the WebCodecs VP9+Alpha option. Worth removing
+  the plain VP9 entry entirely if the WebCodecs path proves reliable.
+- **Alpha for image/generator sources.** `IMAGE_INPUT` already honours PNG alpha, but it
+  goes through `renderImageNode`, not `_drawSourceWithAlpha`, so a premultiplied PNG has
+  no interpretation control. Same fix, different call site, if it ever bites.
+
+- **Verify the edge-transition pass in `npm run dev`** — written with the Cowork sandbox down, so
+  `npm run lint` (ESLint + shader smoke test) and `npm run build` have NOT been run. Highest-value
+  checks, roughly in order of how much they'd hurt if broken:
+  1. **The alpha fix.** Put one clip on the timeline with a 2s fade-out and nothing after it. The
+     ramp should look linear and land on the same black the gap shows — no early drop-off, no step
+     at the clip's end. Compare a fade-in on the same clip: they should mirror each other.
+  2. **Out to nothing.** Right-click that clip's tail wedge → Effect → Circle Wipe. It should iris
+     out to black. Then Dip to Color, then Node Graph.
+  3. **In from nothing.** Same on a clip's head with no clip before it.
+  4. **Crossfade unchanged.** Overlap two clips, put a Crossfade on the incoming one — should be
+     identical to before, and the head handle should be hidden while it is (the overlap owns it).
+  5. **No double dip.** A clip with both a fade handle and a transition on the same edge should
+     ramp exactly once.
+  6. **Transition graph.** Right-click a wedge → Convert to Node Graph. The editor should open on a
+     mid-region frame titled "Transition In/Out: <clip>", with the full pipeline previewing; editing
+     the graph should change the preview live. Then Save to Library and check it appears in the
+     other clip's effect list. Delete the clip and confirm no orphan graphs remain.
+  7. **Short-clip edge case.** A 1s clip with 0.8s in and 0.8s out, both with transitions — the head
+     should win for the overlap and the tail should pick up after.
+  8. **Round trips.** Save/load keeps both edges; split gives the left half the head and the right
+     half the tail; duplicate drops the head only; undo/redo of an effect change works.
+  9. **Export parity.** A short MP4 export of a clip with a tail transition should match the preview
+     frame-for-frame, with the audio fading out alongside.
+  10. `npm run smoke:shaders` — the new `DIP_COLOR` entry and the `u_backdrop` header addition.
+- **Transition graphs can't use a preview tap.** `executeTransitionCompound` doesn't take a
+  `tapPointNodeId`, so clicking a node's 👁 inside a transition graph does nothing. Threading it
+  through is easy; the risk is that the tap path draws straight to screen mid-pipeline, which would
+  fight the compositor. Worth doing properly if transition graphs get used much.
+- **Keyframes inside a transition graph** land under the synthetic clip key, so `KeyframeLane`
+  finds no base clip and treats the times as absolute. Harmless today (the lane just shows nothing
+  useful), but it should either resolve the key to its owning clip or hide the lane.
+- **Verify the clip context menu + reverse in `npm run dev`** — written with the sandbox down, so
+  no lint/build run. Checks: right-click a clip (and its trim/fade handles) opens the menu without
+  the clip jumping; Reverse plays the clip backwards and the ✓ toggles in place; splitting a
+  reversed clip yields two halves that play back-to-back with no content swap; a reversed clip
+  exports with reversed audio that lines up with the picture; save/load keeps `reversed`; Ripple
+  Delete closes the gap on that track only.
+- **Reversed audio in the live preview** — currently silent (the media element is paused and
+  seek-driven). Doing it properly means decoding the clip once into a reversed `AudioBuffer` and
+  scheduling it through the `AudioEngine` in sync with the playhead, including a pre-gain tap so
+  stem reactivity still works. Worth it if reverse gets used a lot.
+- **Verify the TIME node in `npm run dev`** — also written with the sandbox down (no lint/build run).
+  Checks: drop a TIME node, wire `value` → a slider socket and confirm the param animates and the
+  card readout shows ⚡; `Clip Progress` + `Saw Up` ramps exactly once across a clip and re-times
+  when the clip is trimmed; scrubbing the playhead moves the value (deterministic sources) while
+  `Free Run` keeps going when paused; a short export matches the preview frame-for-frame; and a
+  save/load round-trip keeps the node's params (they're plain `node.params`, so this should be free).
 - **Verify the transition in/out-of-nothing work in `npm run dev`** — written with the Cowork
   sandbox down, so `npm run lint` and `npm run build` have NOT been run against it. Checks, highest
   value first: (1) a lone clip on an empty timeline with Transition In = Crossfade and Fade In 1s

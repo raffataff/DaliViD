@@ -1,9 +1,18 @@
 /**
  * DaliVid — transitionRegistry.js
- * Clip-to-clip transition shaders. A transition runs in the compositor when an
- * incoming clip (with `clip.transition` set) overlaps the previous clip on its
- * track: instead of the plain blend-mode composite, the transition shader reads
- * both sides and mixes them by `u_progress` (0 → 1 across the overlap window).
+ * Edge-transition shaders. A transition owns one of a clip's two edge regions
+ * (see utils/clipTransitions.js) and mixes the two sides of that region by
+ * `u_progress`, 0 → 1 across it, replacing the plain blend-mode composite:
+ *
+ *   HEAD over an overlap → u_from = everything composited so far (the outgoing
+ *     clip over the lower tracks), u_to = this clip. A crossfade.
+ *   HEAD with nothing before it → u_from = the backdrop behind the clip (lower
+ *     tracks, else transparent/black), u_to = this clip. A shaped fade-in.
+ *   TAIL → u_from = this clip, u_to = the backdrop behind it. A shaped fade-out
+ *     "to nothing", which is the direction the old overlap-only model had no
+ *     way to express.
+ *
+ * A shader never needs to know which case it is in: it always mixes FROM → TO.
  *
  * Conventions (mirrors shaderRegistry.js):
  *   - `@param` directives become Inspector sliders (parsed by paramParser).
@@ -20,10 +29,11 @@ import { parseParams, getDefaultParams } from '../utils/paramParser.js'
 export const TRANSITION_HEADER = `#version 300 es
 precision highp float;
 in vec2 v_uv;
-uniform sampler2D u_from;    // outgoing side (everything composited so far)
-uniform sampler2D u_to;      // incoming clip's finished frame
-uniform float u_progress;    // 0 → 1 across the overlap window
-uniform float u_opacity;     // clip × track opacity (incl. fade ramps)
+uniform sampler2D u_from;    // side the region starts on
+uniform sampler2D u_to;      // side the region ends on
+uniform sampler2D u_backdrop; // what's behind the whole region (see footer)
+uniform float u_progress;    // 0 → 1 across the region
+uniform float u_opacity;     // clip × track opacity
 uniform vec2 u_resolution;
 uniform float u_time;
 uniform float u_beat;        // always-live beat trigger (0..1 decay)
@@ -39,12 +49,18 @@ float t_env(float p) { return 1.0 - abs(2.0 * p - 1.0); }
 `
 
 // Shared epilogue: every transition returns its mixed color; opacity falls back
-// toward the backdrop (u_from) exactly like the blend compositor's u_opacity.
+// toward the BACKDROP exactly like the blend compositor's u_opacity.
+//
+// u_backdrop is bound separately from u_from because the two only coincide on a
+// head transition. On a TAIL, u_from is the clip itself, so falling back toward
+// u_from at low opacity would make a transparent clip re-appear — the fallback
+// has to be what's actually behind the region. Head passes bind both to the
+// accumulator, so their result is bit-identical to the pre-edge-model footer.
 export const TRANSITION_FOOTER = `
 void main() {
-  vec4 fromC = texture(u_from, v_uv);
+  vec4 backC = texture(u_backdrop, v_uv);
   vec4 result = transition(v_uv);
-  fragColor = mix(fromC, result, clamp(u_opacity, 0.0, 1.0));
+  fragColor = mix(backC, result, clamp(u_opacity, 0.0, 1.0));
 }
 `
 
@@ -59,6 +75,28 @@ uniform float u_ease;
 vec4 transition(vec2 uv) {
   float p = mix(u_progress, smoothstep(0.0, 1.0, u_progress), u_ease);
   return mix(texture(u_from, uv), texture(u_to, uv), p);
+}
+`,
+  },
+
+  DIP_COLOR: {
+    label: 'Dip to Color',
+    description: 'Fades through a solid colour — dip to black/white. On a tail this is a true fade-out.',
+    glsl: `
+// @param name="Color" type=color default="#000000"
+uniform vec3 u_dip_color;
+// @param name="Hold" min=0.0 max=0.9 default=0.0 step=0.01
+uniform float u_hold;
+
+vec4 transition(vec2 uv) {
+  // Two ramps meeting at the midpoint: FROM → colour, then colour → TO.
+  // Hold widens the fully-solid plateau between them (a beat of black).
+  float h = u_hold * 0.5;
+  float outP = smoothstep(0.0, max(0.0001, 0.5 - h), u_progress);
+  float inP  = smoothstep(min(0.9999, 0.5 + h), 1.0, u_progress);
+  vec4 dip = vec4(u_dip_color, 1.0);
+  vec4 a = mix(texture(u_from, uv), dip, outP);
+  return mix(a, texture(u_to, uv), inP);
 }
 `,
   },

@@ -268,6 +268,153 @@ const NODE_DEFS = {
     ],
     hasParamInputs: true,
   },
+
+  // ── 3D / Depth family ──
+  // DEPTH estimates depth from a flat image; everything below CONSUMES a depth
+  // map through the `depth_map` socket. That split is deliberate: one estimator
+  // feeding many consumers means the DAG caches the estimate for free (it is
+  // just another node's FBO), and it makes depth *wirable* — a DEPTH node, a
+  // painted SHAPE_INPUT gradient, a real depth-map video or a luma matte are all
+  // interchangeable on that socket.
+  //
+  // `depth_map` is registered in clipGraphManager's TEXTURE_INPUT_SOCKETS, which
+  // falls secondary texture inputs back to the primary input when nothing is
+  // wired — so an unwired consumer reads the colour image's own luma and still
+  // does something sensible instead of rendering black.
+  DEPTH: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Depth' },
+    ],
+    hasParamInputs: true,
+  },
+  NORMALS_3D: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Depth / Image' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Normals' },
+    ],
+    hasParamInputs: true,
+  },
+  RELIGHT_3D: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
+  AO_3D: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
+  FOG_3D: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
+  BOKEH_3D: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
+  CAMERA_3D: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
+  STEREO_3D: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
+  MULTIPLANE: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
+  DEPTH_DISPLACE: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
+  VOXEL_3D: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
+  // TIME_SLICE_3D also declares u_prev_frame, which is what makes the executor
+  // give it a ping-pong FBO pair (the isFeedback branch in executeGraphDAG). That
+  // pair IS its frame history — no extra plumbing, and releaseNodeResources
+  // already frees `__npp_` keys.
+  TIME_SLICE_3D: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Image' },
+      { id: 'depth_map', type: 'texture', name: 'Depth' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
 }
 
 /**

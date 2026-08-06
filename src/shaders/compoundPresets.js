@@ -173,6 +173,227 @@ export const COMPOUND_PRESETS = [
       ],
     },
   },
+
+  // ── 3D / Depth rigs ─────────────────────────────────────────────────────────
+  // These are the discoverability layer for the depth family: the interesting
+  // part is not any single node but the SHAPE of the graph — ONE depth estimate
+  // fanned out to several consumers, which is a wiring pattern nobody guesses
+  // from a node list.
+  //
+  // Note what is deliberately NOT wired: each node's primary `input`. An unwired
+  // texture input resolves to the chain input (see executeGraphDAG), so DEPTH and
+  // the head of the image chain both pick up the incoming video automatically.
+  // Only the image chain and the depth fan-out need explicit edges.
+  {
+    id: 'cinematic_depth', name: 'Cinematic Depth',
+    description: 'One depth estimate driving haze, depth of field and a lighting pass — the "shot on a real lens" rig.',
+    category: '3D / Depth', color: '#66ddff',
+    subGraph: {
+      nodes: [
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 7.0, u_dp_w_focus: 0.5, u_dp_w_aerial: 0.3, u_dp_curve: 1.1 } },
+        { type: 'FOG_3D', name: 'Aerial Haze', relPos: { x: 250, y: 0 }, params: { u_fg_mode: 4, u_fg_density: 0.8, u_fg_desat: 0.35, u_fg_blue: 0.25, u_fg_mix: 0.7 } },
+        { type: 'BOKEH_3D', name: 'Lens', relPos: { x: 500, y: 0 }, params: { u_bk_focus: 0.35, u_bk_range: 0.14, u_bk_aperture: 16.0, u_bk_blades: 6.0, u_bk_highlight: 2.0 } },
+        { type: 'RELIGHT_3D', name: 'Key Light', relPos: { x: 750, y: 0 }, params: { u_rl_mode: 0, u_rl_relief: 34.0, u_rl_key_int: 0.9, u_rl_ambient: 0.85, u_rl_rim: 0.5, u_rl_mix: 0.6 } },
+      ],
+      edges: [
+        // Image chain.
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 2, fromSocket: 'output', to: 3, toSocket: 'input' },
+        // One depth estimate, three consumers — the DAG evaluates DEPTH once.
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+        { from: 0, fromSocket: 'output', to: 2, toSocket: 'depth_map' },
+        { from: 0, fromSocket: 'output', to: 3, toSocket: 'depth_map' },
+      ],
+    },
+  },
+  {
+    id: 'sculpted_light', name: 'Sculpted Light',
+    description: 'Relight flat footage with a 3-point studio rig, then add contact shadows. Costs no extra texture taps.',
+    category: '3D / Depth', color: '#ffd9a0',
+    subGraph: {
+      nodes: [
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 8.0, u_dp_w_focus: 0.55, u_dp_w_luma: 0.4, u_dp_w_radial: 0.2 } },
+        { type: 'RELIGHT_3D', name: 'Studio', relPos: { x: 250, y: 0 }, params: { u_rl_mode: 0, u_rl_relief: 55.0, u_rl_key_angle: 125.0, u_rl_key_elev: 0.3, u_rl_key_int: 1.2, u_rl_fill: 0.4, u_rl_rim: 0.9, u_rl_spec: 0.7, u_rl_ambient: 0.7 }, audioWire: ['bass'] },
+        { type: 'AO_3D', name: 'Occlusion', relPos: { x: 500, y: 0 }, params: { u_ao_mode: 0, u_ao_radius: 34.0, u_ao_samples: 2, u_ao_strength: 1.2, u_ao_range: 0.3, u_ao_mix: 0.8 } },
+      ],
+      edges: [
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+        { from: 0, fromSocket: 'output', to: 2, toSocket: 'depth_map' },
+      ],
+    },
+  },
+  {
+    id: 'miniature_tilt', name: 'Miniature (Tilt-Shift)',
+    description: 'The fake-model look: a linear focus band plus a saturation punch. Needs no depth map at all.',
+    category: '3D / Depth', color: '#c9a8ff',
+    subGraph: {
+      nodes: [
+        // Tilt-shift synthesises its own focus field from screen position, which
+        // is why this rig has no DEPTH node — a miniature is faked by ignoring
+        // real depth, not by measuring it.
+        { type: 'BOKEH_3D', name: 'Tilt-Shift', relPos: { x: 0, y: 0 }, params: { u_bk_field: 1, u_bk_focus: 0.5, u_bk_range: 0.1, u_bk_aperture: 26.0, u_bk_tilt: 90.0, u_bk_blades: 8.0, u_bk_highlight: 1.0 } },
+        // Oversaturation is the other half of the miniature illusion — model
+        // paint reads as more saturated than the real thing.
+        { type: 'COLOR_INVERSION', name: 'Saturate', relPos: { x: 250, y: 0 }, params: { u_hue_shift: 0.0, u_saturation: 1.4, u_brightness: 1.05 } },
+        { type: 'LUT', name: 'Punch', relPos: { x: 500, y: 0 }, params: { u_contrast: 1.15, u_gamma: 0.95, u_temperature: 0.08 } },
+        { type: 'VIGNETTE', name: 'Vignette', relPos: { x: 750, y: 0 }, params: { u_size: 0.7, u_softness: 0.55 } },
+      ],
+      edges: [
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'input' },
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 2, fromSocket: 'output', to: 3, toSocket: 'input' },
+      ],
+    },
+  },
+  {
+    id: 'depth_reactor', name: 'Depth Reactor',
+    description: 'Bass rolls fog in and opens the aperture; the beat pops the rim light. Audio-reactive depth.',
+    category: '3D / Depth', color: '#a8c4d8',
+    subGraph: {
+      nodes: [
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 6.0, u_dp_w_focus: 0.5 } },
+        { type: 'FOG_3D', name: 'Reactive Fog', relPos: { x: 250, y: 0 }, params: { u_fg_mode: 1, u_fg_density: 0.5, u_fg_use_gradient: true, u_fg_gradient: 3, u_fg_mix: 0.85 }, audioWire: ['bass'] },
+        { type: 'BOKEH_3D', name: 'Breathing Lens', relPos: { x: 500, y: 0 }, params: { u_bk_focus: 0.3, u_bk_range: 0.18, u_bk_aperture: 10.0, u_bk_swirl: 0.8, u_bk_highlight: 3.0 }, audioWire: ['treble'] },
+        // No 'beat' in audioWire on purpose: u_beat is an always-live standard
+        // uniform, so the rim already pops on the beat with nothing wired. Only
+        // the gated bands (AUDIO_DRIVER_BANDS) need an edge.
+        { type: 'RELIGHT_3D', name: 'Rim Pop', relPos: { x: 750, y: 0 }, params: { u_rl_mode: 2, u_rl_rim: 1.4, u_rl_relief: 60.0, u_rl_ambient: 1.0, u_rl_mix: 0.9 }, audioWire: ['bass'] },
+      ],
+      edges: [
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 2, fromSocket: 'output', to: 3, toSocket: 'input' },
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+        { from: 0, fromSocket: 'output', to: 2, toSocket: 'depth_map' },
+        { from: 0, fromSocket: 'output', to: 3, toSocket: 'depth_map' },
+      ],
+    },
+  },
+  {
+    id: 'photo_3d', name: '3D Photo (Parallax)',
+    description: 'The camera pushes into the frame and near objects occlude far ones. Works on a still image too.',
+    category: '3D / Depth', color: '#5ce6c0',
+    subGraph: {
+      nodes: [
+        // Heavier smoothing than the other rigs: parallax is where a noisy depth
+        // estimate shows up worst — it boils, and the eye reads boiling as broken
+        // in a way it never does in fog or lighting.
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 10.0, u_dp_edge: 0.1, u_dp_w_focus: 0.5, u_dp_w_aerial: 0.25, u_dp_curve: 1.2 } },
+        { type: 'CAMERA_3D', name: '3D Camera', relPos: { x: 250, y: 0 }, params: { u_c3_motion: 1, u_c3_amp: 0.3, u_c3_speed: 0.25, u_c3_scale: 0.09, u_c3_quality: 2, u_c3_fill: 1, u_c3_edge: 0.14 }, audioWire: ['bass'] },
+        { type: 'VIGNETTE', name: 'Vignette', relPos: { x: 500, y: 0 }, params: { u_size: 0.75, u_softness: 0.6 } },
+      ],
+      edges: [
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+      ],
+    },
+  },
+  {
+    id: 'paper_diorama', name: 'Paper Diorama',
+    description: 'Depth quantised into hard cutout layers that slide past each other — paper theatre / anime background.',
+    category: '3D / Depth', color: '#8ad9a0',
+    subGraph: {
+      nodes: [
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 12.0, u_dp_edge: 0.09, u_dp_w_focus: 0.5, u_dp_w_horizon: 0.3 } },
+        // Low feather keeps the plane edges hard — that IS the look. Separation
+        // pulls the stack apart so you can see it is made of layers.
+        { type: 'MULTIPLANE', name: 'Planes', relPos: { x: 250, y: 0 }, params: { u_mp_slices: 5.0, u_mp_spread: 0.09, u_mp_motion: 0, u_mp_amp: 0.4, u_mp_speed: 0.3, u_mp_feather: 0.12, u_mp_sep: 0.15 }, audioWire: ['bass'] },
+        { type: 'LUT', name: 'Storybook', relPos: { x: 500, y: 0 }, params: { u_contrast: 1.1, u_gamma: 1.05, u_temperature: 0.12, u_lift: 0.02 } },
+      ],
+      edges: [
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+      ],
+    },
+  },
+  {
+    id: 'anaglyph_retro', name: 'Anaglyph Retro',
+    description: 'Red/cyan 3D through a CRT. Dig out the cardboard glasses.',
+    category: '3D / Depth', color: '#ff8a8a',
+    subGraph: {
+      nodes: [
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 8.0, u_dp_w_focus: 0.5 } },
+        // Dubois rather than naive channel-swap: it is a least-squares fit that
+        // keeps some colour and cuts the ghosting that makes red/cyan a headache.
+        { type: 'STEREO_3D', name: 'Anaglyph', relPos: { x: 250, y: 0 }, params: { u_st_mode: 1, u_st_sep: 0.03, u_st_conv: 0.45, u_st_ghost: 0.25 } },
+        { type: 'CRT', name: 'CRT', relPos: { x: 500, y: 0 }, params: { u_curvature: 0.03, u_scanline_intensity: 0.3, u_vignette: 0.4 } },
+      ],
+      edges: [
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+      ],
+    },
+  },
+  {
+    id: 'wiggle_3d', name: 'Wiggle 3D (No Glasses)',
+    description: 'Flips between the two eyes a few times a second — the brain reads depth with no glasses and no colour loss.',
+    category: '3D / Depth', color: '#ff8a8a',
+    subGraph: {
+      nodes: [
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 9.0, u_dp_w_focus: 0.5 } },
+        // ONE eye is sampled per frame, so this is the cheapest convincing 3D in
+        // the whole family — and the only one that needs no hardware at all.
+        { type: 'STEREO_3D', name: 'Wiggle', relPos: { x: 250, y: 0 }, params: { u_st_mode: 5, u_st_sep: 0.022, u_st_conv: 0.45, u_st_wiggle: 5.0 } },
+      ],
+      edges: [
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+      ],
+    },
+  },
+  {
+    id: 'bass_voxels', name: 'Bass Voxels',
+    description: 'The frame rebuilt as extruded blocks that punch up with the low end. Equaliser geometry.',
+    category: '3D / Depth', color: '#d8c86a',
+    subGraph: {
+      nodes: [
+        // Coarse smoothing is fine here — the voxel grid quantises depth anyway,
+        // so a noisy estimate is thrown away by the cell averaging.
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 5.0, u_dp_w_luma: 0.5, u_dp_w_focus: 0.4, u_dp_curve: 1.3 } },
+        { type: 'VOXEL_3D', name: 'Blocks', relPos: { x: 250, y: 0 }, params: { u_vx_mode: 0, u_vx_grid: 40.0, u_vx_height: 0.22, u_vx_levels: 7.0, u_vx_motion: 1, u_vx_amp: 0.4, u_vx_speed: 0.3, u_vx_mortar: 0.1, u_vx_shade: 1.2 }, audioWire: ['bass', 'sub_bass'] },
+        { type: 'BLOOM', name: 'Glow', relPos: { x: 500, y: 0 }, params: { u_threshold: 0.6, u_bloom_intensity: 1.1, u_radius: 6 }, audioWire: ['bass'] },
+      ],
+      edges: [
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+      ],
+    },
+  },
+  {
+    id: 'time_corridor', name: 'Time Corridor',
+    description: 'The background lags in time behind the foreground, then falls out of focus. Distance becomes age.',
+    category: '3D / Depth', color: '#9a8cff',
+    subGraph: {
+      nodes: [
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 9.0, u_dp_w_focus: 0.5, u_dp_w_aerial: 0.3 } },
+        { type: 'TIME_SLICE_3D', name: 'Depth Freeze', relPos: { x: 250, y: 0 }, params: { u_ts_mode: 3, u_ts_persist: 0.88, u_ts_depth_rate: 0.8, u_ts_tint_amt: 0.25 }, audioWire: ['bass'] },
+        // DOF on top of the temporal lag: the far field is both old AND soft,
+        // which is what stops the freeze reading as a glitch.
+        { type: 'BOKEH_3D', name: 'Lens', relPos: { x: 500, y: 0 }, params: { u_bk_focus: 0.3, u_bk_range: 0.16, u_bk_aperture: 14.0, u_bk_highlight: 2.0 } },
+      ],
+      edges: [
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+        { from: 0, fromSocket: 'output', to: 2, toSocket: 'depth_map' },
+      ],
+    },
+  },
+  {
+    id: 'liquid_depth', name: 'Liquid Depth',
+    description: 'A shockwave travelling through depth, lit like wet glass. Ripples move toward camera, not across the screen.',
+    category: '3D / Depth', color: '#e08adf',
+    subGraph: {
+      nodes: [
+        { type: 'DEPTH', name: 'Depth', relPos: { x: 0, y: 180 }, params: { u_dp_mode: 0, u_dp_smooth: 8.0, u_dp_w_focus: 0.5, u_dp_w_luma: 0.3 } },
+        { type: 'DEPTH_DISPLACE', name: 'Ripple', relPos: { x: 250, y: 0 }, params: { u_dd_mode: 5, u_dd_amount: 0.05, u_dd_freq: 12.0, u_dd_speed: 1.2, u_dd_relief: 50.0, u_dd_chroma: 0.25 }, audioWire: ['bass', 'mid'] },
+        { type: 'RELIGHT_3D', name: 'Wet', relPos: { x: 500, y: 0 }, params: { u_rl_mode: 5, u_rl_relief: 55.0, u_rl_key_int: 1.0, u_rl_spec: 1.2, u_rl_shine: 64.0, u_rl_rim: 0.7, u_rl_mix: 0.75 } },
+      ],
+      edges: [
+        { from: 1, fromSocket: 'output', to: 2, toSocket: 'input' },
+        { from: 0, fromSocket: 'output', to: 1, toSocket: 'depth_map' },
+        { from: 0, fromSocket: 'output', to: 2, toSocket: 'depth_map' },
+      ],
+    },
+  },
 ]
 
 /**

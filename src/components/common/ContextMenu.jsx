@@ -5,7 +5,12 @@
  * position-clamped after mount from its real measured size rather than a
  * hard-coded width guess.
  *
- * items: [{ label, hint, icon, danger, disabled, onSelect } | { separator: true }]
+ * items: [{ label, hint, icon, shortcut, danger, disabled, checked, onSelect }
+ *          | { separator: true }]
+ *
+ * `shortcut` renders right-aligned (the usual place for a key hint); `checked`
+ * shows a ✓ in the icon slot for toggle items, so callers don't have to fake it
+ * by rewriting the label.
  */
 
 import { useRef, useEffect, useLayoutEffect, useState } from 'react'
@@ -68,7 +73,8 @@ export default function ContextMenu({ x, y, header, items = [], onClose }) {
           <button
             key={item.label + i}
             type="button"
-            className={`ctx-menu__item ${item.danger ? 'ctx-menu__item--danger' : ''}`}
+            className={`ctx-menu__item ${item.danger ? 'ctx-menu__item--danger' : ''} ${item.checked ? 'ctx-menu__item--checked' : ''}`}
+            aria-pressed={item.checked == null ? undefined : !!item.checked}
             disabled={item.disabled}
             title={item.hint || ''}
             onClick={() => {
@@ -79,6 +85,10 @@ export default function ContextMenu({ x, y, header, items = [], onClose }) {
           >
             {item.icon && <span className="ctx-menu__icon">{item.icon}</span>}
             <span className="ctx-menu__label">{item.label}</span>
+            {/* An active toggle gets a ✓ AND a tinted row — the icon slot keeps
+                the item's own glyph, so its identity doesn't flicker on toggle. */}
+            {item.checked && <span className="ctx-menu__check">✓</span>}
+            {item.shortcut && <span className="ctx-menu__shortcut mono">{item.shortcut}</span>}
           </button>
         )
       ))}

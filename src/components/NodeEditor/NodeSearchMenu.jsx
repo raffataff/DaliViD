@@ -57,7 +57,7 @@ const NODE_CATALOG = [
       { type: 'VORONOI', name: 'Voronoi / Cellular' },
       { type: 'FLUID_WARP', name: 'Fluid Warp' },
       { type: 'HALFTONE', name: 'Halftone' },
-      { type: 'DEPTH_BLUR', name: 'Depth-Based Blur' },
+      { type: 'DEPTH_BLUR', name: 'Depth-Based Blur (simple)' },
       { type: 'PARTICLE_DISPLACE', name: 'Particle Displace' },
       { type: 'EMBOSS', name: 'Emboss' },
       { type: 'ASCII', name: 'ASCII Art' },
@@ -71,6 +71,25 @@ const NODE_CATALOG = [
       { type: 'BLUR', name: 'Gaussian Blur' },
       { type: 'PIXELATE', name: 'Pixelate' },
       { type: 'DISPLACEMENT', name: 'Displacement Map' },
+    ],
+  },
+  {
+    // Depth first in the list on purpose: every other node here consumes its
+    // output, so the order reads as the order you build the graph in.
+    category: '3D / Depth',
+    items: [
+      { type: 'DEPTH', name: 'Depth Estimate' },
+      { type: 'NORMALS_3D', name: 'Normals / Curvature' },
+      { type: 'CAMERA_3D', name: '3D Camera (Parallax)' },
+      { type: 'MULTIPLANE', name: 'Multiplane (Cutout Layers)' },
+      { type: 'STEREO_3D', name: 'Stereo 3D / Anaglyph' },
+      { type: 'VOXEL_3D', name: 'Voxel / Block Extrude' },
+      { type: 'DEPTH_DISPLACE', name: 'Depth Displace (Inflate / Melt)' },
+      { type: 'TIME_SLICE_3D', name: 'Time Slice (Z = Time)' },
+      { type: 'RELIGHT_3D', name: 'Relight 3D' },
+      { type: 'AO_3D', name: 'Ambient Occlusion' },
+      { type: 'BOKEH_3D', name: 'Bokeh / Depth of Field' },
+      { type: 'FOG_3D', name: 'Fog / Atmosphere' },
     ],
   },
   {

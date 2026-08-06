@@ -58,6 +58,15 @@ const useAppStore = create(
     // master effect chain (true) or show the node's raw output in isolation
     // (false). Lets you "tap" a node both with and without master FX applied.
     previewThroughMaster: false,
+    // What "transparent" looks like in the preview. 'black' is the NLE default
+    // and the one the present pass gets for free; 'checker' / 'white' cost one
+    // extra pass and exist so you can SEE a key or an alpha source instead of
+    // guessing whether that black area is picture or hole. `previewAlphaView`
+    // replaces the picture with its alpha channel as greyscale (matte view).
+    // View state, not project state — deliberately not serialized, so a project
+    // never opens with a diagnostic view left on.
+    previewBackdrop: 'black', // 'black' | 'checker' | 'white'
+    previewAlphaView: false,
     exportModalOpen: false,
     newProjectModalOpen: false,
     welcomeShown: false,
@@ -114,6 +123,16 @@ const useAppStore = create(
       masterBars: { ...state.masterBars, ...patch },
       autosaveState: 'unsaved',
     })),
+    // Preview transparency display. No `autosaveState` bump — these are view
+    // settings, not edits, and marking the project dirty for looking at it
+    // would fight the unsaved-changes warning.
+    setPreviewBackdrop: (previewBackdrop) => set({ previewBackdrop }),
+    cyclePreviewBackdrop: () => set((state) => ({
+      previewBackdrop: state.previewBackdrop === 'black' ? 'checker'
+        : state.previewBackdrop === 'checker' ? 'white' : 'black',
+    })),
+    togglePreviewAlphaView: () => set((state) => ({ previewAlphaView: !state.previewAlphaView })),
+
     toggleMasterBars: () => set((state) => ({
       masterBars: { ...state.masterBars, enabled: !state.masterBars.enabled },
       autosaveState: 'unsaved',

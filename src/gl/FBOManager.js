@@ -28,7 +28,26 @@ export class FBOManager {
    */
   create(id, width, height, options = {}) {
     const gl = this.gl
-    const { halfFloat = true } = options
+    // `fixedSize` opts an FBO out of resizeAll. Almost every FBO here is a
+    // full-frame buffer that must track the canvas, but a few are sized for
+    // their own purpose (the alpha probe's 64×64 sample grid) and silently
+    // growing them to canvas size would change what they measure.
+    //
+    // `scale` renders a pass at a FRACTION of the canvas size. Unlike fixedSize
+    // it still tracks the canvas — resize() re-applies the ratio — so a 0.5×
+    // target stays 0.5× across a resolution change. This is what lets a
+    // low-frequency pass (depth estimation, and later AO / volumetrics) cost a
+    // quarter or a sixteenth of the pixels while every consumer keeps sampling
+    // it with plain normalized UVs and gets a free bilinear upsample.
+    //
+    // NOTE: width/height are the CANVAS dimensions; the scale is applied here, so
+    // callers never do the arithmetic and `resize` can reproduce it from `scale`
+    // alone. The RGBA8 fallback below re-enters with the canvas dimensions for
+    // exactly that reason — scaling them here first would square the ratio.
+    const { halfFloat = true, fixedSize = false, scale = 1 } = options
+    const sc = Math.max(0.05, Math.min(1, scale))
+    const w = Math.max(1, Math.round(width * sc))
+    const h = Math.max(1, Math.round(height * sc))
 
     const fbo = gl.createFramebuffer()
     const texture = gl.createTexture()
@@ -47,7 +66,7 @@ export class FBOManager {
     }
 
     gl.bindTexture(gl.TEXTURE_2D, texture)
-    gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, width, height, 0, format, type, null)
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, w, h, 0, format, type, null)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
@@ -64,15 +83,25 @@ export class FBOManager {
       if (halfFloat && this._hasHalfFloat) {
         gl.deleteFramebuffer(fbo)
         gl.deleteTexture(texture)
-        return this.create(id, width, height, { halfFloat: false })
+        return this.create(id, width, height, { halfFloat: false, fixedSize, scale })
       }
     }
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
 
-    const entry = { fbo, texture, width, height, internalFormat, format, type }
+    const entry = { fbo, texture, width: w, height: h, internalFormat, format, type, fixedSize, scale: sc }
     this.fbos.set(id, entry)
     return entry
+  }
+
+  /**
+   * The scale an FBO was created with (1 when unscaled / unknown). The executor
+   * uses this to notice that a node's Resolution param changed, which `resize`
+   * deliberately cannot do for it — see `resize`.
+   */
+  getScale(id) {
+    const entry = this.fbos.get(id)
+    return entry ? (entry.scale || 1) : 1
   }
 
   /**
@@ -151,22 +180,33 @@ export class FBOManager {
     const gl = this.gl
     const entry = this.fbos.get(id)
     if (!entry) return
-    if (entry.width === width && entry.height === height) return
+    if (entry.fixedSize) return
+
+    // Re-apply the FBO's own scale, so a 0.5× target stays 0.5× when the canvas
+    // resolution changes. This deliberately CANNOT change an existing FBO's scale
+    // — the ratio is a property of the buffer, not of the call — so a node whose
+    // Resolution param changed must be destroyed and recreated (the executor's
+    // ensureFBO does that).
+    const sc = entry.scale || 1
+    const w = Math.max(1, Math.round(width * sc))
+    const h = Math.max(1, Math.round(height * sc))
+    if (entry.width === w && entry.height === h) return
 
     gl.bindTexture(gl.TEXTURE_2D, entry.texture)
-    gl.texImage2D(gl.TEXTURE_2D, 0, entry.internalFormat, width, height, 0,
+    gl.texImage2D(gl.TEXTURE_2D, 0, entry.internalFormat, w, h, 0,
                   entry.format, entry.type, null)
-    entry.width = width
-    entry.height = height
+    entry.width = w
+    entry.height = h
   }
 
   /**
-   * Resize all managed FBOs to a new resolution (except the thumbnail FBO).
+   * Resize all managed FBOs to a new resolution. The thumbnail FBO and anything
+   * created with `fixedSize` keep their own dimensions (see `create`).
    */
   resizeAll(width, height) {
     for (const [id] of this.fbos) {
       if (id === '__thumbnail__') continue
-      this.resize(id, width, height)
+      this.resize(id, width, height) // no-ops for fixedSize entries
     }
   }
 
