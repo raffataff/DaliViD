@@ -19,7 +19,10 @@ export default [
         sourceType: 'module',
       },
     },
-    settings: { react: { version: '18.3' } },
+    // Must track the installed react-dom major: eslint-plugin-react gates
+    // version-specific rules on it, so a stale value silently disables React 19
+    // checks (and re-enables ones React 19 no longer needs).
+    settings: { react: { version: '19.0' } },
     plugins: {
       react,
       'react-hooks': reactHooks,

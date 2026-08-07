@@ -1657,12 +1657,6 @@ export class Renderer {
     let accumReadId = accumAId
     let accumWriteId = accumBId
 
-    // Scratch buffer for transition-OUT only: the "before" state of the frame
-    // (this clip already composited over the accumulator), which the transition
-    // reads as u_from while dissolving TO the bare accumulator. Created lazily
-    // on first use so a project with no transition-out never allocates it.
-    const scratchId = '__compositor_scratch'
-
     // Start from a fully transparent backdrop so uncovered regions / gaps read
     // as nothing (spec: a track with no active clip contributes vec4(0.0)).
     this.fbos.bind(accumReadId)
@@ -2246,7 +2240,7 @@ export class Renderer {
     )
     if (!resultFBO) return false
 
-    this._compositeTrack(backdropFBOId, destFBOId, resultFBO, 0 /* Normal */, opacity)
+    this._compositeTrack(baseFBOId, destFBOId, resultFBO, 0 /* Normal */, opacity)
     return true
   }
 

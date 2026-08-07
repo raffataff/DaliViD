@@ -24,8 +24,17 @@ section rather than reading whole).
 - `npm run smoke:shaders` — dependency-free static validation of every registry shader (structure,
   undeclared `u_*` uniforms after audio injection, `@param` integrity). Also runs as part of lint.
 
+**Node `^20.19 || >=22.12`** (Vite 8 / rolldown), enforced: `engines` in `package.json` plus
+`engine-strict=true` in `.npmrc`, so a stale Node fails at install rather than warning. CI pins the
+same major. This is not theoretical — Node 20.11.1 installed with only an `EBADENGINE` warning and
+then failed the build from inside rolldown with `'node:util' does not provide an export named
+'styleText'` (added in Node 20.12.0), which looks nothing like a Node version problem.
+
 > Note: the Cowork Linux sandbox has been failing to start, so builds/lint often can't be run
-> in-session — verify with `npm run dev` locally.
+> in-session — verify with `npm run dev` locally. **As of 2026-08-07 `npm run lint` (ESLint + the
+> shader smoke test) and `npm run build` both pass**, so anything below claiming "lint/build have
+> NOT been run" refers to when it was written, not to now. Those entries' *static* checks are
+> confirmed; only their runtime (WebGL2) checks are still open.
 
 ## File map (where things live)
 
@@ -369,6 +378,36 @@ section rather than reading whole).
   backlog for the oversampled-clip-input idea.
 
 ## Recently completed
+
+- **Dependency bumps + the first green `lint`/`build` in a while (2026-08-07).** Took Dependabot
+  #17 (`react-dom` 18.3.1 → 19.2.8, `@types/react-dom` → 19.2.4) and #20 (`@vitejs/plugin-react`
+  4.7.0 → 6.0.5). #18/#19 (ESLint 10) are blocked upstream — see the backlog.
+  - **#17 was a repair, not an upgrade.** `package.json` already had `react@^19.2.8` next to
+    `react-dom@^18.3.1`, so the installed tree carried an unsatisfied peer (`react-dom` 18 wants
+    `react: ^18.3.1`). Source needed no changes — `createRoot` + `createPortal` only, no
+    `findDOMNode` / `defaultProps` / string refs. `eslint.config.js`'s `settings.react.version`
+    went 18.3 → 19.0 to match, since eslint-plugin-react gates rules on it.
+  - **#20 was clean because we're already on Vite 8.** plugin-react 6 only drops Babel (Vite 8
+    does React Refresh via Oxc), and `vite.config.js` calls bare `react()` with no `babel` option.
+    Its two new peers are optional.
+  - **Five artifacts of the unfinished edge-transitions rework were fixed to get there.** Two
+    files did not parse, so `npm run build` could not have succeeded on this tree beforehand, and
+    a parse error masks every other diagnostic in its file — each fix revealed the next.
+    `Inspector.jsx` had a duplicated import block, a duplicated `nextOverlap` (the second copy
+    filtered on the **legacy** `clip.transition` field and required the incoming clip to *have* a
+    transition before suppressing this clip's tail — the renderer suppresses on overlap alone, so
+    the panel would have contradicted the picture), an orphan `)}`, a duplicated function tail,
+    and `{isVideoClip && …}` where `isVideoClip` was **declared nowhere** — a `ReferenceError` that
+    killed the whole Clip Inspector. That last one is now `supportsTransition`
+    (`clipSupportsTransform`, i.e. not audio), which is what the adjacent comment always said and
+    restores edge-transition UI on text/image/shape generator clips. Also `Renderer.js` called
+    `_compositeTrack(backdropFBOId, …)` — no such identifier; the parameter is `baseFBOId`, so
+    **every node-graph transition threw at composite time**. Plus dead `scratchId` (Renderer) and
+    `transitionBadgeLabel` (Timeline, superseded by `edgeEffectLabel`).
+  - **Lesson worth keeping:** all of this sat undetected because lint had not run for several
+    sessions while the sandbox was down. The cheap sweep for this artifact class is indented
+    content sitting after a **top-level `}`** — valid module scope only ever has a blank line,
+    another declaration, or EOF there.
 
 - **3D / Depth node family (phases 1–4) — `3D_DEPTH_EFFECTS_PLAN.md` is the design doc.**
   12 nodes, 63 primary modes, 152 params, one shared GLSL header. The architecture is the point:
@@ -1050,6 +1089,27 @@ Ideas surfaced but not yet built (roughly by value-to-effort).
     Monaco picks it up (Dependabot will raise the PR — take it); (2) we add a language service,
     hover provider, completion docs, or otherwise render markdown in the editor, which makes the
     path reachable; (3) the CSP is relaxed to allow inline script.
+
+- **BLOCKED UPSTREAM: ESLint 10 (`eslint` + `@eslint/js`) cannot be taken yet.** Dependabot has two
+  open PRs for it and they must land **together** — `@eslint/js` 10 declares `eslint` in
+  `peerDependencies`, so merging either alone breaks `npm ci`.
+  - **The blocker is `eslint-plugin-react`.** Latest published is still **7.37.5**, whose
+    `peerDependencies` are `eslint: ^3 || … || ^9.7` — no v10 range, and no v10-compatible release
+    exists (tracked at jsx-eslint/eslint-plugin-react#3977). CI runs `npm ci`, which is strict about
+    peers, so this fails the build rather than warning. Forcing it with an override is a bad trade:
+    ESLint 10 **removed the deprecated `context.getScope()`/`SourceCode` methods** that plugin still
+    reaches for, so the failure would move from install time to lint time.
+  - **The other three plugins are already fine**, so the blocker is genuinely singular:
+    `eslint-plugin-react-hooks` 7.1.1 and `eslint-plugin-react-refresh` 0.5.2/0.5.3 both list `^10`.
+    (We are on react-hooks **5.2.0**; 5.x predates v10 support, so that one still needs a bump —
+    note v7 folds the React Compiler rules into `recommended`, which will surface a wave of new
+    findings and is worth doing as its own commit, not bundled into the ESLint 10 jump.)
+  - **Also required when it unblocks:** `@eslint/js` 10 changes the `eslint:recommended` ruleset
+    (expect new errors from `...js.configs.recommended.rules` in `eslint.config.js`), and ESLint 10
+    requires Node `^20.19 || ^22.13 || >=24` — `.github/workflows/ci.yml` pins `node-version: 20`,
+    which resolves to a 20.x new enough to pass, but bumping it to 22 first removes the sharp edge.
+  - **Expiry condition:** `eslint-plugin-react` publishes a release with `^10` in its peer range.
+    Until then leave both Dependabot PRs open; do not merge, do not override.
 
 - **Exported audio is quieter (unconfirmed).** The offline mixdown (`ExportModal.renderTimelineAudio`)
   is unity-gain and no attenuation was found in code. Needs an A/B (exported MP4 audio vs the source

@@ -19,12 +19,6 @@ import {
 } from '../../utils/clipTransitions'
 import { keyAtTime } from '../../utils/keyframes'
 import {
-  EDGE_HEAD, EDGE_TAIL, edgeLabel, getEdgeTransition, setEdgeTransitionPatch,
-  findPrevOverlap, findNextOverlap, headRegion, tailRegion,
-  transitionGraphKey, GRAPH_TYPE, isGraphType, isCompoundType, compoundIdOf,
-} from '../../utils/clipTransitions'
-import { keyAtTime } from '../../utils/keyframes'
-import {
   ALPHA_AUTO, ALPHA_MODES, ALPHA_DETECTION_LABELS, ALPHA_PREMULTIPLIED,
   alphaSourceKey, resolveAlphaMode,
 } from '../../utils/alphaModes'
@@ -835,33 +829,12 @@ function ClipInspector({ clipId }) {
     [EDGE_HEAD]: headRegion(clip, findPrevOverlap(clip, clips)),
     [EDGE_TAIL]: tailRegion(clip, findNextOverlap(clip, clips)),
   }
+  // Consumed by the TAIL's EdgeTransitionSection, which explains in words why a
+  // tail transition is unavailable: a later clip overlapping this clip's end
+  // means that cut already belongs to the incoming clip's HEAD. Resolved with
+  // findNextOverlap over the full clip list — the same call clipTransitions and
+  // the renderer make — so the panel can't disagree with what actually renders.
   const nextOverlap = findNextOverlap(clip, clips)
-
-  // A later clip overlapping this clip's fade-out window. If it runs its own
-  // transition-in, that window is already spoken for and this clip's
-  // transition-out is suppressed (the renderer makes the same call per frame).
-  const fadeOutStart = clip.timelineEnd - Math.min(clip.fadeOut || 0, clip.timelineEnd - clip.timelineStart)
-  const nextOverlap = clips
-    .filter(c => c.trackId === clip.trackId && c.id !== clip.id && c.transition?.type &&
-      c.timelineStart > clip.timelineStart && c.timelineStart < clip.timelineEnd &&
-      c.timelineEnd > fadeOutStart)
-    .sort((a, b) => a.timelineStart - b.timelineStart)[0] || null
-  const nextOwnsWindow = !!nextOverlap
-
-  // Duration hints. In: the overlap if there is one, else the fade-in handle
-  // (blending in from whatever is underneath — the lower tracks, or nothing).
-  // Out: always the fade-out handle.
-  const inHint = overlapDur > 0.001
-    ? { ok: true, text: `Plays over the ${overlapDur.toFixed(2)}s overlap with “${prevOverlap.filename}”` }
-    : (clip.fadeIn > 0
-      ? { ok: true, text: `No overlap — blends in from whatever is underneath over the ${(clip.fadeIn).toFixed(2)}s fade-in handle` }
-      : { ok: false, text: 'Set a Fade In above (or drag the clip’s left fade handle) to give this a duration — or overlap the previous clip' })
-
-  const outHint = nextOwnsWindow
-    ? { ok: false, text: `“${nextOverlap.filename}” overlaps this clip’s end and runs its own transition-in, which owns that window` }
-    : (clip.fadeOut > 0
-      ? { ok: true, text: `Blends out to whatever is underneath over the ${(clip.fadeOut).toFixed(2)}s fade-out handle` }
-      : { ok: false, text: 'Set a Fade Out above (or drag the clip’s right fade handle) to give this a duration' })
 
   return (
     <div className="inspector__section">
@@ -925,7 +898,6 @@ function ClipInspector({ clipId }) {
           <ClipTransformEditor clip={clip} />
         </>
       )}
-      )}
 
       {clip.fileType === 'text' && (
         <>
@@ -969,7 +941,7 @@ function ClipInspector({ clipId }) {
         </>
       )}
 
-      {isVideoClip && [EDGE_HEAD, EDGE_TAIL].map(edge => (
+      {supportsTransition && [EDGE_HEAD, EDGE_TAIL].map(edge => (
         <EdgeTransitionSection
           key={edge}
           clip={clip}
@@ -1109,10 +1081,6 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
           isConnected={false}
         />
       ))}
-    </>
-  )
-}
-      )}
     </>
   )
 }
