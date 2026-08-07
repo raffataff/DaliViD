@@ -60,7 +60,6 @@ function migrateGraphNodes(nodes) {
   })
   return changed ? out : nodes
 }
-}
 
 /**
  * Serialize the entire project state into a plain object.

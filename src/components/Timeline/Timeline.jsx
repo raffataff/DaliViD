@@ -22,18 +22,6 @@ import './Timeline.css'
 const DEFAULT_EDGE_SECONDS = 1
 
 /**
- * Human-readable name for a clip transition, for the ⇄ badge tooltip.
- * "compound:<libId>" resolves against the compound library; a stale id (the
- * entry was deleted) reads as unknown rather than leaking the raw id.
- */
-function transitionBadgeLabel(type, compoundLibrary) {
-  if (!type) return ''
-  if (!type.startsWith('compound:')) return getTransitionLabel(type)
-  const id = type.slice('compound:'.length)
-  return compoundLibrary?.find(c => c.id === id)?.name || 'missing node transition'
-}
-
-/**
  * Timeline panel — horizontal ruler, tracks, clips, playhead, zoom.
  * Wired to Zustand stores for real state.
  */
