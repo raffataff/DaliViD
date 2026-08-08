@@ -8,18 +8,22 @@ import ContextMenu from '../common/ContextMenu'
 import { makeImageClipParams, makeTextClipParams, makeShapeClipParams, DEFAULT_GENERATOR_DURATION } from '../../utils/generatorClips'
 import {
   EDGE_HEAD, EDGE_TAIL, edgeLabel, getEdgeTransition, setEdgeTransitionPatch,
-  findPrevOverlap, findNextOverlap, headRegion, tailRegion,
-  edgeHasEffect, edgeDisplaySeconds,
-  transitionGraphKey, GRAPH_TYPE, isGraphType, isCompoundType, compoundIdOf,
+  findPrevOverlap, findNextOverlap, headRegion, tailRegion, edgeRegion,
+  edgeHasEffect, edgeDisplaySeconds, nearestEdge, TRANSITION_DRAG_TYPE,
+  transitionGraphKey, isGraphType, GRAPH_TYPE,
 } from '../../utils/clipTransitions'
-import { TRANSITION_TYPES, getTransitionLabel, getTransitionDefaults } from '../../shaders/transitionRegistry'
-import { isTransitionCompound } from '../../utils/compoundUtils'
+import {
+  applyEdgeType, openEdgeGraphAction, applyTransitionById, transitionLabelOf,
+  groupedTransitionCatalog,
+} from '../../utils/transitionActions'
+import { clearTransitionStatus } from '../../gl/transitionStatus'
 import './Timeline.css'
 
-// Default length given to an edge with no region yet when the user assigns a
-// transition to it. Without this, picking an effect on a clip whose fade handle
-// is still at zero would appear to do nothing at all.
-const DEFAULT_EDGE_SECONDS = 1
+// How close to a clip's start/end (in px) still counts as "that edge" for a
+// right-click, when no wedge is drawn there. Matches the width of the ⇄ hotspot
+// that appears on hover, so the visible affordance and the invisible hit zone
+// are the same target.
+const EDGE_HIT_PX = 22
 
 /**
  * Timeline panel — horizontal ruler, tracks, clips, playhead, zoom.
@@ -79,6 +83,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const selectTrack = useAppStore(s => s.selectTrack)
   const selectedClipId = useAppStore(s => s.selectedClipId)
   const enterClipGraph = useAppStore(s => s.enterClipGraph)
+  const defaultTransition = useAppStore(s => s.defaultTransition)
   const clipGraphs = useGraphStore(s => s.clipGraphs)
   const initClipGraph = useGraphStore(s => s.initClipGraph)
   const compoundLibrary = useGraphStore(s => s.compoundLibrary)
@@ -329,18 +334,61 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   }, [pxPerSec, selectClip, moveClip, collectSnapPoints, snapClipStart])
 
   // ── Drag & drop generator clips (text / image) onto a video track ──
-  const handleTrackDragOver = useCallback((e) => {
-    if (e.dataTransfer.types.includes('application/dalivid-drag')) {
-      e.preventDefault()
-      e.dataTransfer.dropEffect = 'copy'
-    }
+  //
+  // A transition drag is the other thing that lands here, and it needs a hover
+  // highlight (which of the clip's two edges will it land on?) that a generator
+  // drag must NOT get. `getData` is blocked outside `drop`, so the two are told
+  // apart by the marker MIME type the Transitions browser sets alongside the
+  // payload — `types` is readable during dragover, values are not.
+  const [transitionDrop, setTransitionDrop] = useState(null) // { clipId, edge }
+
+  /** The clip under a client-x on this track, and which of its edges is nearer. */
+  const edgeAtPointer = useCallback((e, track) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const t = (e.clientX - rect.left + timelineScrollLeft) / pxPerSec
+    const all = useTimelineStore.getState().clips
+    const hit = all.find(c => c.trackId === track.id && t >= c.timelineStart && t <= c.timelineEnd)
+    return hit ? { clipId: hit.id, edge: nearestEdge(hit, t) } : null
+  }, [pxPerSec, timelineScrollLeft])
+
+  const handleTrackDragOver = useCallback((e, track) => {
+    if (!e.dataTransfer.types.includes('application/dalivid-drag')) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
+    const isTransition = e.dataTransfer.types.includes(TRANSITION_DRAG_TYPE)
+    setTransitionDrop(isTransition && track?.type === 'video' ? edgeAtPointer(e, track) : null)
+  }, [edgeAtPointer])
+
+  // dragleave bubbles up from every clip inside the lane, so an unconditional
+  // clear makes the highlight strobe as the pointer crosses child elements.
+  // Only a leave that actually exits the lane counts.
+  const handleTrackDragLeave = useCallback((e) => {
+    if (e.currentTarget.contains(e.relatedTarget)) return
+    setTransitionDrop(null)
   }, [])
 
   const handleTrackDrop = useCallback((e, track) => {
     const raw = e.dataTransfer.getData('application/dalivid-drag')
+    setTransitionDrop(null)
     if (!raw) return
     let payload
     try { payload = JSON.parse(raw) } catch { return }
+
+    // A transition dropped from the browser lands on the nearer edge of the clip
+    // under the cursor — drop on the front half for an In, the back half for an
+    // Out. Same gesture as dropping a transition on a cut in any NLE, and it is
+    // the reason `transitionCatalog` types are directly consumable: no branch
+    // here for built-in vs library vs private graph.
+    if (payload.kind === 'transition') {
+      e.preventDefault()
+      e.stopPropagation()
+      if (track.type !== 'video') return
+      const target = edgeAtPointer(e, track)
+      if (!target) return
+      applyTransitionById(target.clipId, target.edge, payload.transitionType ?? null)
+      selectClip(target.clipId)
+      return
+    }
 
     // A drop makes a generator CLIP. Media-Pool image cards and text/shape preset
     // cards all land here; node-graph drags (kind:'node' with no generator type)
@@ -380,7 +428,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     })
     initClipGraph(clipId, filename, clipType)
     selectClip(clipId)
-  }, [pxPerSec, timelineScrollLeft, addClip, initClipGraph, selectClip])
+  }, [pxPerSec, timelineScrollLeft, addClip, initClipGraph, selectClip, edgeAtPointer])
 
   // Trim handle drag (left or right edge). Edge snaps to targets; Shift disables.
   const handleTrimMouseDown = useCallback((e, clip, edge) => {
@@ -607,12 +655,24 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     const headSecs = edgeDisplaySeconds(clip, EDGE_HEAD, headRegion(clip, findPrevOverlap(clip, all)))
     const tailSecs = edgeDisplaySeconds(clip, EDGE_TAIL, tailRegion(clip, findNextOverlap(clip, all)))
     const rect = e.currentTarget.getBoundingClientRect()
-    const t = clip.timelineStart + ((e.clientX - rect.left) / Math.max(1, rect.width)) *
+    const px = e.clientX - rect.left
+    const t = clip.timelineStart + (px / Math.max(1, rect.width)) *
       (clip.timelineEnd - clip.timelineStart)
 
+    // The wedge, OR a fixed pixel zone at each end when there is no wedge yet.
+    //
+    // Without the pixel fallback, a clip with no fades has zero-width wedges, so
+    // there is physically nothing to right-click and the edge menus are reachable
+    // only from a submenu of the clip menu. That made "add a transition to this
+    // cut" — the single most common transition gesture in any NLE — the least
+    // discoverable thing in the app. The zone is capped at a third of the clip so
+    // a very short clip still has a middle that opens clip actions.
+    const zonePx = Math.min(EDGE_HIT_PX, rect.width / 3)
     let edge = null
     if (headSecs > 0 && t < clip.timelineStart + headSecs) edge = EDGE_HEAD
     else if (tailSecs > 0 && t >= clip.timelineEnd - tailSecs) edge = EDGE_TAIL
+    else if (px < zonePx) edge = EDGE_HEAD
+    else if (px > rect.width - zonePx) edge = EDGE_TAIL
 
     setClipMenu({
       x: e.clientX,
@@ -625,8 +685,10 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   }, [selectClip])
 
   const closeClipMenu = useCallback(() => setClipMenu(null), [])
+  // `group` is reset on every view change so the effect picker always opens on
+  // its category list rather than on whichever category was browsed last time.
   const setMenuView = useCallback((view, edge) => {
-    setClipMenu(m => (m ? { ...m, view, edge: edge || m.edge } : m))
+    setClipMenu(m => (m ? { ...m, view, edge: edge || m.edge, group: null } : m))
   }, [])
 
   // Duplicate: the copy needs its own deep-copied effect graph (same reasoning
@@ -669,76 +731,37 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
 
   /** The live region for one edge, recomputed from current clip positions. */
   const edgeRegionOf = useCallback((clip, edge) => {
-    const all = useTimelineStore.getState().clips
-    return edge === EDGE_TAIL
-      ? tailRegion(clip, findNextOverlap(clip, all))
-      : headRegion(clip, findPrevOverlap(clip, all))
+    return edgeRegion(clip, useTimelineStore.getState().clips, edge)
   }, [])
 
   /**
-   * Assign an effect to one edge. Two things have to happen together or the
-   * result looks broken: the region needs a non-zero length (assigning a
-   * transition to an edge whose handle is still at 0 would otherwise be a
-   * no-op), and a 'graph' type needs its graph to exist before the renderer
-   * looks for it.
+   * Assign an effect to one edge. Shared with the Inspector's picker via
+   * `applyEdgeType` so the two routes cannot drift — they used to, and the
+   * Inspector's silently produced transitions with no window to play in.
    */
   const setEdgeType = useCallback((clip, edge, type) => {
-    const patch = {}
-
-    // Give the edge a default length if it has none. A head region backed by an
-    // overlap already has its length from the overlap, so it's left alone.
-    const region = edgeRegionOf(clip, edge)
-    if (!region) {
-      const maxLen = Math.max(0.1, (clip.timelineEnd - clip.timelineStart) / 2)
-      const len = Math.min(DEFAULT_EDGE_SECONDS, maxLen)
-      patch[edge === EDGE_TAIL ? 'fadeOut' : 'fadeIn'] = len
-    }
-
-    if (!type) {
-      // "Fade" — hand the window back to the plain opacity ramp. The private
-      // graph is deliberately kept: switching effects to compare them shouldn't
-      // throw away a graph the user built.
-      Object.assign(patch, setEdgeTransitionPatch(edge, null))
-      updateClip(clip.id, patch)
-      return
-    }
-
-    if (isGraphType(type)) {
-      const key = transitionGraphKey(clip.id, edge)
-      if (!useGraphStore.getState().clipGraphs[key]) {
-        // Seed from the compound this edge was already using, if any, so
-        // "Crossfade → Node Graph" opens on the thing you were just looking at.
-        const prev = getEdgeTransition(clip, edge)
-        const seed = isCompoundType(prev?.type)
-          ? compoundLibrary.find(c => c.id === compoundIdOf(prev.type))?.subGraph
-          : null
-        useGraphStore.getState().initTransitionGraph(clip.id, edge, seed || null)
-      }
-      Object.assign(patch, setEdgeTransitionPatch(edge, { type: GRAPH_TYPE, params: {} }))
-    } else {
-      // Built-ins start from their registry defaults; compounds start empty —
-      // the library entry's exposedParams carry their own defaults.
-      const params = isCompoundType(type) ? {} : getTransitionDefaults(type)
-      Object.assign(patch, setEdgeTransitionPatch(edge, { type, params }))
-    }
-
-    updateClip(clip.id, patch)
+    applyEdgeType(clip, edge, type, edgeRegionOf(clip, edge), updateClip, compoundLibrary)
   }, [updateClip, edgeRegionOf, compoundLibrary])
 
   /** Open this edge's node graph in the editor, converting to one if needed. */
   const openEdgeGraph = useCallback((clip, edge) => {
-    const tr = getEdgeTransition(clip, edge)
-    if (!isGraphType(tr?.type)) setEdgeType(clip, edge, GRAPH_TYPE)
+    openEdgeGraphAction(clip, edge, edgeRegionOf(clip, edge), {
+      updateClip, compoundLibrary, enterClipGraph, setPlayheadTime,
+    })
+  }, [edgeRegionOf, updateClip, compoundLibrary, enterClipGraph, setPlayheadTime])
 
-    // Park the playhead mid-region so the editor opens on the transition
-    // half-way through — the frame where you can actually see what it does.
-    // Read the region AFTER setEdgeType, which may have just created it.
-    const clipNow = useTimelineStore.getState().clips.find(c => c.id === clip.id) || clip
-    const region = edgeRegionOf(clipNow, edge)
-    if (region) setPlayheadTime(region.start + region.dur * 0.5)
+  /**
+   * Apply the project's default transition to one edge — the payload behind the
+   * ⇄ hotspots, the T shortcut and a click in the Transitions browser. One
+   * gesture, no picker: choosing between two dozen effects before you can have
+   * any transition at all is the thing every NLE avoids with a default.
+   */
+  const applyDefaultTransition = useCallback((clipId, edge) => {
+    applyTransitionById(clipId, edge, useAppStore.getState().defaultTransition)
+    selectClip(clipId)
+  }, [selectClip])
 
-    enterClipGraph(transitionGraphKey(clip.id, edge))
-  }, [setEdgeType, edgeRegionOf, enterClipGraph, setPlayheadTime])
+  const defaultTransitionLabel = transitionLabelOf(defaultTransition, compoundLibrary)
 
   /** Clear the edge entirely: no effect, no ramp, no graph. */
   const clearEdge = useCallback((clip, edge) => {
@@ -747,6 +770,9 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
       [edge === EDGE_TAIL ? 'fadeOut' : 'fadeIn']: 0,
     })
     useGraphStore.getState().removeTransitionGraph(clip.id, edge)
+    // The edge no longer composites, so nothing will ever overwrite a stale
+    // health note left over from the effect just removed.
+    clearTransitionStatus(transitionGraphKey(clip.id, edge))
   }, [updateClip])
 
   const promoteEdgeGraph = useCallback((clip, edge) => {
@@ -757,18 +783,13 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   // Built fresh each render from live clip state, so a toggle (Reverse, Mute)
   // updates its own ✓ without closing the menu.
   const menuClip = clipMenu ? clips.find(c => c.id === clipMenu.clipId) : null
-  // Library compounds usable as a transition (≥ 2 image inputs to bind FROM/TO).
-  const transitionCompounds = compoundLibrary.filter(isTransitionCompound)
 
   /** Human name for whatever effect an edge currently carries. */
   const edgeEffectLabel = (clip, edge) => {
-    const tr = getEdgeTransition(clip, edge)
-    if (!tr?.type) return 'Fade (opacity ramp)'
-    if (isGraphType(tr.type)) return 'Node Graph (this clip)'
-    if (isCompoundType(tr.type)) {
-      return compoundLibrary.find(c => c.id === compoundIdOf(tr.type))?.name || 'Missing compound'
-    }
-    return getTransitionLabel(tr.type)
+    const type = getEdgeTransition(clip, edge)?.type
+    if (!type) return 'Fade (opacity ramp)'
+    if (isGraphType(type)) return 'Node Graph (this clip)'
+    return transitionLabelOf(type, compoundLibrary)
   }
 
   // ── Menu view: one edge's actions ──
@@ -805,6 +826,17 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     }
     items.push({ separator: true })
 
+    // The one-click route, first, so the common case never requires choosing
+    // from a list of two dozen. Hidden once the edge already has an effect —
+    // "apply the default" over an existing choice is a silent overwrite.
+    if (!tr?.type) {
+      items.push({
+        label: `Apply Default: ${defaultTransitionLabel}`,
+        icon: '★',
+        hint: 'Same as pressing T, or clicking the ⇄ hotspot on this end of the clip',
+        onSelect: () => applyDefaultTransition(clip.id, edge),
+      })
+    }
     items.push({
       label: `Effect: ${edgeEffectLabel(clip, edge)}`,
       icon: '⇄',
@@ -860,42 +892,63 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   }
 
   // ── Menu view: effect picker for one edge ──
+  //
+  // Built from the shared catalog and split by its `category`, with one category
+  // shown at a time. A flat list of every built-in was fine at nine entries and
+  // is unusable at thirty-plus — and duplicating the grouping here rather than
+  // reading `groupedTransitionCatalog` would let it drift from the Media Pool
+  // and the Inspector, which is exactly what this pass has been undoing.
   const edgeTypeMenuItems = (clip, edge) => {
     const current = getEdgeTransition(clip, edge)?.type || null
-    const items = [{
-      label: 'Fade (opacity ramp)',
-      icon: '◺',
-      checked: !current,
-      hint: 'The default — a straight linear ramp across the region',
-      onSelect: () => setEdgeType(clip, edge, null),
-    }, { separator: true }]
+    const groups = groupedTransitionCatalog(compoundLibrary)
+    const openGroup = clipMenu?.group || null
 
-    for (const t of TRANSITION_TYPES) {
-      items.push({
-        label: getTransitionLabel(t),
-        icon: '⇄',
-        checked: current === t,
-        onSelect: () => setEdgeType(clip, edge, t),
-      })
+    if (!openGroup) {
+      const items = []
+      for (const { group, items: entries } of groups) {
+        // The single-entry groups (Basic's "Fade") are worth showing inline —
+        // burying one item behind a category is pure friction.
+        if (entries.length === 1) {
+          const e = entries[0]
+          items.push({
+            label: e.label,
+            icon: '◺',
+            checked: (current || '') === e.type,
+            hint: e.description,
+            onSelect: () => setEdgeType(clip, edge, e.type || null),
+          })
+          continue
+        }
+        const hasCurrent = entries.some(e => e.type === current)
+        items.push({
+          label: `${group}…`,
+          icon: hasCurrent ? '●' : '⇄',
+          hint: `${entries.length} transitions`,
+          keepOpen: true,
+          onSelect: () => setClipMenu(m => (m ? { ...m, group } : m)),
+        })
+      }
+      return items
     }
 
+    const entries = groups.find(g => g.group === openGroup)?.items || []
+    const items = entries.map(e => ({
+      label: e.type === GRAPH_TYPE ? 'Node Graph (this clip)' : e.label,
+      icon: e.group === 'Node Graph' ? '❖' : '⇄',
+      checked: (current || '') === e.type,
+      hint: e.description,
+      // A private graph wants the editor opened, not just the type assigned.
+      onSelect: () => (e.type === GRAPH_TYPE
+        ? openEdgeGraph(clip, edge)
+        : setEdgeType(clip, edge, e.type || null)),
+    }))
     items.push({ separator: true })
     items.push({
-      label: 'Node Graph (this clip)',
-      icon: '❖',
-      checked: isGraphType(current),
-      hint: 'A graph owned by this clip edge — edit it without touching anything else',
-      onSelect: () => openEdgeGraph(clip, edge),
+      label: 'All categories…',
+      icon: '↩',
+      keepOpen: true,
+      onSelect: () => setClipMenu(m => (m ? { ...m, group: null } : m)),
     })
-    for (const c of transitionCompounds) {
-      items.push({
-        label: c.name,
-        icon: '❖',
-        checked: current === `compound:${c.id}`,
-        hint: c.description || 'Shared transition from the compound library',
-        onSelect: () => setEdgeType(clip, edge, `compound:${c.id}`),
-      })
-    }
     return items
   }
 
@@ -1026,7 +1079,11 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
       const r = edgeRegionOf(menuClip, clipMenu.edge)
       return `${edgeLabel(clipMenu.edge)} — ${r ? `${r.dur.toFixed(2)}s` : 'no region'} · ${name}`
     }
-    if (clipMenu.view === 'edgeType') return `${edgeLabel(clipMenu.edge)} effect · ${name}`
+    if (clipMenu.view === 'edgeType') {
+      return clipMenu.group
+        ? `${clipMenu.group} · ${edgeLabel(clipMenu.edge)}`
+        : `${edgeLabel(clipMenu.edge)} effect · ${name}`
+    }
     return name
   })()
 
@@ -1287,7 +1344,8 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                   {/* Track Clip Region */}
                   <div
                     className="timeline__track-clips"
-                    onDragOver={handleTrackDragOver}
+                    onDragOver={(e) => handleTrackDragOver(e, track)}
+                    onDragLeave={handleTrackDragLeave}
                     onDrop={(e) => handleTrackDrop(e, track)}
                   >
                     <div style={{ transform: `translateX(-${timelineScrollLeft}px)`, position: 'relative', height: '100%' }}>
@@ -1311,6 +1369,11 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                         const tailFx = supportsFades && edgeHasEffect(clip, EDGE_TAIL, tailR)
                         const fadeInW = Math.min(width, edgeDisplaySeconds(clip, EDGE_HEAD, headR) * pxPerSec)
                         const fadeOutW = Math.min(width, edgeDisplaySeconds(clip, EDGE_TAIL, tailR) * pxPerSec)
+                        // Which edge a transition being dragged over would land
+                        // on. Shown as a lit band so the drop is aimed rather
+                        // than guessed — the two edges of one clip are a single
+                        // pointer target otherwise.
+                        const dropEdge = transitionDrop?.clipId === clip.id ? transitionDrop.edge : null
                         return (
                           <div
                             key={clip.id}
@@ -1328,6 +1391,11 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                               setPlayheadTime(clip.timelineStart)
                             }}
                           >
+                            {dropEdge && (
+                              <div
+                                className={`timeline__clip-drop-edge timeline__clip-drop-edge--${dropEdge === EDGE_TAIL ? 'out' : 'in'}`}
+                              />
+                            )}
                             {/* Left trim handle */}
                             <div
                               className="timeline__clip-trim timeline__clip-trim--left"
@@ -1429,6 +1497,35 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                             )}
                             {(hasGraph || clip.hasEffects) && (
                               <div className="timeline__clip-fx-badge" style={{ color: track.color }}>FX</div>
+                            )}
+                            {/* Add-transition hotspots. Appear on hover at each
+                                end of the clip and apply the default transition
+                                in one click — the equivalent of dropping the
+                                default onto a cut in Premiere/Resolve. They sit
+                                exactly where the invisible right-click edge zone
+                                is (EDGE_HIT_PX), so hovering teaches you where
+                                to right-click. Hidden once that edge already
+                                carries an effect: the wedge is the affordance
+                                from then on. */}
+                            {supportsFades && width > 3 * EDGE_HIT_PX && (
+                              <>
+                                {!headFx && (
+                                  <button
+                                    className="timeline__clip-edge-add timeline__clip-edge-add--in"
+                                    title={`Add ${defaultTransitionLabel} to this clip's start (T)`}
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                    onClick={(e) => { e.stopPropagation(); applyDefaultTransition(clip.id, EDGE_HEAD) }}
+                                  >⇄</button>
+                                )}
+                                {!tailFx && (
+                                  <button
+                                    className="timeline__clip-edge-add timeline__clip-edge-add--out"
+                                    title={`Add ${defaultTransitionLabel} to this clip's end (T)`}
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                    onClick={(e) => { e.stopPropagation(); applyDefaultTransition(clip.id, EDGE_TAIL) }}
+                                  >⇄</button>
+                                )}
+                              </>
                             )}
                             {/* Fallback marker for wedges too narrow to fit a label. */}
                             {((headFx && fadeInW <= 34) || (tailFx && fadeOutW <= 34)) && (

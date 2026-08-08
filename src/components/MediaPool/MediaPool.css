@@ -198,6 +198,105 @@
   gap: var(--space-xs);
 }
 
+/* ── Transitions tab ── */
+.media-pool__transitions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.media-pool__transitions-hint {
+  padding: var(--space-xs) var(--space-sm);
+  font-size: 9px;
+  line-height: 1.5;
+  color: var(--text-disabled);
+  background: var(--bg-base);
+  border-radius: var(--radius-md);
+}
+
+.media-pool__transitions-hint kbd {
+  padding: 0 3px;
+  font-family: var(--font-code);
+  font-size: 9px;
+  color: var(--text-secondary);
+  background: var(--bg-hover);
+  border: 1px solid var(--border-subtle);
+  border-radius: 2px;
+}
+
+.media-pool__transitions-search {
+  width: 100%;
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.media-pool__transitions-search:focus {
+  outline: none;
+  border-color: var(--accent-cyan);
+}
+
+.media-pool__transitions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: var(--space-xs);
+}
+
+.media-pool__transition-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-xs);
+  border-radius: var(--radius-md);
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  cursor: grab;
+  transition: all var(--duration-fast);
+  user-select: none;
+}
+.media-pool__transition-card:hover {
+  border-color: var(--accent-cyan);
+  background: var(--bg-hover);
+  box-shadow: var(--shadow-sm);
+}
+.media-pool__transition-card:active { cursor: grabbing; opacity: 0.7; }
+
+.media-pool__transition-card--default {
+  border-color: var(--accent-cyan);
+  background: color-mix(in srgb, var(--accent-cyan) 10%, var(--bg-base));
+}
+
+.media-pool__transition-icon {
+  font-size: 13px;
+  color: var(--accent-cyan);
+  line-height: 1;
+}
+
+.media-pool__transition-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.2;
+}
+
+.media-pool__transition-star { color: var(--accent-cyan); font-size: 9px; }
+
+.media-pool__transition-desc {
+  font-size: 9px;
+  line-height: 1.35;
+  color: var(--text-disabled);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 .media-pool__preset-card {
   display: flex;
   flex-direction: column;

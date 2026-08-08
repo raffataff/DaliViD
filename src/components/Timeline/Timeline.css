@@ -531,6 +531,68 @@
 .timeline__clip-transition-badge--in { left: 4px; }
 .timeline__clip-transition-badge--out { right: 4px; }
 
+/* ── Add-transition hotspots ──
+   One click applies the default transition to that end of the clip. Hidden
+   until hover so the timeline stays quiet, but they occupy exactly the zone
+   that right-click treats as "this edge" (EDGE_HIT_PX in Timeline.jsx), so
+   discovering one teaches the other. */
+.timeline__clip-edge-add {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-primary);
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid var(--accent-cyan);
+  border-radius: 50%;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 90ms ease;
+  /* Below the trim handles (5) and the fade handles (6) on purpose: those two
+     are precision drags on a 5–9px target, and this is a fat click zone that
+     would otherwise swallow their edges. Inset past the 5px trim strip for the
+     same reason. */
+  z-index: 4;
+  cursor: pointer;
+}
+
+.timeline__clip-edge-add--in { left: 7px; }
+.timeline__clip-edge-add--out { right: 7px; }
+
+.timeline__clip:hover .timeline__clip-edge-add {
+  opacity: 0.85;
+  pointer-events: auto;
+}
+
+.timeline__clip-edge-add:hover {
+  opacity: 1;
+  background: var(--accent-cyan);
+  color: #06212a;
+}
+
+/* Drop target band while a transition is dragged over this clip — names which
+   of the two edges the drop will land on. */
+.timeline__clip-drop-edge {
+  position: absolute;
+  top: 0;
+  width: 28px;
+  height: 100%;
+  pointer-events: none;
+  background: linear-gradient(var(--accent-cyan), var(--accent-cyan));
+  opacity: 0.35;
+  z-index: 4;
+}
+
+.timeline__clip-drop-edge--in { left: 0; border-left: 2px solid var(--accent-cyan); }
+.timeline__clip-drop-edge--out { right: 0; border-right: 2px solid var(--accent-cyan); }
+
 /* ── Clip Fade Ramps & Handles ── */
 .timeline__clip-fade {
   position: absolute;

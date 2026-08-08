@@ -39,6 +39,11 @@ export const NODE_COLORS = {
 // socket-position fallback in NodeCanvas both derive geometry from this.
 export const NODE_WIDTH = 270
 
+// How far a Shift+drag must travel (screen px, so it's zoom-independent) before
+// the node is pulled out of its chain. Extraction rewrites edges, so it must not
+// fire on a click that merely wobbled. Matches the marquee's click threshold.
+const EXTRACT_THRESHOLD_PX = 4
+
 // On-card quick shape switcher for SHAPE_INPUT — [glyph, u_shp_type, tooltip].
 // Indices match the SHAPE_INPUT shader's "Shape" select options.
 const SHAPE_QUICK_PICKS = [
@@ -154,7 +159,7 @@ const NodeCard = memo(function NodeCard({
   node, selected = false, isMultiSelected = false, isPreviewTap = false, isOrphaned = false,
   executionOrder = null, paramConfigs = [], onSelect, onDelete, onMove, onMoveEnd, onOpenMonaco,
   onSetPreview, onToggleBypass, onParamChange, onSocketDragStart, onSocketDragEnd,
-  onDuplicate, onDetachNode, connectedInputs = new Set(), connectedOutputs = new Set(),
+  onDuplicate, onExtractNode, onDissolveNode, connectedInputs = new Set(), connectedOutputs = new Set(),
   zoom = 1, onEnterCompound, onExposedParamChange,
 }) {
   const cardRef = useRef(null)
@@ -184,14 +189,30 @@ const NodeCard = memo(function NodeCard({
   )
 
   const dragMoved = useRef(false)
+  const extracted = useRef(false)
 
   const handleMouseDown = useCallback((e) => {
     if (e.target.closest('.socket') || e.target.closest('.node-card__slider') || e.target.closest('button') || e.target.closest('input') || e.target.closest('select')) return
+
+    // Right-click never drags. It used to: there was no button check here, so a
+    // right-drag silently moved the node out from under its own context menu.
+    // Shift+right-click is Dissolve (handled in handleContextMenu) — leave the
+    // selection alone there so the menu and the action agree on the target.
+    if (e.button === 2) {
+      if (!e.shiftKey) onSelect?.(node.id, e)
+      return
+    }
+    if (e.button !== 0) return
+
     e.stopPropagation()
     if (e.altKey) e.preventDefault() // keep Alt from triggering the browser menu
     let dragNodeId = node.id
     dragMoved.current = false
-    if (e.shiftKey && onDetachNode) onDetachNode(node.id)
+    extracted.current = false
+    // Alt (duplicate) wins over Shift (extract): duplicating and then extracting
+    // in one gesture has no coherent meaning, and guessing wrong is destructive.
+    const wantsExtract = e.shiftKey && !e.altKey && !isLocked && !!onExtractNode
+
     if (e.altKey && onDuplicate) {
       const newId = onDuplicate(node.id)
       if (newId) dragNodeId = newId
@@ -204,10 +225,21 @@ const NodeCard = memo(function NodeCard({
     dragStart.current = { x: e.clientX, y: e.clientY, nodeX: node.position.x, nodeY: node.position.y }
     const handleMouseMove = (e) => {
       dragMoved.current = true
+      // Extract on the drag THRESHOLD, never on mousedown. The old code detached
+      // the instant Shift+mousedown landed, so a stationary Shift+click rewired
+      // the graph — and it ran *before* the drag, leaving the drag to push a node
+      // that had already been deleted.
+      if (wantsExtract && !extracted.current) {
+        const dist = Math.hypot(e.clientX - dragStart.current.x, e.clientY - dragStart.current.y)
+        if (dist >= EXTRACT_THRESHOLD_PX) {
+          extracted.current = true
+          onExtractNode(dragNodeId)
+        }
+      }
       const dx = (e.clientX - dragStart.current.x) / zoom
       const dy = (e.clientY - dragStart.current.y) / zoom
       // Pass the live event through so the canvas can do modifier-aware work
-      // (Ctrl+drag = highlight a wire under the node for auto-insert).
+      // (Ctrl/Shift+drag = highlight a wire under the node for auto-insert).
       onMove?.(dragNodeId, { x: dragStart.current.nodeX + dx, y: dragStart.current.nodeY + dy }, e)
     }
     const handleMouseUp = (e) => {
@@ -218,7 +250,20 @@ const NodeCard = memo(function NodeCard({
     }
     document.addEventListener('mousemove', handleMouseMove)
     document.addEventListener('mouseup', handleMouseUp)
-  }, [node.id, node.position, zoom, onSelect, onMove, onMoveEnd, onDuplicate, onDetachNode])
+  }, [node.id, node.position, zoom, isLocked, onSelect, onMove, onMoveEnd, onDuplicate, onExtractNode])
+
+  // Shift+right-click = dissolve: heal the wires around this node, then delete
+  // it. Anything else falls through to the canvas's node-search menu unchanged.
+  const handleContextMenu = useCallback((e) => {
+    if (!e.shiftKey || isLocked || !onDissolveNode) return
+    // Same dead-zone as the drag: a right-click on a control belongs to that
+    // control, and losing the whole node to a mis-aimed click on a slider would
+    // be a nasty surprise.
+    if (e.target.closest('.socket') || e.target.closest('.node-card__slider') || e.target.closest('button') || e.target.closest('input') || e.target.closest('select')) return
+    e.preventDefault()
+    e.stopPropagation()
+    onDissolveNode(node.id)
+  }, [node.id, isLocked, onDissolveNode])
 
   const handleDoubleClick = useCallback((e) => {
     if (isCompound && onEnterCompound) { e.stopPropagation(); onEnterCompound(node.id) }
@@ -288,6 +333,7 @@ const NodeCard = memo(function NodeCard({
       ].filter(Boolean).join(' ')}
       style={{ left: node.position.x, top: node.position.y, borderLeftColor: isCompound ? (node.color || accentColor) : accentColor }}
       onMouseDown={handleMouseDown}
+      onContextMenu={handleContextMenu}
       onClick={(e) => {
         e.stopPropagation()
         // A drag's release also fires a click — don't re-select (or Ctrl-toggle)

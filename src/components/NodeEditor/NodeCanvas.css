@@ -94,16 +94,21 @@
   opacity: 1;
 }
 
-/* ── Master FX preview toggle (clip graph only) ── */
-/* Static hint shown in place of the Master FX toggle while editing a transition
-   graph (which always previews through the full pipeline). */
-.node-canvas__transition-hint {
-  margin-right: var(--space-xs);
-  padding: 2px 8px;
-  font-size: 11px;
-  color: var(--text-secondary, #9aa);
-  white-space: nowrap;
+/* ── Transition strip ── */
+/* Its own row under the header while editing a transition graph: the progress
+   scrubber, the FROM/TO binding readout and any failure note. A transition
+   graph always previews through the full pipeline, so this replaces the Master
+   FX toggle rather than sitting beside it. */
+.node-canvas__transition-strip {
+  display: flex;
+  align-items: center;
+  flex: none;
+  padding: 4px 0;
+  background: var(--bg-elevated, #1c1e23);
+  border-bottom: 1px solid var(--border-subtle, #3a3d45);
 }
+
+/* ── Master FX preview toggle (clip graph only) ── */
 
 .node-canvas__masterfx-toggle {
   margin-right: var(--space-xs);

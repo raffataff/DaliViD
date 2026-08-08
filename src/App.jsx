@@ -19,6 +19,9 @@ import {
   saveProject, requestPersistentStorage, purgeStoredFolderHandles
 } from './utils/projectSerializer'
 import { initHistory, undo, redo } from './utils/history'
+import { nearestEdge } from './utils/clipTransitions'
+import { applyTransitionById } from './utils/transitionActions'
+import { clipSupportsTransform } from './utils/clipTransform'
 
 // Start recording undo history as soon as the module loads, so even the very
 // first edit after startup is undoable.
@@ -201,6 +204,23 @@ const clearSelection = useAppStore(s => s.clearSelection)
        if (e.code === 'KeyL' && !isInput && !e.ctrlKey && !e.metaKey) {
          e.preventDefault()
          toggleLoop()
+         return
+       }
+
+       // T — apply the default transition to the selected clip's nearer edge.
+       //
+       // Every NLE binds this ("Apply Default Video Transition"); Premiere uses
+       // Ctrl+D, which is already Duplicate Node here, so a bare T — otherwise
+       // unbound, and mnemonic — carries it. The edge comes from where the
+       // PLAYHEAD sits in the clip, because parking near a cut is what you do
+       // immediately before wanting a transition on it.
+       if (e.code === 'KeyT' && !isInput && !e.ctrlKey && !e.metaKey) {
+         const { selectedClipId, playheadTime, defaultTransition } = useAppStore.getState()
+         if (!selectedClipId) return
+         const clip = useTimelineStore.getState().clips.find(c => c.id === selectedClipId)
+         if (!clip || !clipSupportsTransform(clip)) return // audio clips have no picture
+         e.preventDefault()
+         applyTransitionById(clip.id, nearestEdge(clip, playheadTime), defaultTransition)
          return
        }
 

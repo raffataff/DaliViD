@@ -94,6 +94,15 @@ const useAppStore = create(
     // ── Audio Reactive ──
     audioReactiveEnabled: true,
 
+    // ── Transitions ──
+    // The effect applied by the T shortcut, the +/- hotspots on a clip's ends
+    // and the Transitions tab's click-to-apply. Every professional NLE has this
+    // ("Apply Default Video Transition"), and without one there is no way to add
+    // a transition that doesn't involve first choosing which of two dozen it
+    // should be. '' means the plain opacity ramp, which is a legitimate default.
+    // A registry key, `compound:<libId>`, or 'graph'.
+    defaultTransition: 'CROSSFADE',
+
     // ── Beat Grid / Snapping ──
     bpm: 120,
     beatOffset: 0,          // seconds — where beat 1 falls on the timeline
@@ -248,6 +257,9 @@ const useAppStore = create(
     toggleAudioReactive: () => set((state) => ({
       audioReactiveEnabled: !state.audioReactiveEnabled,
     })),
+
+    // Transitions
+    setDefaultTransition: (type) => set({ defaultTransition: type || '', autosaveState: 'unsaved' }),
 
     // Beat grid / snapping
     setBpm: (bpm) => set({ bpm: Math.max(20, Math.min(300, bpm || 120)), autosaveState: 'unsaved' }),

@@ -13,12 +13,13 @@ import useTimelineStore from '../../store/useTimelineStore'
 import { topologicalSort, findOrphaned } from '../../utils/topSort'
 import { parseParams, getDefaultParams } from '../../utils/paramParser'
 import { DEFAULT_TEXT_PARAMS } from '../../utils/textRenderer'
-import { getShaderSource } from '../../shaders/shaderRegistry'
+import { getShaderSource, getNodeSource } from '../../shaders/shaderRegistry'
 import { instantiatePreset, instantiateUserCompound } from '../../shaders/compoundPresets'
 import { generateCombinedShader } from '../../shaders/shaderGenerator'
 import { getNodeSockets, getSocketYOffset, canConnect } from '../../shaders/nodeDefinitions'
 import { getDataNodeParams, visibleDataParams } from '../../shaders/dataNodeParams'
 import { parseTransitionGraphKey, edgeLabel } from '../../utils/clipTransitions'
+import TransitionGraphBar from './TransitionGraphBar'
 import './NodeCanvas.css'
 
 const EXCLUDED_FROM_MARQUEE = new Set([
@@ -50,6 +51,15 @@ const AUDIO_AUTOWIRE = {
   // Audio-reactive post effect
   PARTICLE_DISPLACE: ['rms'],
 }
+
+// NOTE: a node added inside a TRANSITION graph is added exactly like a node
+// added anywhere else — unconnected, where you dropped it. There was briefly an
+// auto-splice here (into the chain before EFFECT_OUTPUT, plus Transition
+// Progress guessed onto an "amount" param); it was removed because guessing at
+// wiring is worse than no wiring: you cannot tell what it decided without
+// reading the noodles, and undoing its guess costs more than making the two
+// connections yourself. Ctrl+drag-over-a-wire is still there for deliberate
+// insertion.
 
 // Estimated card height: header(30) + sockets + params + footer. Shared by the
 // marquee hit test, fit-to-window, the wire-insert hit test and the minimap so
@@ -123,7 +133,8 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   // and would just say "Clip". The clip list is read non-reactively: the header
   // only has to be right when the key changes, and subscribing the whole canvas
   // to `clips` would re-render it on every timeline edit.
-  const isTransitionGraph = graphLevel === 'clip' && !!parseTransitionGraphKey(graphClipId)
+  const transitionCtx = graphLevel === 'clip' ? parseTransitionGraphKey(graphClipId) : null
+  const isTransitionGraph = !!transitionCtx
 
   const graphTitle = useMemo(() => {
     if (graphLevel === 'master') return 'Master Effect Graph'
@@ -181,7 +192,13 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   const nodeParamConfigs = useMemo(() => {
     const map = {}
     for (const node of graph.nodes) {
-      const shaderSrc = node.customShaderSource || node.shaderCode || getShaderSource(node.type)
+      // getNodeSource, not a re-implementation of it: it is the single
+      // source-of-truth resolver the compiler and Monaco use, and it is where
+      // node-dependent sources (TRANSITION_FX assembles its GLSL from the
+      // transition its Effect param names) are handled. Inlining the old
+      // custom → shaderCode → registry chain here meant this card showed the
+      // DEFAULT transition's params no matter which effect was selected.
+      const shaderSrc = getNodeSource(node)
       let params = shaderSrc ? parseParams(shaderSrc) : []
       if (node.type === 'AUDIO_INPUT') {
         const audioClips = timelineClips.filter(c => c.fileType === 'audio').map(c => c.filename)
@@ -679,37 +696,68 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     setTapPoint(graphLevel, graphClipId, next)
   }, [outputNode, graph.tapPointNodeId, setTapPoint, graphLevel, graphClipId])
 
-  const handleDetachNode = useCallback((nodeId) => {
-    const currentGraph = graph
-    const incomingEdges = currentGraph.edges.filter(e => e.toNode === nodeId)
-    const outgoingEdges = currentGraph.edges.filter(e => e.fromNode === nodeId)
-    for (const inEdge of incomingEdges) {
-      const upstreamNodeId = inEdge.fromNode
-      const upstreamSocketId = inEdge.fromSocket
-      const upstreamNode = currentGraph.nodes.find(n => n.id === upstreamNodeId)
-      if (!upstreamNode) continue
-      const upParams = nodeParamConfigs[upstreamNodeId] || []
-      const upSockets = getNodeSockets(upstreamNode.type, upParams, upstreamNode)
-      const upstreamSocket = upSockets.outputs.find(s => s.id === upstreamSocketId)
-      const upstreamType = upstreamSocket?.type || 'texture'
-      const compatibleOut = outgoingEdges.find(outE => {
-        const downNode = currentGraph.nodes.find(n => n.id === outE.toNode)
-        if (!downNode) return false
-        const downParams = nodeParamConfigs[outE.toNode] || []
-        const downSockets = getNodeSockets(downNode.type, downParams, downNode)
-        const downSocket = downSockets.inputs.find(s => s.id === outE.toSocket)
-        const downType = downSocket?.type || 'texture'
-        return downType === upstreamType
-      })
-      if (compatibleOut) {
-        addEdge(graphLevel, graphClipId, upstreamNodeId, upstreamSocketId, compatibleOut.toNode, compatibleOut.toSocket)
+  // ── Extract / Dissolve (Shift gestures) ──
+  // Rewire the graph AROUND a node and drop that node's own edges, leaving the
+  // node itself intact. Shared by extract (Shift+drag, keeps the node in hand)
+  // and dissolve (Shift+right-click, which then deletes it).
+  //
+  // Healing is per DATA TYPE and it FANS OUT: the node's first input of a given
+  // type becomes the producer for *every* output edge of that type. The previous
+  // implementation walked incoming edges and stopped at the first compatible
+  // consumer, so extracting a node that fed three consumers silently orphaned two.
+  //
+  // The graph is read live from the store rather than from the render snapshot —
+  // NodeCard captures its drag callbacks at mousedown, so a Shift+drag mutates
+  // edges *after* the closed-over `graph` was captured.
+  const detachNodeWires = useCallback((nodeId) => {
+    const g = useGraphStore.getState().getActiveGraph(graphLevel, graphClipId)
+    if (!g) return
+    const node = g.nodes.find(n => n.id === nodeId)
+    if (!node || node.locked) return
+
+    const socketType = (id, socketId, side) => {
+      const n = g.nodes.find(x => x.id === id)
+      if (!n) return null
+      const sockets = getNodeSockets(n.type, nodeParamConfigs[id] || [], n)
+      const list = side === 'output' ? sockets.outputs : sockets.inputs
+      return list.find(s => s.id === socketId)?.type || 'texture'
+    }
+
+    const incoming = g.edges.filter(e => e.toNode === nodeId)
+    const outgoing = g.edges.filter(e => e.fromNode === nodeId)
+    if (incoming.length === 0 && outgoing.length === 0) return
+
+    const producerByType = new Map()
+    for (const e of incoming) {
+      const type = socketType(e.fromNode, e.fromSocket, 'output')
+      if (type && !producerByType.has(type)) {
+        producerByType.set(type, { nodeId: e.fromNode, socketId: e.fromSocket })
       }
     }
-    for (const edge of [...incomingEdges, ...outgoingEdges]) {
-      removeEdge(graphLevel, graphClipId, edge.id)
+
+    // Remove first, then heal: on a single-accept input socket `addEdge` replaces
+    // whatever is already there, so healing first would leave the downstream
+    // socket briefly owned by the node we're pulling out.
+    for (const e of [...incoming, ...outgoing]) removeEdge(graphLevel, graphClipId, e.id)
+
+    for (const e of outgoing) {
+      const producer = producerByType.get(socketType(e.toNode, e.toSocket, 'input'))
+      if (producer) {
+        addEdge(graphLevel, graphClipId, producer.nodeId, producer.socketId, e.toNode, e.toSocket)
+      }
     }
+  }, [nodeParamConfigs, addEdge, removeEdge, graphLevel, graphClipId])
+
+  // Shift+right-click: heal the wires and remove the node ("dissolve"). This is
+  // what the old Shift+drag actually did, despite being labelled "Detach" — the
+  // drag gesture now keeps the node instead, and deletion lives on its own button.
+  const handleDissolveNode = useCallback((nodeId) => {
+    const g = useGraphStore.getState().getActiveGraph(graphLevel, graphClipId)
+    const node = g?.nodes.find(n => n.id === nodeId)
+    if (!node || node.locked) return
+    detachNodeWires(nodeId)
     removeNode(graphLevel, graphClipId, nodeId)
-  }, [graph, nodeParamConfigs, addEdge, removeEdge, removeNode, graphLevel, graphClipId])
+  }, [detachNodeWires, removeNode, graphLevel, graphClipId])
 
   const getSocketPos = useCallback((nodeId, socketId, socketSide) => {
     const node = graph.nodes.find(n => n.id === nodeId)
@@ -753,17 +801,25 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     return { x, y }
   }, [graph.nodes, nodeParamConfigs, pan, zoom])
 
-  // ── Ctrl+drag auto-insert (Blender-style) ──
-  // While Ctrl is held during a node drag, find a wire passing under the node
-  // whose data type the node can splice into (a matching input AND output).
+  // ── Ctrl/Shift+drag auto-insert (Blender-style) ──
+  // While Ctrl (insert) or Shift (extract-then-reinsert) is held during a node
+  // drag, find a wire passing under the node whose data type it can splice into
+  // (a matching input AND output).
   // Prefers a free input; falls back to the first matching one (addEdge replaces
   // the old connection on single-accept sockets).
   const findInsertCandidate = useCallback((nodeId, position) => {
-    const node = graph.nodes.find(n => n.id === nodeId)
+    // Live store read, not the render snapshot: a Shift+drag extracts the node
+    // (healing and removing its edges) partway through the same gesture, and this
+    // callback was captured at mousedown. Using the closed-over `graph` would
+    // hit-test wires that no longer exist and miss the one we just healed.
+    const g = useGraphStore.getState().getActiveGraph(graphLevel, graphClipId)
+    if (!g) return null
+    const node = g.nodes.find(n => n.id === nodeId)
     if (!node || node.locked) return null
     const params = nodeParamConfigs[nodeId] || []
     const { inputs, outputs } = getNodeSockets(node.type, params, node)
     if (inputs.length === 0 || outputs.length === 0) return null
+    const takenInputs = new Set(g.edges.filter(e => e.toNode === nodeId).map(e => e.toSocket))
 
     // Approximate the card's bounding box (same estimate as the marquee).
     const height = estimateNodeHeight(node, params)
@@ -779,23 +835,23 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     const downStack = [nodeId]
     while (downStack.length) {
       const id = downStack.pop()
-      for (const e of graph.edges) {
+      for (const e of g.edges) {
         if (e.fromNode === id && !downstream.has(e.toNode)) { downstream.add(e.toNode); downStack.push(e.toNode) }
       }
     }
     const upStack = [nodeId]
     while (upStack.length) {
       const id = upStack.pop()
-      for (const e of graph.edges) {
+      for (const e of g.edges) {
         if (e.toNode === id && !upstream.has(e.fromNode)) { upstream.add(e.fromNode); upStack.push(e.fromNode) }
       }
     }
 
     let best = null
-    for (const edge of graph.edges) {
+    for (const edge of g.edges) {
       if (edge.fromNode === nodeId || edge.toNode === nodeId) continue
       if (downstream.has(edge.fromNode) || upstream.has(edge.toNode)) continue
-      const fromNode = graph.nodes.find(n => n.id === edge.fromNode)
+      const fromNode = g.nodes.find(n => n.id === edge.fromNode)
       if (!fromNode) continue
       const fromSockets = getNodeSockets(fromNode.type, nodeParamConfigs[edge.fromNode] || [], fromNode)
       const dataType = fromSockets.outputs.find(s => s.id === edge.fromSocket)?.type || 'texture'
@@ -804,7 +860,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       if (!outSocket) continue
       const inCandidates = inputs.filter(s => s.type === dataType)
       if (inCandidates.length === 0) continue
-      const inSocket = inCandidates.find(s => !connectedInputsMap[nodeId]?.has(s.id)) || inCandidates[0]
+      const inSocket = inCandidates.find(s => !takenInputs.has(s.id)) || inCandidates[0]
 
       const from = getSocketPos(edge.fromNode, edge.fromSocket, 'output')
       const to = getSocketPos(edge.toNode, edge.toSocket, 'input')
@@ -819,7 +875,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       }
     }
     return best
-  }, [graph.nodes, graph.edges, nodeParamConfigs, connectedInputsMap, getSocketPos])
+  }, [graphLevel, graphClipId, nodeParamConfigs, getSocketPos])
 
   // Only re-render when the highlighted edge changes; keep the ref fresh always.
   const applyInsertTarget = useCallback((target) => {
@@ -829,11 +885,20 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   }, [])
 
   const handleNodeMove = useCallback((nodeId, position, e) => {
+    // Ctrl OR Shift arms the wire-insert highlight. Shift is there because a
+    // Shift+drag extracts the node — pulling it out of one wire and dropping it
+    // into another should be one continuous gesture, not two.
+    const wantsInsert = !!e && (e.ctrlKey || e.metaKey || e.shiftKey)
+
     // Group drag: moving a multi-selected node moves the whole selection.
     // NodeCard captures this callback at mousedown, so `graph.nodes` positions
     // here are the drag-START positions — the delta is cumulative and each
     // node lands at start + delta, which is exactly right.
-    if (selectedNodeIds.length > 1 && selectedNodeIds.includes(nodeId)) {
+    //
+    // A Shift+drag is an extract of the ONE grabbed node, so it never group-drags.
+    // That test reads the live event rather than the mousedown-time selection,
+    // which is the only thing still current inside this stale closure.
+    if (!e?.shiftKey && selectedNodeIds.length > 1 && selectedNodeIds.includes(nodeId)) {
       const dragged = graph.nodes.find(n => n.id === nodeId)
       const dx = position.x - (dragged?.position.x ?? position.x)
       const dy = position.y - (dragged?.position.y ?? position.y)
@@ -851,7 +916,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       return
     }
     updateNode(graphLevel, graphClipId, nodeId, { position })
-    if (e && (e.ctrlKey || e.metaKey)) {
+    if (wantsInsert) {
       applyInsertTarget(findInsertCandidate(nodeId, position))
     } else if (insertTargetRef.current) {
       applyInsertTarget(null)
@@ -882,13 +947,17 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     const target = insertTargetRef.current
     if (!target) return
     applyInsertTarget(null)
-    const edge = graph.edges.find(e => e.id === target.edgeId)
+    // Live read, for the same reason findInsertCandidate does one: a Shift+drag
+    // rewrote the edge list after this callback was captured at mousedown, so the
+    // target edge id may only exist in the store.
+    const g = useGraphStore.getState().getActiveGraph(graphLevel, graphClipId)
+    const edge = g?.edges.find(e => e.id === target.edgeId)
     if (!edge) return
     // Splice: upstream → node input, node output → downstream.
     removeEdge(graphLevel, graphClipId, edge.id)
     addEdge(graphLevel, graphClipId, edge.fromNode, edge.fromSocket, nodeId, target.inputSocketId)
     addEdge(graphLevel, graphClipId, nodeId, target.outputSocketId, edge.toNode, edge.toSocket)
-  }, [graph.edges, removeEdge, addEdge, graphLevel, graphClipId, applyInsertTarget])
+  }, [removeEdge, addEdge, graphLevel, graphClipId, applyInsertTarget])
 
   const handleSocketDragStart = useCallback((socketInfo) => {
     if (socketInfo.type === 'output') {
@@ -1140,19 +1209,15 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
         <span className="panel__header-title">{graphTitle}</span>
         {graphLevel === 'clip' && (
           <button className="node-canvas__back-btn" onClick={exitClipGraph}>
-            ↩ Back to Master
+            {isTransitionGraph ? '↩ Done' : '↩ Back to Master'}
           </button>
         )}
         <div style={{ flex: 1 }} />
         {/* A transition graph is previewed in the FULL pipeline (it mixes two
             sides that only exist there), so the isolated/through-master choice
-            doesn't apply — the hint replaces it with the one thing worth
-            knowing: scrub the region to see the effect. */}
-        {isTransitionGraph ? (
-          <span className="node-canvas__transition-hint">
-            Scrub the transition region to preview
-          </span>
-        ) : graphLevel === 'clip' && (
+            doesn't apply. Its own controls live in the strip below the header,
+            which needs two rows. */}
+        {!isTransitionGraph && graphLevel === 'clip' && (
           <button
             className={`node-canvas__masterfx-toggle ${previewThroughMaster ? 'node-canvas__masterfx-toggle--on' : ''}`}
             onClick={togglePreviewThroughMaster}
@@ -1187,6 +1252,20 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
           <IconFitWindow />
         </button>
       </div>
+
+      {/* Transition strip: progress scrub + FROM/TO binding + why-it-isn't-
+          running. Its own row rather than a header item — the header is one
+          line, and cramming a scrubber into it left no room for the binding
+          readout, which is the part that explains the model. */}
+      {isTransitionGraph && (
+        <div className="node-canvas__transition-strip">
+          <TransitionGraphBar
+            clipId={transitionCtx.clipId}
+            edge={transitionCtx.edge}
+            graphKey={graphClipId}
+          />
+        </div>
+      )}
 
       {showShaderGenerator && (
         <ShaderGenerator
@@ -1271,7 +1350,8 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
                   onSocketDragStart={handleSocketDragStart}
                   onSocketDragEnd={handleSocketDragEnd}
                   onDuplicate={handleNodeDuplicate}
-                  onDetachNode={handleDetachNode}
+                  onExtractNode={detachNodeWires}
+                  onDissolveNode={handleDissolveNode}
                   onEnterCompound={enterCompound}
                   onExposedParamChange={handleCompoundExposedParamChange}
                   onExpandCompound={handleExpandCompound}
