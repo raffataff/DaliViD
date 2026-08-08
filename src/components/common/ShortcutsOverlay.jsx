@@ -19,6 +19,9 @@ const SHORTCUTS = [
       { keys: ['I', 'O'], desc: 'Set In / Out Point' },
       { keys: ['X'], desc: 'Clear In / Out Points' },
       { keys: ['M'], desc: 'Add Marker at Playhead' },
+      { keys: ['T'], desc: 'Default Transition on Nearest Edge' },
+      { keys: ['⇄ Hotspot'], desc: 'Same, on a Clip’s Start / End (hover)' },
+      { keys: ['Right Click Edge'], desc: 'Transition Menu for That Edge' },
     ]
   },
   {
@@ -45,7 +48,8 @@ const SHORTCUTS = [
       { keys: ['Ctrl', 'D'], desc: 'Duplicate Selected Node' },
       { keys: ['Ctrl', 'Drag Node'], desc: 'Insert Node into Wire' },
       { keys: ['Alt', 'Drag Node'], desc: 'Duplicate + Drag' },
-      { keys: ['Shift', 'Drag Node'], desc: 'Detach Node (heal wires)' },
+      { keys: ['Shift', 'Drag Node'], desc: 'Extract Node (heal wires, keep it)' },
+      { keys: ['Shift', 'Right Click Node'], desc: 'Dissolve Node (heal wires, delete)' },
       { keys: ['Wheel'], desc: 'Zoom Graph at Cursor' },
       { keys: ['F'], desc: 'Fit Graph to Screen' },
       { keys: ['Delete'], desc: 'Delete Selected Node(s)' },

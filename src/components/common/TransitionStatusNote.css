@@ -1,0 +1,32 @@
+/* Transition failure note — Inspector edge section + Node Editor header. */
+
+.transition-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 2px 8px 6px;
+  padding: 6px 8px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--accent-amber, #ffb020);
+  background: color-mix(in srgb, var(--accent-amber, #ffb020) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-amber, #ffb020) 35%, transparent);
+  border-radius: 4px;
+}
+
+.transition-status__icon {
+  flex: none;
+  line-height: 1.4;
+}
+
+/* Header variant: one line, truncates rather than growing the toolbar. */
+.transition-status--compact {
+  display: inline-block;
+  max-width: 340px;
+  margin: 0 8px;
+  padding: 2px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 10px;
+}

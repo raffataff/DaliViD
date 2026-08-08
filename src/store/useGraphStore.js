@@ -11,6 +11,8 @@ import { removeNodeImage } from '../gl/imageRegistry'
 import { removeText } from '../gl/textRegistry'
 import { emitNodeRemoved } from '../gl/nodeLifecycle'
 import { transitionGraphKey, EDGES } from '../utils/clipTransitions'
+import { getNodeSource } from '../shaders/shaderRegistry'
+import { parseParams, getDefaultParams } from '../utils/paramParser'
 
 let nodeCounter = 0
 function newNodeId() {
@@ -25,6 +27,34 @@ function newEdgeId() {
 // flags, or source). Plain param/position/name edits are intentionally excluded
 // so dragging a slider doesn't recompile the graph every frame.
 const RECOMPILE_KEYS = ['bypassed', 'customShaderSource', 'shaderCode', 'type', 'subGraph']
+
+// Params whose value CHANGES THE NODE'S SHADER SOURCE, by node type. Normally a
+// param edit deliberately skips the recompile — that is what keeps a slider drag
+// cheap — but TRANSITION_FX assembles its GLSL from whichever transition its
+// Effect param names, so changing it must rebuild the program or the node keeps
+// running the previous effect with no sign that anything was ignored.
+const SOURCE_PARAMS = {
+  TRANSITION_FX: 'u_tfx_type',
+}
+
+/**
+ * Params for a node whose SOURCE just changed: the new shader's defaults filled
+ * in underneath whatever the node already had.
+ *
+ * Without this, switching a TRANSITION_FX from Crossfade to Film Burn leaves the
+ * node holding only Crossfade's params — every Film Burn uniform is absent, so
+ * uploadUniforms skips it and the shader runs with GLSL's implicit zeros: no
+ * edge width, no glow, no turbulence. The effect looks broken rather than
+ * unconfigured, which is the worst possible first impression of a new effect.
+ *
+ * Existing values win over defaults, so a param the two effects share by name
+ * (Softness, Ease) keeps the value you set rather than snapping back.
+ */
+function withSourceDefaults(node) {
+  const src = getNodeSource(node)
+  if (!src) return node.params
+  return { ...getDefaultParams(parseParams(src)), ...node.params }
+}
 
 /**
  * Deep-copy a { nodes, edges } graph with fresh ids, remapping edge endpoints.
@@ -163,10 +193,18 @@ const useGraphStore = create((set, get) => ({
     set((state) => {
       const graph = graphLevel === 'master' ? state.masterGraph : state.clipGraphs[clipId]
       if (!graph) return state
-      const nodes = graph.nodes.map(n => n.id === nodeId ? { ...n, params: { ...n.params, [paramName]: value } } : n)
+      const target = graph.nodes.find(n => n.id === nodeId)
+      const isSourceParam = SOURCE_PARAMS[target?.type] === paramName
+      const nodes = graph.nodes.map(n => {
+        if (n.id !== nodeId) return n
+        const next = { ...n, params: { ...n.params, [paramName]: value } }
+        return isSourceParam ? { ...next, params: withSourceDefaults(next) } : next
+      })
+      // Almost never — see SOURCE_PARAMS. A slider drag must not recompile.
+      const bump = isSourceParam ? { topologyVersion: state.topologyVersion + 1 } : {}
       return graphLevel === 'master'
-        ? { masterGraph: { ...graph, nodes } }
-        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes } } }
+        ? { masterGraph: { ...graph, nodes }, ...bump }
+        : { clipGraphs: { ...state.clipGraphs, [clipId]: { ...graph, nodes } }, ...bump }
     })
   },
 

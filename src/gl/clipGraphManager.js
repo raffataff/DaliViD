@@ -331,24 +331,38 @@ export function executeChain(renderer, chain, inputFBOId, outputFBOId, standardS
  * @param {string} scopeId   — FBO namespace (per clip, e.g. `tr~<clipId>~`)
  * @param {object|null} liveNodes — optional { nodeId → { params } } overrides
  *   (used to apply the clip's exposed-param values without mutating the entry)
+ * @param {string|null} tapPointNodeId — solo one node's output in place of the
+ *   graph's OUTPUT. A transition can only be judged in context, so the tap is
+ *   routed through the normal composite rather than blitted to screen: you see
+ *   that node's picture sitting in the timeline where the transition would be.
  * @returns {string|null} the FBO holding the transition result (by reference),
  *   or null when the graph is empty / has no resolvable output.
  */
-export function executeTransitionCompound(renderer, subChain, subGraph, fromFBOId, toFBOId, standardState, progress, scopeId, liveNodes = null) {
+export function executeTransitionCompound(renderer, subChain, subGraph, fromFBOId, toFBOId, standardState, progress, scopeId, liveNodes = null, tapPointNodeId = null) {
   if (!subChain || subChain.length === 0 || !subGraph) return null
 
-  // Bind FROM → 1st image terminal, TO → 2nd (same input_<i> ordering the
-  // compound's sockets use). Audio-band terminals keep their tagged routing.
+  // Bind FROM and TO to the graph's two image terminals.
+  //
+  // By ROLE when the terminals declare one (`terminalRole: 'from' | 'to'`),
+  // falling back to array order. Order alone is a trap: `subGraph.nodes` is
+  // append-ordered, so deleting a terminal and adding one back — or a graph
+  // rebuilt from a promoted library copy — silently swaps the two sides, and a
+  // reversed transition looks like a bug in the shader rather than a rewiring.
+  // The role travels with the node through cloneGraphWithNewIds, so a forked or
+  // published graph keeps it.
   const inTerms = (subGraph.nodes || []).filter(t => t.type === 'EFFECT_INPUT' && !t.audioBand)
   const terminalMap = {}
-  if (inTerms[0]) terminalMap[inTerms[0].id] = fromFBOId
-  if (inTerms[1]) terminalMap[inTerms[1].id] = toFBOId
+  const byRole = (role) => inTerms.find(t => t.terminalRole === role)
+  const fromTerm = byRole('from') || inTerms[0]
+  const toTerm = byRole('to') || inTerms.find(t => t !== fromTerm)
+  if (fromTerm) terminalMap[fromTerm.id] = fromFBOId
+  if (toTerm) terminalMap[toTerm.id] = toFBOId
 
   const state = { ...standardState, transitionProgress: Math.max(0, Math.min(1, progress)) }
   const outResolved = {}
   executeGraphDAG(
     renderer, subChain, subGraph.edges || [], fromFBOId, null,
-    state, {}, liveNodes, null, scopeId, buildNodeMap(subGraph), terminalMap, outResolved
+    state, {}, liveNodes, tapPointNodeId, scopeId, buildNodeMap(subGraph), terminalMap, outResolved
   )
 
   const outTerm = (subGraph.nodes || []).find(t => t.type === 'EFFECT_OUTPUT')
@@ -456,7 +470,9 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
   for (const n of chain) {
     if (!n.isImage) continue
     const fboId = ensureFBO(imageFBO(n.nodeId))
-    const liveParams = liveNodes?.[n.nodeId]?.params ?? n.params
+    // Same three-source resolution as the effect loop below — see the comment
+    // there for why nodeLookup cannot be skipped.
+    const liveParams = liveNodes?.[n.nodeId]?.params ?? nodeLookup?.[n.nodeId]?.params ?? n.params
     const cp = normalizeParams(liveParams)
     const ov = floatOverrides[n.nodeId]
     if (ov) Object.assign(cp, ov)
@@ -470,7 +486,7 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
   for (const n of chain) {
     if (!n.isText) continue
     const fboId = ensureFBO(textFBO(n.nodeId))
-    const liveParams = liveNodes?.[n.nodeId]?.params ?? n.params
+    const liveParams = liveNodes?.[n.nodeId]?.params ?? nodeLookup?.[n.nodeId]?.params ?? n.params
     const cp = { ...(liveParams || {}) }
     const ov = floatOverrides[n.nodeId]
     if (ov) Object.assign(cp, ov)
@@ -484,7 +500,7 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
   for (const n of chain) {
     if (!n.isShape) continue
     const fboId = ensureFBO(shapeFBO(n.nodeId))
-    const liveParams = liveNodes?.[n.nodeId]?.params ?? n.params
+    const liveParams = liveNodes?.[n.nodeId]?.params ?? nodeLookup?.[n.nodeId]?.params ?? n.params
     const cp = normalizeParams(liveParams)
     const ov = floatOverrides[n.nodeId]
     if (ov) Object.assign(cp, ov)
@@ -580,7 +596,21 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     }
 
     // Build the parameter set (live params + audio bindings + float modulation).
-    const liveParams = liveNodes?.[node.nodeId]?.params ?? node.params
+    //
+    // THREE sources, in this order, and the middle one is load-bearing:
+    //   liveNodes  — per-frame overrides (keyframes, a compound's exposed params)
+    //   nodeLookup — the CURRENT graph node, rebuilt from the store every frame
+    //   node.params — the snapshot baked into the chain at compile time
+    //
+    // Skipping nodeLookup meant that any graph evaluated WITHOUT a liveNodes map
+    // read compile-time values forever: a param edit deliberately does not bump
+    // topologyVersion (that is what keeps a slider drag cheap), so the chain is
+    // never rebuilt and the slider does nothing at all. That is every node
+    // inside a transition graph and every node inside a compound — the top level
+    // was fine only because the renderer happens to pass a full node map there
+    // as `liveNodes`. The float-source path above already resolved all three
+    // this way; this one did not, so the two disagreed.
+    const liveParams = liveNodes?.[node.nodeId]?.params ?? nodeLookup?.[node.nodeId]?.params ?? node.params
     const customParams = normalizeParams(liveParams)
     for (const [key, value] of Object.entries(audioBindings)) {
       if (key.startsWith(node.nodeId + '.')) {
@@ -656,9 +686,18 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
   // Compound context: record the FBO feeding EACH EFFECT_OUTPUT terminal so the
   // parent can route every output socket independently (by reference — no blit).
   if (outputResolved) {
+    // A tap inside a compound / transition graph substitutes for EVERY output
+    // terminal rather than drawing to screen. Drawing straight to the drawing
+    // buffer from in here would fight the compositor (this sub-graph is one
+    // layer of a frame, not the frame), whereas substituting keeps the tapped
+    // node's picture on the normal path — you see it composited in place, which
+    // is the only way to judge a transition anyway.
+    const tapped = (tapPointNodeId && byId[tapPointNodeId] && !byId[tapPointNodeId].isOutput)
+      ? resolveProducer(tapPointNodeId, new Set())
+      : null
     for (const n of chain) {
       if (!n.isOutput) continue
-      outputResolved[n.nodeId] = resolveSocket(n.nodeId, 'input') ?? lastProducedFBO ?? inputFBOId
+      outputResolved[n.nodeId] = tapped ?? resolveSocket(n.nodeId, 'input') ?? lastProducedFBO ?? inputFBOId
     }
     return
   }

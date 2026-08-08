@@ -5,6 +5,7 @@
  */
 
 import { LIB3D } from './lib3d.glsl.js'
+import { buildTransitionNodeShader } from './transitionRegistry.js'
 
 // Inline shader sources — each one includes @param directives for the inspector
 const SHADER_SOURCES = {}
@@ -39,8 +40,24 @@ export function getRegisteredTypes() {
  */
 export function getNodeSource(node) {
   if (!node) return null
-  return node.customShaderSource || node.shaderCode || getShaderSource(node.type) || null
+  if (node.customShaderSource) return node.customShaderSource
+  // TRANSITION_FX has no fixed registry entry: its source is assembled from
+  // whichever transition its Effect param names, so every built-in becomes a
+  // chainable node without registering 35 near-identical shaders. Checked before
+  // node.shaderCode so an older saved node carrying a baked copy still switches
+  // effects. See `SOURCE_PARAMS` in useGraphStore for how a change recompiles.
+  if (node.type === 'TRANSITION_FX') return buildTransitionNodeShader(node)
+  return node.shaderCode || getShaderSource(node.type) || null
 }
+
+// TRANSITION_FX's real source is assembled per node (see getNodeSource above),
+// but registering the DEFAULT has two jobs: a bare getShaderSource call — which
+// is what the add-node paths use to compute a new node's default params —
+// returns something sensible, and the wrapper gets the same smoke-test coverage
+// as every other shader. The #define aliases are already understood by the
+// smoke test's declared-name check, so u_from / u_to / u_progress read as
+// declared rather than as three undeclared uniforms.
+registerShader('TRANSITION_FX', buildTransitionNodeShader('CROSSFADE'))
 
 // ═══════════════════════════════════════════════════════════
 // Built-in Shader Sources

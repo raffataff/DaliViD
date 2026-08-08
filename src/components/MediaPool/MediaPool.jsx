@@ -12,6 +12,7 @@ import { getShaderSource } from '../../shaders/shaderRegistry'
 import { parseParams, getDefaultParams } from '../../utils/paramParser'
 import { addToast } from '../common/Toast'
 import ContextMenu from '../common/ContextMenu'
+import TransitionsTab from './TransitionsTab'
 import {
   startScreenCapture, startRecording, stopRecording, stopRecordingIfActive,
   openRecordingSink, isRecording, getRecordingInfo, mp4Supported, tsStamp,
@@ -27,6 +28,7 @@ const TABS = [
   { id: 'screens', label: 'Screen' },
   { id: 'audio', label: 'Audio' },
   { id: 'effects', label: 'Effects' },
+  { id: 'transitions', label: 'Transitions' },
   { id: 'scopes', label: 'Scopes' },
 ]
 
@@ -1318,6 +1320,9 @@ export default function MediaPool() {
           </>
         )}
 
+        {/* ── Transitions Tab ── */}
+        {activeTab === 'transitions' && <TransitionsTab />}
+
         {/* ── Scopes Tab ── */}
         {activeTab === 'scopes' && (
           <div className="media-pool__scopes">
@@ -1371,6 +1376,10 @@ const EFFECT_PRESETS = [
   { type: 'TEXT_INPUT', name: 'Text', color: '#ffcc44', icon: 'T' },
   { type: 'SHAPE_INPUT', name: 'Shape', color: '#ff5588', icon: '★' },
   { type: 'TRANSFORM', name: 'Pan / Zoom', color: '#8899aa', icon: '⤢' },
+  // Any built-in transition, as a node. Listed here (not only in the node search
+  // menu) because the natural way to reach for one is "I want that effect", and
+  // the Effects tab is where people already drag effects from.
+  { type: 'TRANSITION_FX', name: 'Transition FX', color: '#00e5ff', icon: '⇄' },
   { type: 'LETTERBOX', name: 'Letterbox', color: '#8899aa', icon: '▤' },
   { type: 'EDGE_DETECTION', name: 'Edge Detection', color: '#ff8844', icon: '◈' },
   { type: 'COLOR_INVERSION', name: 'Color / HSV', color: '#ff44cc', icon: '◐' },

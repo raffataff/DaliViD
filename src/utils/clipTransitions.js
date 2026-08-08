@@ -31,9 +31,24 @@
 // stops sub-frame slivers from flickering a transition on for one frame.
 export const MIN_REGION = 0.001
 
+// Length given to an edge that has no region yet when an effect is assigned to
+// it. A transition needs a WINDOW as well as a type, and the two are set from
+// different places (the wedge handle vs. the effect picker) — so assigning an
+// effect to a zero-length edge produced a transition that was stored, editable,
+// and completely invisible. One second is the NLE default and is trimmed by
+// dragging the wedge, exactly like a fade.
+export const DEFAULT_EDGE_SECONDS = 1
+
 export const EDGE_HEAD = 'in'
 export const EDGE_TAIL = 'out'
 export const EDGES = [EDGE_HEAD, EDGE_TAIL]
+
+// Marker MIME type set alongside the normal drag payload when a TRANSITION is
+// dragged. `dataTransfer.getData` is blocked outside the `drop` event, so a
+// dragover handler can only inspect `types` — this is how the Timeline knows to
+// highlight the clip edge a drop would land on instead of treating the drag as
+// a new generator clip.
+export const TRANSITION_DRAG_TYPE = 'application/dalivid-transition'
 
 /** Human label for an edge, used by the Timeline menu and the Inspector. */
 export function edgeLabel(edge) {
@@ -50,7 +65,7 @@ const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v)
 // transition graph editable through the existing plumbing with no new branches
 // — and the serializer, which maps clipGraphs generically, persists it for free.
 
-const GRAPH_KEY_SEP = '::tr:'
+export const GRAPH_KEY_SEP = '::tr:'
 
 /** clipGraphs key holding this clip edge's private transition graph. */
 export function transitionGraphKey(clipId, edge) {
@@ -102,6 +117,33 @@ export function setEdgeTransitionPatch(edge, transition) {
   return edge === EDGE_TAIL
     ? { transitionOut: transition }
     : { transitionIn: transition, transition: null }
+}
+
+/**
+ * updateClip patch guaranteeing `edge` has a window for an effect to play
+ * across, or `null` when it already has one.
+ *
+ * Every route that assigns an effect must apply this, and that is the whole
+ * reason it lives here rather than in one caller: the Timeline's wedge menu did
+ * it and the Inspector's picker did not, so choosing a transition from the
+ * Inspector on a clip whose handle sat at zero assigned the type, created the
+ * node graph, opened the editor — and rendered nothing, with no way to tell
+ * from the UI that a length was the missing ingredient.
+ *
+ * A head region backed by an overlap already takes its length from that
+ * overlap, so `region` non-null is left alone. The default is capped at half
+ * the clip so a short clip doesn't end up entirely inside its own transition.
+ *
+ * @param {object} clip
+ * @param {string} edge — EDGE_HEAD | EDGE_TAIL
+ * @param {object|null} region — the edge's current region (headRegion/tailRegion)
+ * @returns {object|null} a patch to merge into updateClip, or null if unneeded
+ */
+export function ensureEdgeRegionPatch(clip, edge, region) {
+  if (region) return null
+  const half = Math.max(0.1, (clip.timelineEnd - clip.timelineStart) / 2)
+  const len = Math.min(DEFAULT_EDGE_SECONDS, half)
+  return { [edge === EDGE_TAIL ? 'fadeOut' : 'fadeIn']: len }
 }
 
 // ── Region geometry ──────────────────────────────────────────────────────────
@@ -181,6 +223,32 @@ export function tailRegion(clip, nextOverlap) {
     mode: 'nothing',
     prev: null,
   }
+}
+
+/**
+ * One edge's region resolved straight from the live clip list — the head/tail
+ * split and the neighbour lookup in a single call, so a caller can't get the
+ * pairing wrong (tail with findPrevOverlap, say) or forget that neighbours must
+ * come from the FULL list rather than the currently-active clips.
+ */
+export function edgeRegion(clip, clips, edge) {
+  return edge === EDGE_TAIL
+    ? tailRegion(clip, findNextOverlap(clip, clips))
+    : headRegion(clip, findPrevOverlap(clip, clips))
+}
+
+/**
+ * Which edge of `clip` the time `t` belongs to — the near half is the head, the
+ * far half the tail.
+ *
+ * Every "apply a transition here" gesture needs this: the T shortcut, a drop
+ * from the Transitions browser, a click on a clip-end hotspot. Splitting at the
+ * midpoint (rather than at a fixed distance from each end) means the answer is
+ * always defined, however short the clip and however far from an end you land.
+ */
+export function nearestEdge(clip, t) {
+  const mid = (clip.timelineStart + clip.timelineEnd) / 2
+  return t >= mid ? EDGE_TAIL : EDGE_HEAD
 }
 
 /**

@@ -379,6 +379,195 @@ then failed the build from inside rolldown with `'node:util' does not provide an
 
 ## Recently completed
 
+- **Params inside a transition graph (or any compound) were frozen at compile time — fixed
+  (2026-08-08).** Moving any slider on a node inside a transition graph did nothing at all.
+  - `executeGraphDAG` resolved a node's params as `liveNodes[id] ?? node.params`, skipping the
+    `nodeLookup` map in between. `node.params` is the snapshot **baked into the compiled chain**,
+    and a param edit deliberately does NOT bump `topologyVersion` — that is what keeps a slider drag
+    cheap — so the chain is never rebuilt and the baked value is used forever.
+  - The top level looked fine only by accident: the renderer passes a full node map there as
+    `liveNodes`. Every graph evaluated *without* one — a transition graph, a compound's interior —
+    read compile-time values. `_compositeGraphTransition`'s own comment claimed the executor "reads
+    current values off the graph regardless"; it did not, and that claim is what made the bug easy
+    to look past.
+  - Now `liveNodes[id] ?? nodeLookup[id] ?? node.params` at all four sites (the effect loop and the
+    image / text / shape pre-passes). `nodeLookup` is `buildNodeMap(subGraph)`, rebuilt from the
+    store every frame, so it is always current. The float-source path already resolved all three
+    this way — the two had simply disagreed.
+
+- **`TRANSITION_FX` — every built-in transition is now a chainable NODE (2026-08-08).** Two
+  complaints, one mechanism: "Convert to Node Graph doesn't keep my effect" and "I want to stack
+  transitions the way Resolve does".
+  - **The node.** Two texture inputs (`input` = From, `input_b` = To), a `Progress` param socket,
+    and an **Effect** select over all 35 built-ins. Its GLSL is assembled per node by
+    `buildTransitionNodeShader` — the SAME `vec4 transition(vec2 uv)` body, with a different
+    prelude — so there is one copy of each effect, not one for transitions and one for nodes.
+    - Aliasing is `#define u_from u_texture` etc., **not** a textual rewrite: a substitution would
+      also hit `u_from` inside comments and any identifier that merely starts with it, and a
+      `#define` keeps compile-error line numbers pointing at the line you wrote. The smoke test's
+      `declaredNames` already understands `#define`, so this validates cleanly.
+    - Sockets reuse `input`/`input_b` because `TEXTURE_INPUT_SOCKETS` already maps those to
+      `u_texture`/`u_texture_b` — the DAG executor routes both images with no new branch.
+    - `u_backdrop` / `u_opacity` are deliberately absent. They belong to `TRANSITION_FOOTER` (the
+      compositor's opacity fallback); a node sits mid-graph where there is no backdrop to fall back
+      to, and its output is composited by whatever consumes it.
+  - **Convert to Node Graph now preserves the effect.** `seedGraphFor` (transitionActions) builds
+    the seed from what the edge is *currently* carrying: a library compound forks a copy, a built-in
+    becomes a `TRANSITION_FX` node **with its current param values**, and plain Fade becomes the
+    MIX_BLEND crossfade. Previously it always seeded the starter crossfade, so converting a Film
+    Burn silently discarded it — indistinguishable from the outside from the graph being broken.
+  - **Stacking is just wiring.** Chain one node's output into the next one's `From` and give each
+    its own remap of Progress. Worth knowing when wiring by hand: an unwired `input_b` falls back to
+    the PRIMARY input (`executeGraphDAG`'s rule for a secondary texture socket), so a Transition FX
+    with only `From` connected mixes a picture with itself and does nothing visible — it reads as
+    broken when it is merely unwired. Connect `To` as well.
+  - **`SOURCE_PARAMS` (useGraphStore) is new and load-bearing.** A param edit deliberately does NOT
+    bump `topologyVersion` — that is what keeps a slider drag cheap — but `u_tfx_type` *changes the
+    shader source*, so it must recompile or the node keeps running the previous effect. The same
+    branch also merges the new effect's **defaults** underneath the existing params: without it,
+    switching Crossfade → Film Burn leaves every Film Burn uniform absent, `uploadUniforms` skips
+    them, and the shader runs on GLSL's implicit zeros (no edge, no glow) — the worst possible first
+    impression of a new effect.
+  - **Two places were re-implementing `getNodeSource` inline** (`NodeCanvas.nodeParamConfigs` and
+    `autoWireTransitionNode`) with the old custom → shaderCode → registry chain. Both now call it.
+    That resolver is documented as the single source of truth precisely so a node-dependent source
+    like this one works everywhere; the inline copies would have shown the DEFAULT transition's
+    params no matter which effect was selected.
+  - The default (`CROSSFADE`) wrapper is `registerShader`ed, so a bare `getShaderSource` — what the
+    add-node paths use to compute a new node's default params — returns something sensible, and the
+    wrapper gets smoke-test coverage like every other shader.
+
+- **The transition library went from 10 to 35 (2026-08-08).** Five new families, all built on the
+  existing `TRANSITION_HEADER` / `vec4 transition(vec2 uv)` / `TRANSITION_FOOTER` contract, so
+  nothing in the renderer or the edge model changed.
+  - **Film** — `FILM_BURN` (3 styles: emulsion char, paper, chemical bleach), `FILM_ROLL` (projector
+    loses sync: frames roll past the gate with the frame bar sweeping through), `LIGHT_LEAK`,
+    `PROJECTOR_REEL` (cue mark, flicker, gate weave, dust, scratches), `VHS_TRACKING`.
+  - **Motion** — `WHIP_PAN`, `SLIDE` (Cover / Reveal / Push × 8 directions, with a seam shadow),
+    `SPIN`, `SWIRL`.
+  - **Geometric** — `CLOCK_WIPE`, `BARN_DOORS`, `BLINDS`, `CHECKERBOARD`, `SHAPE_IRIS` (8 shapes).
+  - **Digital** — `SCANLINE_COLLAPSE` (CRT squash to a line), `PIXEL_SORT`, `STATIC_NOISE`,
+    `SLICE_SHIFT`.
+  - **Organic / Light** — `INK_BLEED`, `LIQUID_MORPH`, `RIPPLE`, `SMOKE`, `FLASH`,
+    `BLOOM_DISSOLVE`, `DEFOCUS`.
+  - **Six shared helpers moved into `TRANSITION_HEADER`** (`t_aspect`, `t_rot`, `t_noise`, `t_fbm`,
+    `t_front`, `t_dir8`, `t_clip`, `t_disc`, `t_streak`). A dozen of these transitions want the same
+    value noise; a per-entry copy is duplication AND a guarantee that two "identical" effects drift.
+    Unused helpers are dead code the compiler drops, so an entry that needs none pays nothing.
+    - **`t_front` is the load-bearing one.** It sweeps a threshold across a 0..1 map over
+      `(1 + 2*soft)` rather than over `1`, which is what guarantees a FULL hand-off — without the
+      widened span the softest pixels never finish and a dissolve that ends at ~97% reads as a
+      broken cut rather than a slow one. Every noise/shape-driven entry uses it.
+    - `t_disc` / `t_streak` are constant-tap (13 and 9), per the house rule: no radius-dependent
+      loops, because that is O(r²) and was a real perf bug in `DEPTH_BLUR`.
+  - **Every entry now carries a `category`** (`TRANSITION_CATEGORIES`), which is the only thing
+    keeping a library this size browsable. `groupedTransitionCatalog()` (transitionActions) is the
+    one grouping, read by the Media Pool browser, the Inspector dropdown (`optgroup`s) and the
+    Timeline's edge menu — which became a two-level menu (categories, then entries) because a flat
+    list was fine at nine and is unusable at thirty-five. The Transitions tab also gained a search
+    box for the same reason.
+  - **Two bugs worth remembering, both caught by hand because the sandbox was down:**
+    - A GLSL comment contained **backticks** (``frames``, ``travel``, ``dir``). That closes the JS
+      template literal and the rest of the shader parses as JavaScript — the exact failure the Code
+      Style section warns about, and it reports as a bare `Parsing error` hundreds of lines away.
+    - `FILM_BURN` used **`char`** as a local variable. It is a RESERVED word in GLSL ES and the
+      shader will not compile with it, no matter what surrounds it. Renamed `charAmt`.
+  - **`FILM_ROLL`'s direction is done by mirroring y, not by negating travel.** A negative travel
+    pushes the strip's `cell` index below zero, where the FROM branch is taken forever — so rolling
+    "Down" would have looked fine and simply never arrived at the incoming clip.
+
+- **Transitions became discoverable (2026-08-08).** The previous pass made transitions *work*; this
+  one makes them findable. The old entry points were a dropdown buried in the clip Inspector and a
+  right-click on a fade wedge — and **the wedge has zero width until a fade exists**, so on a fresh
+  cut there was physically nothing to click. Four routes now, matching the muscle memory people
+  arrive with:
+  - **⇄ hotspots on each end of a clip** (hover to reveal) apply the default transition in one
+    click. They sit exactly on top of the invisible right-click edge zone, so finding one teaches
+    the other. Below the trim (z 5) and fade (z 6) handles by design — those are precision drags on
+    a 5–9px target and a fat click zone would swallow their edges.
+  - **Right-click near a clip end** now opens that edge's menu even with no wedge there
+    (`EDGE_HIT_PX`, capped at a third of the clip so a short clip keeps a middle). Previously the
+    edge menus were reachable only through a submenu of the clip menu.
+  - **A Transitions tab in the Media Pool.** Drag a card onto a clip — front half = In, back half =
+    Out — or click to apply to the selected clip, or right-click to set the default.
+  - **`T`** applies the default to the selected clip's nearer edge. Premiere's Ctrl+D was taken by
+    Duplicate Node, and a bare `T` was free.
+  - **`useAppStore.defaultTransition`** (serialized under `project`) is what all of those apply; it
+    is also a dropdown in Inspector → Project. `''` is a real value — the plain opacity ramp — which
+    is why the load path uses `??` and not `||`.
+  - **`transitionCatalog()`** (transitionActions) is the single list of choosable transitions —
+    built-in shaders, `compound:<libId>` library entries and `'graph'` as one uniform set whose
+    `type` is directly consumable by `applyEdgeType`. The Inspector dropdown and the Media Pool
+    browser read it; the Timeline's effect menu is the last hold-out.
+  - **Which edge a gesture means** is always `nearestEdge(clip, t)` — the half of the clip the
+    pointer/playhead is in. Splitting at the midpoint rather than "within N seconds of an end" means
+    the answer is defined however short the clip and however far from an end you land.
+  - **Drag detection needed a marker MIME type** (`TRANSITION_DRAG_TYPE`). `dataTransfer.getData` is
+    blocked outside the `drop` event, so a `dragover` handler can only read `types` — without a
+    second, empty type set alongside the payload there is no way to tell a transition drag from a
+    generator-clip drag, and the edge highlight would flash on both. Also: `dragleave` bubbles from
+    every clip inside the lane, so it clears the highlight only when `relatedTarget` is outside.
+  - **FROM/TO now bind by `terminalRole`, not array position.** `subGraph.nodes` is append-ordered,
+    so deleting a terminal and adding one back — or a graph rebuilt from a promoted library copy —
+    silently swapped the two sides, and a reversed transition reads as a broken shader rather than a
+    rewiring. Index order remains the fallback, so pre-existing graphs are unaffected.
+  - **Two node fields were being dropped by the serializer**: `terminalRole` (new) and **`audioBand`
+    (pre-existing bug)** — neither was in either node map, so a compound's audio-band terminal lost
+    its tag on every save/load and stopped routing its splitter band.
+
+- **Transition authoring made survivable (2026-08-08).** The edge-transition *model* was sound;
+  every fault was at its edges. Five fixes, in the order they bite a user:
+  - **Assigning an effect now always creates a window to play it in.** `Timeline.setEdgeType` gave a
+    zero-length edge a 1s default; `Inspector.EdgeTransitionSection.onPickType` did not. So picking a
+    transition from the Inspector on a clip whose fade handle sat at 0 stored the type, created the
+    node graph, opened the editor — and rendered *nothing, ever*, with only a passive note that a
+    length was missing. That is the whole of "the node graph doesn't seem to work". Both routes now
+    go through **`utils/transitionActions.js`** (`applyEdgeType` / `openEdgeGraphAction`), the write
+    peer to the pure `clipTransitions.js`; `ensureEdgeRegionPatch` + `DEFAULT_EDGE_SECONDS` live
+    with the rest of the model. Re-opening an existing graph transition ensures a window too — the
+    handle can have been dragged back to zero since.
+  - **A transition graph is previewable at all now.** It only composites while the playhead is
+    inside its region — a sub-second window, a few pixels of timeline. The header said "Scrub the
+    transition region to preview", which was true and unactionable. **`TransitionGraphBar`** (a
+    strip under the Node Editor header) gives it a 0→1 progress scrubber. It drives the
+    **playhead**, deliberately, rather than introducing a second notion of progress: what you scrub
+    is exactly what renders and exports.
+    - Worth knowing: **`TRANSITION_PROGRESS`'s Preview / auto-preview params are unreachable inside
+      a real clip transition** and always were. `resolveTransitionProgress` prefers
+      `standardState.transitionProgress`, and the renderer only runs the graph when it is supplying
+      one. Those params only ever apply when the compound is placed as a node in an ordinary graph.
+      Hence a playhead scrubber rather than "just use the preview slider".
+    - The strip also names what **FROM** and **TO** are bound to *on this edge* — they swap between
+      head and tail, which the node names can't convey and which is the single most confusing thing
+      about authoring a transition out to nothing.
+  - **Nodes added in a transition graph are added unconnected, like anywhere else.** There was
+    briefly an auto-splice (into the chain before `EFFECT_OUTPUT`, plus `TRANSITION_PROGRESS`
+    guessed onto an "amount" param); it was **removed on request (2026-08-08)**. Guessing at wiring
+    is worse than no wiring: you cannot tell what it decided without reading the noodles, and
+    undoing its guess costs more than making the two connections yourself. Ctrl+drag-a-node-over-a-
+    wire remains as the deliberate insert gesture. Do not reintroduce it without asking.
+    - The thing it was papering over is still true and worth stating in the UI instead: an unwired
+      node is pruned by `getExecutionOrder` (no effect, no error), and a node wired without
+      `TRANSITION_PROGRESS` runs at a **constant** value for the whole region. The header strip says
+      both.
+  - **Failures are visible.** Every `return false` in the transition path was a `console.warn` plus
+    a silent fall back to a hard cut, so "broken" and "working but subtle" looked identical.
+    **`gl/transitionStatus.js`** is a tiny subscribable registry (peer of `alphaRegistry`) keyed by
+    clip edge; `TransitionStatusNote` renders it in the Inspector section and the Node Editor strip.
+    A registry rather than Zustand for the usual reason — the answer is only knowable inside the
+    render loop, and a per-frame store write would re-render the app. `null` means "never
+    evaluated", which is deliberately **not** a failure.
+  - **The preview tap (👁) works inside a transition graph.** `executeTransitionCompound` now takes
+    a `tapPointNodeId` and `executeGraphDAG`'s `outputResolved` branch substitutes the tapped node's
+    FBO for every `EFFECT_OUTPUT`. Substitution, not a draw-to-screen: this sub-graph is one layer
+    of a frame, so blitting from in here would fight the compositor — and seeing the tapped node
+    composited in place is the only way to judge a transition anyway.
+  - **Duration moved next to the effect it governs.** The In/Out Length sliders were in the Fades
+    section, ~200px above the Transition In/Out sections, which is most of why the region model read
+    as arbitrary. Each edge section now owns its own Duration (still `clip.fadeIn`/`fadeOut` — one
+    number, one wedge, one handle) plus a **Go to Transition** button. Audio clips have no
+    transition sections, so they keep a plain Fade In / Fade Out pair.
+
 - **Dependency bumps + the first green `lint`/`build` in a while (2026-08-07).** Took Dependabot
   #17 (`react-dom` 18.3.1 → 19.2.8, `@types/react-dom` → 19.2.4) and #20 (`@vitejs/plugin-react`
   4.7.0 → 6.0.5). #18/#19 (ESLint 10) are blocked upstream — see the backlog.
@@ -807,6 +996,122 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
     guaranteed user-gesture path. One blob URL per file, not per clip (splits share sources).
 
 ## Backlog / potential improvements
+
+- **Verify `TRANSITION_FX` in `npm run dev`** — sandbox still down, so no lint/build/smoke run.
+  0. **Sliders are live.** Open a transition graph, drag any param on any node — the preview must
+     change *while dragging*. Same for a param on a node inside a COMPOUND, which had the identical
+     bug. Then confirm the drag is still cheap (no recompile): the only param that may stutter is
+     TRANSITION_FX's Effect, which recompiles by design.
+  1. **`npm run smoke:shaders`.** TRANSITION_FX is registered, so the wrapper is validated —
+     specifically that the `#define` aliases keep `u_from`/`u_to`/`u_progress` from reading as
+     undeclared, and that the generated Effect select's default index is in range.
+  2. **Convert preserves the effect.** Put Film Burn on an edge, tweak Origin and Glow, then
+     Convert to Node Graph. The graph must contain a Transition FX node reading *Film Burn* with
+     *those values*, and the picture must not change at the moment of conversion.
+  3. **Switching effect.** Change the node's Effect select — the picture must change immediately
+     (that is the `SOURCE_PARAMS` recompile) and the new effect's params must appear at their
+     defaults, not at zero. Switch back and confirm the original values survived.
+  4. **Nodes arrive unconnected.** Drop any node into a transition graph — it must land exactly
+     where you dropped it with no edges created and no Transition Progress node conjured up.
+  5. **Stacking, wired by hand.** Add a second Transition FX, wire From = the first one's output,
+     To = the TO terminal, and Progress into its Progress socket. Scrubbing must show both effects.
+     Then give the second one its own MATH remap of Progress (e.g. ×2−1 clamped) so it runs in the
+     back half only; that is the Resolve-style custom transition.
+  6. **Round trip.** Save/load keeps `u_tfx_type` (it is a plain param) and the graph still
+     compiles to the right effect. A project saved BEFORE this change must still open — its
+     transition graphs contain MIX_BLEND, which is untouched.
+  7. **Monaco.** Opening the shader editor on a TRANSITION_FX writes `customShaderSource`, which
+     then wins over the generated source — so the Effect select stops having any effect. That is
+     the intended "fork this into a custom shader" path, but it is a sharp edge; if it bites,
+     either hide the Monaco button for this type or clear `customShaderSource` when Effect changes.
+
+- **Verify the 25 new transitions in `npm run dev`** — sandbox down again, so `npm run lint` /
+  `smoke:shaders` have NOT been run. 25 new shaders plus a rewritten shared header is the largest
+  GLSL change since the 3D family, and only a real WebGL2 context proves it.
+  1. **`npm run smoke:shaders` FIRST.** Every transition now carries the rewritten
+     `TRANSITION_HEADER`, so a malformed helper fails all 35 at once — the fastest possible signal.
+     It also catches the two classes of mistake that were found by hand this round (a stray backtick
+     closing the template literal, an `@param` not adjacent to its uniform).
+  2. **Nothing regressed.** The 10 original transitions must look identical — only their `category`
+     field changed. Open a project using CROSSFADE and one using GLITCH_BLOCKS.
+  3. **Both ends are clean.** For every new transition, step to the FIRST and LAST frame of the
+     region: the picture must be exactly FROM and exactly TO, with no residual glow, blur, smear,
+     offset or noise. Everything is gated on `t_env` or lands on identity for this reason, so any
+     entry that fails here has a genuine bug, not a taste problem.
+  4. **The two named ones.** `FILM_BURN` at each Style, sweeping Origin 0→360 (the burn front must
+     travel, not ignite everywhere at once). `FILM_ROLL` at Direction = Up AND Down — Down is the
+     case that would silently never complete if the mirroring were replaced by a negative travel.
+  5. **Select params.** Each of the eight `SHAPE_IRIS` shapes; `SLIDE` at all 3 modes × a few
+     directions; `CHECKERBOARD`'s 5 orders; `PIXEL_SORT`'s 4 directions. A select whose default
+     index is out of range is a smoke-test failure, but a shape that renders wrong is not.
+  6. **Frame time.** `t_disc` (13 taps) is used by `DEFOCUS` and `BLOOM_DISSOLVE`, `t_streak` (9) by
+     `WHIP_PAN`. `PIXEL_SORT` and `SPIN` add their own 8 and 5. None should be near the cost of the
+     3D family, and all are constant regardless of their radius params — sweep Blur/Length to the
+     maximum and confirm the frame time does not climb.
+  7. **Transparency.** `SLICE_SHIFT` Gap Opacity 0 must show lower tracks through the gaps (and
+     export transparent), 1 must show the gap colour. `FILM_BURN` / `SHAPE_IRIS` glow raise alpha
+     deliberately, so check a transition-out-to-nothing over the checker backdrop.
+  8. **Grouping.** Media Pool → Transitions shows 8 category sections and the search box filters
+     across name/category/description; the Inspector dropdown shows the same groups as `optgroup`s;
+     the Timeline edge menu opens on categories and drills in. All three must agree, since all three
+     read `groupedTransitionCatalog`.
+
+- **Transition preview thumbnails.** The browser cards are text plus a ⇄ glyph. Rendering each
+  shader once into a small canvas (two placeholder gradients as FROM/TO, progress ~0.5) would make
+  a 35-entry library scannable at a glance — which is most of the value of a browser. Needs an
+  offscreen WebGL2 context and a cache keyed by type; the shaders are already compilable standalone
+  via `buildTransitionShader`, so the work is all in the harness, not the GLSL.
+
+- **Verify the transition-discoverability pass in `npm run dev`** — the Cowork sandbox was down for
+  this one, so `npm run lint` / `npm run build` have NOT been run against it. No shader changed.
+  Checks, highest value first:
+  1. **Hotspots.** Hover a clip: a ⇄ appears at each end that has no transition. Click it — the
+     default (Crossfade) lands on that edge with a 1s window and the wedge appears. Then confirm the
+     trim handle and the fade handle are still grabbable at the same corner (the hotspot deliberately
+     sits under both).
+  2. **Right-click zone.** On a clip with no fades at all, right-click within ~22px of either end —
+     the edge menu must open, not the clip menu. Right-click the middle → clip menu. On a very short
+     clip the middle must still be reachable (zone caps at a third).
+  3. **`T`.** Select a clip, park the playhead in its first half, press T → Transition In. Second
+     half → Transition Out. In a text field T must still type. On an audio clip it must do nothing.
+  4. **Transitions tab.** Drag a card onto a clip's front half → In, back half → Out; the cyan band
+     must show which edge before you let go, and must NOT appear when dragging an image/shape card
+     (that's the marker MIME type). Click a card with a clip selected → applies to the nearer edge.
+     Right-click → Set as Default, then confirm the ★ moves and T uses the new one.
+  5. **Default round trip.** Change the default in Inspector → Project, save, reload. Also set it to
+     "Fade" (empty string) and confirm it survives — `??` vs `||` is exactly this case.
+  6. **FROM/TO roles.** Open a transition node graph, confirm it still dissolves the right way round.
+     Then save/load and confirm it still does (that's `terminalRole` surviving the serializer). A
+     project saved BEFORE this change must also still work, via the index fallback.
+  7. **`audioBand` regression fix.** Build a compound with an audio-band EFFECT_INPUT terminal, save,
+     reload, and confirm it still drives its band — that field was previously dropped on save.
+
+- **Verify the transition-authoring pass in `npm run dev`** — the Cowork sandbox was down again, so
+  `npm run lint` and `npm run build` have NOT been run against it. No shader changed, so
+  `smoke:shaders` is not the risk here; the risk is React wiring. Checks, highest value first:
+  1. **The headline fix.** New project, one clip, no fades. Inspector → Transition In → Effect →
+     *This clip's own graph*. Duration must jump to 1s **by itself** and the clip must now dissolve
+     in. Repeat via the Timeline (right-click the clip → Transition In → Effect) and confirm both
+     routes behave identically — that parity is the point of `transitionActions.js`.
+  2. **The scrubber.** Open that graph. The strip under the header should show Progress, FROM/TO and
+     the duration. Dragging Progress must move the timeline playhead and change the picture; letting
+     it sit at 100% must show the fully-arrived frame (that's the `0.999` clamp — at a true 1.0
+     `regionProgress` returns null and nothing composites).
+  3. **Drop-in behaviour.** With the graph open, drag any effect from the Media Pool onto the canvas.
+     It must land unconnected, where you dropped it — no edges, no nodes created. Wire it in by hand
+     and confirm it takes effect; wire Transition Progress into its amount param and confirm it ramps
+     rather than sitting still.
+  4. **The error surface.** Delete the Mix node so nothing feeds OUTPUT. The Inspector section and
+     the editor strip must both show an amber note; the cut degrades to a hard cut as before. Re-wire
+     and confirm the note clears.
+  5. **Preview tap.** Click 👁 on a node inside a transition graph — the preview should show that
+     node's output composited in place. Reset via the header chip.
+  6. **Nothing regressed on the ordinary paths.** A crossfade between two overlapping clips must be
+     unchanged (its Duration shows "(overlap)" and is a readout, not a slider). An audio clip's
+     Inspector must still show Fade In / Fade Out. A clip with a built-in transition must still play
+     it, and `edgeDisplaySeconds` still drives the wedge.
+  7. **Round trip.** Save/load keeps both edges and their graphs; deleting the clip leaves no orphan
+     status note or graph.
 
 - **Verify the 3D / Depth family in `npm run dev`** — written with the Cowork sandbox down, so
   `npm run lint` (ESLint + shader smoke test) and `npm run build` have NOT been run. Every static

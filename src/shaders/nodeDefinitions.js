@@ -189,6 +189,30 @@ const NODE_DEFS = {
     ],
     hasParamInputs: true,
   },
+  // TRANSITION_FX — any built-in transition, as a chainable graph node.
+  //
+  // This is what makes transitions something you BUILD with rather than only
+  // pick from a list: two image inputs, a progress input, and an output that is
+  // just a picture. Feed one's output into the next one's From, put a blur
+  // between them, drive each one's Progress from its own MATH remap so they
+  // stagger — the Resolve-style "stack of transitions" workflow, with the whole
+  // node set available in between.
+  //
+  // Sockets deliberately reuse `input` / `input_b`: TEXTURE_INPUT_SOCKETS
+  // already maps those to u_texture / u_texture_b, so the DAG executor routes
+  // both images with no new branch, and an unwired second input falls back to
+  // the first exactly like every other two-input effect.
+  TRANSITION_FX: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'From' },
+      { id: 'input_b', type: 'texture', name: 'To' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
   // MATH — CPU-side math operations on float values, no GLSL shader
   MATH: {
     inputs: [],

@@ -3,6 +3,8 @@
  * Pre-built compound effect presets and user compound instantiation.
  */
 
+import { TRANSITION_TYPES, getTransitionLabel } from './transitionRegistry.js'
+
 export const COMPOUND_PRESETS = [
   {
     id: 'psychedelic_pulse', name: 'Psychedelic Pulse',
@@ -527,8 +529,12 @@ export const STARTER_TRANSITION_COMPOUND = {
   ],
   subGraph: {
     nodes: [
-      { id: 'tstart_in_from', type: 'EFFECT_INPUT', name: 'FROM (outgoing)', position: { x: -220, y: 140 }, locked: true, params: {}, audioBand: null },
-      { id: 'tstart_in_to', type: 'EFFECT_INPUT', name: 'TO (incoming)', position: { x: -220, y: 260 }, locked: true, params: {}, audioBand: null },
+      // `terminalRole` is what actually binds these to the outgoing / incoming
+      // frames (executeTransitionCompound). Array order is only the fallback —
+      // it silently swaps the two sides if a terminal is ever re-added, and a
+      // backwards transition reads as a broken shader rather than a rewiring.
+      { id: 'tstart_in_from', type: 'EFFECT_INPUT', name: 'FROM (outgoing)', terminalRole: 'from', position: { x: -220, y: 140 }, locked: true, params: {}, audioBand: null },
+      { id: 'tstart_in_to', type: 'EFFECT_INPUT', name: 'TO (incoming)', terminalRole: 'to', position: { x: -220, y: 260 }, locked: true, params: {}, audioBand: null },
       { id: 'tstart_progress', type: 'TRANSITION_PROGRESS', name: 'Transition Progress', position: { x: -220, y: 380 }, params: { auto_preview: true, preview: 0.5, preview_speed: 0.25 } },
       { id: 'tstart_mix', type: 'MIX_BLEND', name: 'Mix / Blend', position: { x: 120, y: 200 }, params: { u_mix: 0.5, u_operation: 0 } },
       { id: 'tstart_out', type: 'EFFECT_OUTPUT', name: 'OUTPUT', position: { x: 460, y: 200 }, locked: true, params: {} },
@@ -540,6 +546,72 @@ export const STARTER_TRANSITION_COMPOUND = {
       { id: 'tstart_e4', fromNode: 'tstart_mix', fromSocket: 'output', toNode: 'tstart_out', toSocket: 'input' },
     ],
   },
+}
+
+/**
+ * A transition graph seeded from an EXISTING transition, so "Convert to Node
+ * Graph" hands you the effect you already chose, as a node, ready to build on.
+ *
+ * This is the whole point of the conversion. Previously it always seeded the
+ * starter crossfade, so converting a Film Burn threw the Film Burn away and left
+ * a plain mix — which reads as the node graph not working, because the thing you
+ * were looking at vanished the moment you asked to edit it.
+ *
+ * Layout is left-to-right with the progress node below and a gap before OUTPUT,
+ * so there is an obvious place to drop the next node. Nodes are added
+ * unconnected — this seed is the only thing that wires itself.
+ *
+ * @param {string|null} type — a built-in transition key, or null/'' for a plain
+ *   crossfade built from MIX_BLEND (the historical starter).
+ * @param {object|null} params — the transition's current param values, carried
+ *   over so the node starts looking exactly like the clip did.
+ */
+export function buildTransitionSeedGraph(type, params = null) {
+  const from = { id: 'tseed_from', type: 'EFFECT_INPUT', name: 'FROM (outgoing)', terminalRole: 'from', position: { x: -260, y: 120 }, locked: true, params: {}, audioBand: null }
+  const to = { id: 'tseed_to', type: 'EFFECT_INPUT', name: 'TO (incoming)', terminalRole: 'to', position: { x: -260, y: 250 }, locked: true, params: {}, audioBand: null }
+  const progress = { id: 'tseed_progress', type: 'TRANSITION_PROGRESS', name: 'Transition Progress', position: { x: -260, y: 390 }, params: { auto_preview: true, preview: 0.5, preview_speed: 0.25 } }
+  const out = { id: 'tseed_out', type: 'EFFECT_OUTPUT', name: 'OUTPUT', position: { x: 420, y: 185 }, locked: true, params: {} }
+
+  // A built-in becomes a TRANSITION_FX node carrying its params; "Fade" (no
+  // type) becomes the MIX_BLEND crossfade, which is the same thing expressed
+  // with the general-purpose node.
+  const fx = type
+    ? {
+        id: 'tseed_fx',
+        type: 'TRANSITION_FX',
+        name: `Transition: ${getTransitionLabel(type)}`,
+        position: { x: 90, y: 170 },
+        params: {
+          // The INDEX, not the key: that is what a select control writes, so
+          // storing the key here would leave the dropdown showing the wrong
+          // entry until the user touched it (transitionFxType tolerates both,
+          // but the UI only round-trips the index).
+          u_tfx_type: Math.max(0, TRANSITION_TYPES.indexOf(type)),
+          u_tfx_progress: 0.5,
+          ...(params || {}),
+        },
+      }
+    : {
+        id: 'tseed_fx',
+        type: 'MIX_BLEND',
+        name: 'Mix / Blend',
+        position: { x: 90, y: 170 },
+        params: { u_mix: 0.5, u_operation: 0 },
+      }
+
+  // Each node names its own "amount" uniform, so the progress edge targets a
+  // different socket in the two cases.
+  const progressSocket = type ? 'u_tfx_progress' : 'u_mix'
+
+  return {
+    nodes: [from, to, progress, fx, out],
+    edges: [
+      { id: 'tseed_e1', fromNode: from.id, fromSocket: 'output', toNode: fx.id, toSocket: 'input' },
+      { id: 'tseed_e2', fromNode: to.id, fromSocket: 'output', toNode: fx.id, toSocket: 'input_b' },
+      { id: 'tseed_e3', fromNode: progress.id, fromSocket: 'progress', toNode: fx.id, toSocket: progressSocket },
+      { id: 'tseed_e4', fromNode: fx.id, fromSocket: 'output', toNode: out.id, toSocket: 'input' },
+    ],
+  }
 }
 
 export default COMPOUND_PRESETS

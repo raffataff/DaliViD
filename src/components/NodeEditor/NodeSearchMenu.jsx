@@ -100,6 +100,7 @@ const NODE_CATALOG = [
       { type: 'RAMP', name: 'Ramp (0 → 1 over a clip)' },
       { type: 'LFO', name: 'LFO (oscillator)' },
       { type: 'MATH', name: 'Math' },
+      { type: 'TRANSITION_FX', name: 'Transition Effect (any built-in)' },
       { type: 'TRANSITION_PROGRESS', name: 'Transition Progress' },
       { type: 'LETTERBOX', name: 'Letterbox / Widescreen Bars' },
       { type: 'CUSTOM', name: 'Custom Shader' },

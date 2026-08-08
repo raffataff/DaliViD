@@ -15,6 +15,7 @@ import { ensureNodeImage, removeNodeImage } from './imageRegistry.js'
 import { ensureText, removeText } from './textRegistry.js'
 import { onNodeRemoved } from './nodeLifecycle.js'
 import { setDetectedAlpha, getDetectedAlpha } from './alphaRegistry.js'
+import { setTransitionStatus, clearClipTransitionStatus } from './transitionStatus.js'
 import { getShaderSource } from '../shaders/shaderRegistry.js'
 import { buildTransitionShader, getTransitionDefaults } from '../shaders/transitionRegistry.js'
 import { evaluateKeyframes } from '../utils/keyframes.js'
@@ -1972,6 +1973,9 @@ export class Renderer {
       this.compiledChains.delete(key)
       delete this._nodeTransitionChains[key]
     }
+    // A gone clip's edge statuses are stale advice about something that no
+    // longer exists; leaving them would make a recycled id inherit them.
+    clearClipTransitionStatus(clipId)
   }
 
   /**
@@ -2076,16 +2080,27 @@ export class Renderer {
     const type = transition?.type
     if (!type) return false
 
+    // Status is keyed by the clip EDGE, not by transition type: that is what the
+    // Inspector panel and the Node Editor header have in hand, and neither
+    // should have to know whether this edge is backed by a shader, a library
+    // compound or a private graph. Every `return false` below is a silent
+    // fallback to a hard cut, which is exactly the failure mode that used to be
+    // invisible — so each one now says why.
+    const statusKey = transitionGraphKey(clip.id, edge)
+
     if (isGraphType(type)) {
-      const key = transitionGraphKey(clip.id, edge)
+      const key = statusKey
       const graph = graphState?.clipGraphs?.[key]
       if (!graph || !graph.nodes || graph.nodes.length === 0) {
         this._warnTransitionOnce(key, `[Renderer] Transition graph "${key}" is empty`)
+        setTransitionStatus(key, false, 'empty',
+          'This edge is set to its own node graph, but the graph is empty — the cut plays as a hard cut.')
         return false
       }
       return this._compositeGraphTransition(
         baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge,
-        graph, key, null, null, progress, opacity, standardState
+        graph, key, null, null, progress, opacity, standardState, statusKey,
+        this.previewTapEnabled ? graph.tapPointNodeId : null
       )
     }
 
@@ -2094,17 +2109,25 @@ export class Renderer {
       const entry = this._getGraphStore?.()?.compoundLibrary?.find(c => c.id === libId)
       if (!entry || !entry.subGraph) {
         this._warnTransitionOnce(type, `[Renderer] Node transition "${libId}" not found in compound library`)
+        setTransitionStatus(statusKey, false, 'missing-compound',
+          'This transition points at a library entry that no longer exists — the cut plays as a hard cut.')
         return false
       }
       return this._compositeGraphTransition(
         baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge,
-        entry.subGraph, `lib:${libId}`, entry, transition.params, progress, opacity, standardState
+        entry.subGraph, `lib:${libId}`, entry, transition.params, progress, opacity, standardState, statusKey, null
       )
     }
 
-    return this._compositeBuiltinTransition(
+    const ok = this._compositeBuiltinTransition(
       baseFBOId, destFBOId, fromFBOId, toFBOId, transition, progress, opacity, standardState
     )
+    if (ok) setTransitionStatus(statusKey, true)
+    else {
+      setTransitionStatus(statusKey, false, 'shader',
+        `"${type}" could not be compiled — the cut plays as a hard cut. See the console for the GLSL error.`)
+    }
+    return ok
   }
 
   /** Warn once per key — a broken transition runs every frame, so this is the
@@ -2181,9 +2204,13 @@ export class Renderer {
    * @param {string} cacheKey — compile-cache key (graph key, or `lib:<id>`)
    * @param {object|null} entry — library entry, when this is a shared compound
    * @param {object|null} overrides — exposed-param values by index (entry only)
+   * @param {string} statusKey — clip-edge key for the UI status registry
+   * @param {string|null} tapPointNodeId — solo this node's output instead of the
+   *   graph's OUTPUT terminal (the 👁 button). Only meaningful for a private
+   *   graph: a shared library entry is not the graph open in the editor.
    * @returns {boolean} false → caller falls back to the blend composite
    */
-  _compositeGraphTransition(baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge, subGraph, cacheKey, entry, overrides, progress, opacity, standardState) {
+  _compositeGraphTransition(baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge, subGraph, cacheKey, entry, overrides, progress, opacity, standardState, statusKey = null, tapPointNodeId = null) {
     // Compile (or reuse) the sub-graph's chain.
     //
     // Invalidation is by `topologyVersion`, NOT by object identity: the store
@@ -2204,7 +2231,21 @@ export class Renderer {
         console.warn(`[Renderer] Transition graph "${cacheKey}" compiled with errors:`, compiled.errors)
       }
     }
-    if (!cached.chain || cached.chain.length === 0) return false
+    if (!cached.chain || cached.chain.length === 0) {
+      // compileGraph returns an empty chain for exactly two reasons, and they
+      // need different advice: no OUTPUT terminal to walk back from, or a cycle.
+      const why = cached.errors?.[0]?.message || ''
+      setTransitionStatus(statusKey, false,
+        /output/i.test(why) ? 'no-output' : 'compile',
+        /output/i.test(why)
+          ? 'This graph has no OUTPUT terminal, so nothing can be resolved — the cut plays as a hard cut.'
+          : `This graph could not be compiled (${why || 'see console'}) — the cut plays as a hard cut.`)
+      return false
+    }
+    if (cached.errors?.length) {
+      setTransitionStatus(statusKey, false, 'compile',
+        `${cached.errors.length} node${cached.errors.length > 1 ? 's' : ''} in this graph failed to compile — they are bypassed. See the console for the GLSL error.`)
+    }
 
     // Shared library entries expose params on the clip; a private graph is
     // edited directly, so its node params ARE the values (no override layer).
@@ -2236,10 +2277,15 @@ export class Renderer {
     // set of buffers. Freed by releaseClipResources (which matches on `tr~<id>~`).
     const resultFBO = executeTransitionCompound(
       this, cached.chain, subGraph, fromFBOId, toFBOId,
-      standardState, progress, `tr~${clip.id}~${edge}~`, liveNodes
+      standardState, progress, `tr~${clip.id}~${edge}~`, liveNodes, tapPointNodeId
     )
-    if (!resultFBO) return false
+    if (!resultFBO) {
+      setTransitionStatus(statusKey, false, 'no-output',
+        'Nothing is wired into this graph’s OUTPUT terminal, so it produces no picture — the cut plays as a hard cut.')
+      return false
+    }
 
+    if (!cached.errors?.length) setTransitionStatus(statusKey, true)
     this._compositeTrack(baseFBOId, destFBOId, resultFBO, 0 /* Normal */, opacity)
     return true
   }

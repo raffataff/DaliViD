@@ -10,6 +10,7 @@ import useGraphStore from '../store/useGraphStore.js'
 import useTimelineStore from '../store/useTimelineStore.js'
 import { STARTER_TRANSITION_COMPOUND } from '../shaders/compoundPresets.js'
 import { clearDetectedAlpha } from '../gl/alphaRegistry.js'
+import { resetTransitionStatus } from '../gl/transitionStatus.js'
 import { migrateTimeNodeParams } from '../shaders/dataNodeParams.js'
 import { clearHistory } from './history.js'
 
@@ -86,6 +87,9 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
       bpm: app.bpm,
       beatOffset: app.beatOffset,
       beatGridEnabled: app.beatGridEnabled,
+      // The effect the T shortcut / edge hotspots apply. A project setting
+      // because it is an editorial preference, like the beat grid.
+      defaultTransition: app.defaultTransition,
       // Delivery framing (widescreen bars) is a project setting, not a node.
       masterBars: { ...app.masterBars },
     },
@@ -165,6 +169,14 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
           bypassed: n.bypassed,
           locked: n.locked,
           audioBindings: { ...n.audioBindings },
+          // Terminal tags on EFFECT_INPUT nodes. Both were being dropped, and
+          // both matter on reload: `terminalRole` is how a transition binds FROM
+          // vs TO (without it the two sides fall back to array order and can
+          // swap), and `audioBand` is how a compound's band terminal routes its
+          // splitter band. undefined values are dropped by JSON.stringify, so
+          // ordinary nodes cost nothing.
+          terminalRole: n.terminalRole,
+          audioBand: n.audioBand ?? undefined,
           // COMPOUND nodes carry their whole interior — without these fields a
           // saved compound loses its sub-graph on reload and compiles to
           // nothing. undefined values are dropped by JSON.stringify.
@@ -192,6 +204,10 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
               bypassed: n.bypassed,
               locked: n.locked,
               audioBindings: n.audioBindings ? { ...n.audioBindings } : {},
+              // See masterGraph note — transition graphs live in clipGraphs, so
+              // this is the map that actually carries FROM/TO roles.
+              terminalRole: n.terminalRole,
+              audioBand: n.audioBand ?? undefined,
               // See masterGraph note: compounds must keep their interior.
               subGraph: n.subGraph ? JSON.parse(JSON.stringify(n.subGraph)) : undefined,
               exposedParams: n.exposedParams ? JSON.parse(JSON.stringify(n.exposedParams)) : undefined,
@@ -243,6 +259,12 @@ export function deserializeProject(data, getAppStore) {
   // would apply the wrong interpretation to it.
   clearDetectedAlpha()
 
+  // Same reasoning for transition health: a status is a claim about a clip edge
+  // in the OLD project, and clip ids are reused across a save/load round trip.
+  // The renderer re-evaluates every edge it composites, so clearing costs
+  // nothing and stops a stale warning outliving the thing it described.
+  resetTransitionStatus()
+
   // Restore project settings
   if (data.project) {
     app.setProjectSettings({
@@ -254,6 +276,9 @@ export function deserializeProject(data, getAppStore) {
       bpm: data.project.bpm ?? 120,
       beatOffset: data.project.beatOffset ?? 0,
       beatGridEnabled: !!data.project.beatGridEnabled,
+      // `??` not `||`: '' is a real choice (plain opacity ramp), so only a
+      // genuinely absent field should fall back to the crossfade.
+      defaultTransition: data.project.defaultTransition ?? 'CROSSFADE',
       // Older projects have no bars block — fall back to the "off" defaults so a
       // missing field can't silently letterbox someone's edit.
       masterBars: {

@@ -1,4 +1,4 @@
-import { useState, useSyncExternalStore, useCallback } from 'react'
+import { useState, useSyncExternalStore, useCallback, useMemo } from 'react'
 import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import useTimelineStore from '../../store/useTimelineStore'
@@ -10,13 +10,15 @@ import { getDataNodeParams, visibleDataParams } from '../../shaders/dataNodePara
 import { SHAPE_PRESETS } from '../../utils/generatorClips'
 import { ASPECT_PRESETS } from '../../utils/aspectPresets'
 import { BLEND_MODE_NAMES } from '../../gl/BlendModes.glsl.js'
-import { TRANSITION_TYPES, getTransitionLabel, getTransitionParams, getTransitionDefaults } from '../../shaders/transitionRegistry.js'
+import { getTransitionParams } from '../../shaders/transitionRegistry.js'
 import { isTransitionCompound } from '../../utils/compoundUtils'
 import {
   EDGE_HEAD, EDGE_TAIL, edgeLabel, getEdgeTransition, setEdgeTransitionPatch,
   findPrevOverlap, findNextOverlap, headRegion, tailRegion,
   transitionGraphKey, GRAPH_TYPE, isGraphType, isCompoundType, compoundIdOf,
 } from '../../utils/clipTransitions'
+import { applyEdgeType, openEdgeGraphAction, groupedTransitionCatalog } from '../../utils/transitionActions'
+import TransitionStatusNote from '../common/TransitionStatusNote'
 import { keyAtTime } from '../../utils/keyframes'
 import {
   ALPHA_AUTO, ALPHA_MODES, ALPHA_DETECTION_LABELS, ALPHA_PREMULTIPLIED,
@@ -98,6 +100,10 @@ function ProjectInspector() {
   const setResolution = useAppStore(s => s.setResolution)
   const masterBars = useAppStore(s => s.masterBars)
   const setMasterBars = useAppStore(s => s.setMasterBars)
+  const defaultTransition = useAppStore(s => s.defaultTransition)
+  const setDefaultTransition = useAppStore(s => s.setDefaultTransition)
+  const compoundLibrary = useGraphStore(s => s.compoundLibrary)
+  const catalog = useMemo(() => groupedTransitionCatalog(compoundLibrary), [compoundLibrary])
 
   const bars = masterBars || {}
   const projectAspect = resolution.height ? resolution.width / resolution.height : 16 / 9
@@ -122,6 +128,27 @@ function ProjectInspector() {
         </div>
       </div>
       <div className="inspector__field"><label className="inspector__label">Color Space</label><span className="inspector__value">sRGB</span></div>
+
+      {/* The effect behind the T shortcut, the ⇄ hotspots on a clip's ends and
+          click-to-apply in the Transitions browser. Lives with the project
+          settings because it is an editorial preference, like the beat grid. */}
+      <div className="inspector__field">
+        <label className="inspector__label">Default Transition</label>
+        <select
+          className="inspector__select"
+          value={defaultTransition}
+          onChange={(e) => setDefaultTransition(e.target.value)}
+          title="Applied by T, by the ⇄ hotspots on a clip's ends, and by clicking a card in the Transitions tab"
+        >
+          {catalog.map(({ group, items }) => (
+            <optgroup key={group} label={group}>
+              {items.map(entry => (
+                <option key={entry.type || '__fade'} value={entry.type}>{entry.label}</option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+      </div>
 
       {/* ── Widescreen bars ──
           Final pass of the master pipeline, so it shows in the preview and bakes
@@ -861,30 +888,30 @@ function ClipInspector({ clipId }) {
       )}
       <div className="inspector__field"><label className="inspector__label">Opacity</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={clip.opacity || 1} onChange={(e) => updateClip(clipId, { opacity: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{((clip.opacity || 1) * 100).toFixed(0)}%</span></div></div>
       <div className="inspector__field"><label className="inspector__label">Blend Mode</label><BlendModeSelect allowInherit value={clip.blendMode || 'Inherit'} onChange={(v) => updateClip(clipId, { blendMode: v })} /></div>
-      {/* Region lengths. These ARE the transition durations — the effect each
-          region runs is chosen in the two sections further down. A head region
-          backed by an overlap takes its length from that overlap instead, so
-          the slider is disabled rather than silently ignored. */}
-      <div className="inspector__field">
-        <label className="inspector__label">In Length</label>
-        {edgeRegions[EDGE_HEAD]?.mode === 'crossfade' ? (
-          <span className="inspector__value inspector__value--mono" title="Set by the overlap with the previous clip — move either clip to change it">
-            {edgeRegions[EDGE_HEAD].dur.toFixed(2)}s (overlap)
-          </span>
-        ) : (
-          <div className="inspector__slider">
-            <input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeIn || 0} onChange={(e) => updateClip(clipId, { fadeIn: parseFloat(e.target.value) })} />
-            <span className="inspector__slider-value">{(clip.fadeIn || 0).toFixed(2)}s</span>
+      {/* Fade lengths for clips with no picture. For everything else these ARE
+          the transition durations, so they live in the Transition In / Out
+          sections next to the effect they govern — having the length here and
+          the effect 200px further down was most of why the region model read as
+          arbitrary. Audio clips have no transition sections, so they keep the
+          plain pair. */}
+      {!supportsTransition && (
+        <>
+          <div className="inspector__field">
+            <label className="inspector__label">Fade In</label>
+            <div className="inspector__slider">
+              <input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeIn || 0} onChange={(e) => updateClip(clipId, { fadeIn: parseFloat(e.target.value) })} />
+              <span className="inspector__slider-value">{(clip.fadeIn || 0).toFixed(2)}s</span>
+            </div>
           </div>
-        )}
-      </div>
-      <div className="inspector__field">
-        <label className="inspector__label">Out Length</label>
-        <div className="inspector__slider">
-          <input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeOut || 0} onChange={(e) => updateClip(clipId, { fadeOut: parseFloat(e.target.value) })} />
-          <span className="inspector__slider-value">{(clip.fadeOut || 0).toFixed(2)}s</span>
-        </div>
-      </div>
+          <div className="inspector__field">
+            <label className="inspector__label">Fade Out</label>
+            <div className="inspector__slider">
+              <input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeOut || 0} onChange={(e) => updateClip(clipId, { fadeOut: parseFloat(e.target.value) })} />
+              <span className="inspector__slider-value">{(clip.fadeOut || 0).toFixed(2)}s</span>
+            </div>
+          </div>
+        </>
+      )}
 
       {/* Only file-backed video: live camera/screen streams are opaque by
           construction, and generator clips draw their own alpha. */}
@@ -967,6 +994,8 @@ function ClipInspector({ clipId }) {
 function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionCompounds }) {
   const updateClip = useTimelineStore(s => s.updateClip)
   const clipGraphs = useGraphStore(s => s.clipGraphs)
+  const compoundLibrary = useGraphStore(s => s.compoundLibrary)
+  const catalog = useMemo(() => groupedTransitionCatalog(compoundLibrary), [compoundLibrary])
   const enterClipGraph = useAppStore(s => s.enterClipGraph)
   const setPlayheadTime = useAppStore(s => s.setPlayheadTime)
 
@@ -979,54 +1008,82 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
     ? transitionCompounds.find(c => c.id === compoundIdOf(type)) || null
     : null
 
-  const setTransition = (next) => updateClip(clip.id, setEdgeTransitionPatch(edge, next))
-  const setParams = (params) => setTransition({ ...tr, params })
+  // Params only — the type is already assigned, so this must not go through
+  // applyEdgeType (which would re-seed defaults and re-check the region).
+  const setParams = (params) => updateClip(clip.id, setEdgeTransitionPatch(edge, { ...tr, params }))
 
+  // Every route that assigns an effect goes through applyEdgeType, which also
+  // gives the edge a window to play in. This panel used to set the type only —
+  // so picking a transition on a clip whose handle sat at zero stored it,
+  // created the node graph, and rendered nothing at all.
   const onPickType = (nextType) => {
-    if (!nextType) { setTransition(null); return }
-    if (isGraphType(nextType)) {
-      if (!hasGraph) useGraphStore.getState().initTransitionGraph(clip.id, edge, compoundEntry?.subGraph || null)
-      setTransition({ type: GRAPH_TYPE, params: {} })
-      return
-    }
-    setTransition({ type: nextType, params: isCompoundType(nextType) ? {} : getTransitionDefaults(nextType) })
+    applyEdgeType(clip, edge, nextType || null, region, updateClip, compoundLibrary)
   }
 
   const openGraph = () => {
-    if (!isGraphType(type)) onPickType(GRAPH_TYPE)
-    if (region) setPlayheadTime(region.start + region.dur * 0.5)
-    enterClipGraph(graphKey)
+    openEdgeGraphAction(clip, edge, region, {
+      updateClip, compoundLibrary, enterClipGraph, setPlayheadTime,
+    })
   }
+
+  // The length lives HERE, next to the effect it governs. It is still
+  // clip.fadeIn / clip.fadeOut — one number, one wedge, one handle — but a
+  // transition and its duration being two unrelated sliders in two sections was
+  // most of why the region model felt arbitrary.
+  const lengthKey = edge === EDGE_TAIL ? 'fadeOut' : 'fadeIn'
+  const lengthValue = clip[lengthKey] || 0
+  const clipDur = Math.max(0.1, clip.timelineEnd - clip.timelineStart)
+  const isOverlapDriven = region?.mode === 'crossfade'
 
   return (
     <>
       <div className="inspector__section-header" style={{ marginTop: 12 }}>{edgeLabel(edge)}</div>
       <div className="inspector__field">
         <label className="inspector__label">Effect</label>
+        {/* Grouped by the registry's own `category`, via the shared catalog —
+            with 30-plus built-ins a flat list is unusable, and a second
+            hand-maintained grouping here would drift from the Media Pool's. */}
         <select className="inspector__select" value={type} onChange={(e) => onPickType(e.target.value)}>
-          <option value="">Fade (opacity ramp)</option>
-          <optgroup label="Built-in">
-            {TRANSITION_TYPES.map(t => <option key={t} value={t}>{getTransitionLabel(t)}</option>)}
-          </optgroup>
-          <optgroup label="Node Graph">
-            <option value={GRAPH_TYPE}>This clip&apos;s own graph</option>
-            {transitionCompounds.map(c => (
-              <option key={c.id} value={`compound:${c.id}`}>{c.name}</option>
-            ))}
-          </optgroup>
+          {catalog.map(({ group, items }) => (
+            <optgroup key={group} label={group}>
+              {items.map(entry => (
+                <option key={entry.type || '__fade'} value={entry.type}>
+                  {entry.type === GRAPH_TYPE ? "This clip's own graph" : entry.label}
+                </option>
+              ))}
+            </optgroup>
+          ))}
           {isCompoundType(type) && !compoundEntry && (
             <option value={type} disabled>(missing compound)</option>
           )}
         </select>
       </div>
 
+      {/* Duration. A head backed by an overlap takes its length from that
+          overlap (the NLE convention), so the slider is replaced by a readout
+          rather than silently ignored. */}
+      <div className="inspector__field">
+        <label className="inspector__label">Duration</label>
+        {isOverlapDriven ? (
+          <span className="inspector__value inspector__value--mono" title="Set by the overlap with the previous clip — move either clip to change it">
+            {region.dur.toFixed(2)}s (overlap)
+          </span>
+        ) : (
+          <div className="inspector__slider">
+            <input
+              type="range" min={0} max={clipDur} step={0.05} value={lengthValue}
+              onChange={(e) => updateClip(clip.id, { [lengthKey]: parseFloat(e.target.value) })}
+            />
+            <span className="inspector__slider-value">{lengthValue.toFixed(2)}s</span>
+          </div>
+        )}
+      </div>
+
       {!region ? (
         <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
-          {edge === EDGE_TAIL
-            ? (nextOverlap
-                ? `The next clip "${nextOverlap.filename}" overlaps this one — that cut belongs to its Transition In`
-                : 'No region — give Out Length a value (or drag the clip\'s right fade handle)')
-            : 'No region — give In Length a value, or overlap the previous clip for a crossfade'}
+          {edge === EDGE_TAIL && nextOverlap
+            ? `The next clip "${nextOverlap.filename}" overlaps this one — that cut belongs to its Transition In`
+            : 'No window yet — raise Duration above zero (choosing an effect above does it for you)'}
         </div>
       ) : (
         <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '2px 8px 6px' }}>
@@ -1038,9 +1095,29 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
         </div>
       )}
 
+      {/* Why it isn't playing, when it isn't. Empty until the renderer has
+          actually tried this edge and failed. */}
+      <TransitionStatusNote graphKey={graphKey} />
+
       {isCompoundType(type) && !compoundEntry && (
         <div style={{ fontSize: 10, color: 'var(--accent-amber)', padding: '2px 8px 6px' }}>
           This node transition is no longer in the compound library — the clip falls back to its blend mode
+        </div>
+      )}
+
+      {/* A transition is only judgeable while the playhead is inside its window,
+          which at normal zoom is a few pixels of timeline. This is the reliable
+          way to get there. */}
+      {region && (
+        <div style={{ padding: '2px 8px 6px' }}>
+          <button
+            className="inspector__btn"
+            style={{ width: '100%' }}
+            onClick={() => setPlayheadTime(region.start + region.dur * 0.5)}
+            title="Park the playhead half-way through this transition"
+          >
+            Go to Transition
+          </button>
         </div>
       )}
 
@@ -1050,6 +1127,7 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
           <button
             className="inspector__btn"
             style={{ flex: 1 }}
+            disabled={!hasGraph}
             onClick={() => useGraphStore.getState().promoteTransitionGraph(
               clip.id, edge, `${clip.filename || 'Clip'} ${edgeLabel(edge)}`
             )}
