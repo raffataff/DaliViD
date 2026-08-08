@@ -808,7 +808,6 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
 
 ## Backlog / potential improvements
 
-<<<<<<< HEAD
 - **Verify the 3D / Depth family in `npm run dev`** — written with the Cowork sandbox down, so
   `npm run lint` (ESLint + shader smoke test) and `npm run build` have NOT been run. Every static
   check the smoke test performs was audited by hand (structure, `@param`↔uniform 1:1 adjacency for
@@ -1090,10 +1089,22 @@ Ideas surfaced but not yet built (roughly by value-to-effort).
     hover provider, completion docs, or otherwise render markdown in the editor, which makes the
     path reachable; (3) the CSP is relaxed to allow inline script.
 
-- **BLOCKED UPSTREAM: ESLint 10 (`eslint` + `@eslint/js`) cannot be taken yet.** Dependabot has two
-  open PRs for it and they must land **together** — `@eslint/js` 10 declares `eslint` in
-  `peerDependencies`, so merging either alone breaks `npm ci`.
-  - **The blocker is `eslint-plugin-react`.** Latest published is still **7.37.5**, whose
+- **BLOCKED UPSTREAM: ESLint 10 (`eslint` + `@eslint/js`) cannot be taken yet.** Dependabot raised
+  two PRs for it (#18 `@eslint/js` 10.0.1, #19 `eslint` 10.8.0) and they would have had to land
+  **together** — `@eslint/js` 10 declares `eslint` in `peerDependencies`, so merging either alone
+  breaks `npm ci`.
+  - **Both are now CLOSED with `@dependabot ignore this major version` (2026-08-08).** They were
+    left open at first, but that was the wrong call: master kept moving (react-dom 19, plugin-react
+    6), so #19 went conflicted on `package.json`/`package-lock.json` — and its `eslint` line sits
+    *adjacent* to the `@vitejs/plugin-react` line, which is why a lockfile-only conflict became a
+    manifest conflict too. Dependabot then could not self-rebase: the repo's branch protection
+    matches `dependabot/*`, so its retry posted *"because the branch … is protected it was unable
+    to do so."* Result was a permanently-conflicting PR that could never be merged anyway.
+    **Resolving that conflict by hand would have been wasted work** — a green merge button on a
+    change that fails `npm ci` on the very next CI run. Ignoring the major stops the churn without
+    losing the upgrade: Dependabot re-raises it the moment the blocker below clears.
+  - **The blocker is `eslint-plugin-react`.** Latest published is still **7.37.5** (re-verified
+    against the npm registry 2026-08-08; `next` is 7.8.0-rc.0, i.e. older), whose
     `peerDependencies` are `eslint: ^3 || … || ^9.7` — no v10 range, and no v10-compatible release
     exists (tracked at jsx-eslint/eslint-plugin-react#3977). CI runs `npm ci`, which is strict about
     peers, so this fails the build rather than warning. Forcing it with an override is a bad trade:
@@ -1109,7 +1120,16 @@ Ideas surfaced but not yet built (roughly by value-to-effort).
     requires Node `^20.19 || ^22.13 || >=24` — `.github/workflows/ci.yml` pins `node-version: 20`,
     which resolves to a 20.x new enough to pass, but bumping it to 22 first removes the sharp edge.
   - **Expiry condition:** `eslint-plugin-react` publishes a release with `^10` in its peer range.
-    Until then leave both Dependabot PRs open; do not merge, do not override.
+    Dependabot will then raise the PRs again on its own (the ignore is scoped to *this* major, not
+    to the dependency). Do not un-ignore, do not override, do not force it with a `resolutions`
+    entry before then.
+  - **The escape hatch, if ESLint 10 ever becomes urgent:** drop `eslint-plugin-react` entirely.
+    `eslint.config.js` pulls in `react.configs.recommended` + `jsx-runtime` but immediately turns
+    off the two rules that actually fire on this codebase (`react/prop-types`,
+    `react/jsx-no-target-blank`), and `jsx-runtime` only exists to silence `react-in-jsx-scope` —
+    which is moot once the plugin is gone. `react-hooks` (the rules that catch real bugs here) and
+    `react-refresh` both already support v10. That is a real behaviour change to lint coverage, so
+    it belongs in its own commit with a full `npm run lint` diff, not bundled into a version bump.
 
 - **Exported audio is quieter (unconfirmed).** The offline mixdown (`ExportModal.renderTimelineAudio`)
   is unity-gain and no attenuation was found in code. Needs an A/B (exported MP4 audio vs the source
