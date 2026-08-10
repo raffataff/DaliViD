@@ -54,10 +54,21 @@ const useAppStore = create(
     monacoOpen: false,
     monacoNodeId: null,
     scopesOpen: false,
-    // When previewing a node inside a clip graph, route the preview through the
-    // master effect chain (true) or show the node's raw output in isolation
-    // (false). Lets you "tap" a node both with and without master FX applied.
-    previewThroughMaster: false,
+    // How a clip's effect graph is previewed WHILE you are editing it:
+    //   'isolated' — that clip's chain alone, full-screen. Cheapest (one clip
+    //                renders, every other media element is paused), and the only
+    //                mode where a node tap shows the node's RAW output.
+    //   'master'   — isolated, then pushed through the master chain, so a tap
+    //                can be judged with master FX applied.
+    //   'context'  — the real full pipeline: every track, compositing, blend
+    //                modes, opacity, fades, edge transitions, master and bars.
+    //                Exactly how a TRANSITION graph has always previewed. Most
+    //                truthful, most expensive — every active clip graph runs
+    //                every frame, so it is opt-in rather than the default.
+    // A transition graph ignores this entirely: it mixes two sides that only
+    // exist in the composite, so it is always previewed in context.
+    // View state, not project state — deliberately not serialized.
+    clipPreviewMode: 'isolated', // 'isolated' | 'master' | 'context'
     // What "transparent" looks like in the preview. 'black' is the NLE default
     // and the one the present pass gets for free; 'checker' / 'white' cost one
     // extra pass and exist so you can SEE a key or an alpha source instead of
@@ -191,8 +202,7 @@ const useAppStore = create(
     openMonaco: (nodeId) => set({ monacoOpen: true, monacoNodeId: nodeId }),
     closeMonaco: () => set({ monacoOpen: false, monacoNodeId: null }),
     toggleScopes: () => set((state) => ({ scopesOpen: !state.scopesOpen })),
-    togglePreviewThroughMaster: () => set((state) => ({ previewThroughMaster: !state.previewThroughMaster })),
-    setPreviewThroughMaster: (on) => set({ previewThroughMaster: !!on }),
+    setClipPreviewMode: (mode) => set({ clipPreviewMode: mode }),
     setExportModalOpen: (open) => set({ exportModalOpen: open }),
     setNewProjectModalOpen: (open) => set({ newProjectModalOpen: open }),
     setWelcomeShown: () => set({ welcomeShown: true }),

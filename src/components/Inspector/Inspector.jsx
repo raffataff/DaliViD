@@ -816,6 +816,7 @@ function ClipInspector({ clipId }) {
   const clips = useTimelineStore(s => s.clips)
   const updateClip = useTimelineStore(s => s.updateClip)
   const enterClipGraph = useAppStore(s => s.enterClipGraph)
+  const setPlayheadTime = useAppStore(s => s.setPlayheadTime)
   const compoundLibrary = useGraphStore(s => s.compoundLibrary)
   const clip = clips.find(c => c.id === clipId)
   if (!clip) return <div className="inspector__empty">No clip selected</div>
@@ -979,7 +980,25 @@ function ClipInspector({ clipId }) {
         />
       ))}
 
-      <button className="inspector__btn inspector__btn--primary" onClick={() => enterClipGraph(clipId)} style={{ marginTop: 12 }}>Open Effect Graph</button>
+      {/* Park the playhead on the clip, like the timeline's two entry points do.
+          It costs nothing in isolated preview (the clip renders wherever the
+          playhead is) but it is what makes the "In Context" mode land on a
+          frame that actually contains this clip rather than on empty timeline. */}
+      <button
+        className="inspector__btn inspector__btn--primary"
+        onClick={() => {
+          enterClipGraph(clipId)
+          // Read non-reactively: subscribing the Inspector to the playhead
+          // would re-render this whole panel on every frame of playback.
+          const t = useAppStore.getState().playheadTime
+          if (!(t >= clip.timelineStart && t < clip.timelineEnd)) {
+            setPlayheadTime(clip.timelineStart)
+          }
+        }}
+        style={{ marginTop: 12 }}
+      >
+        Open Effect Graph
+      </button>
     </div>
   )
 }

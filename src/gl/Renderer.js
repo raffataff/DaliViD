@@ -1048,18 +1048,33 @@ export class Renderer {
     // Determine graph context
     // Already declared earlier in the function
 
-    // If in isolated clip graph mode, just render that clip's graph.
+    // Editing a clip graph normally renders that clip ALONE, which is cheap and
+    // is the only view where a node tap shows the node's raw output.
     //
-    // A TRANSITION graph is the exception: it is meaningless in isolation (it
-    // mixes two sides that only exist in the composite), so editing one keeps
-    // the FULL pipeline on screen. Scrub the region and you watch the actual
-    // transition you're building, in context, with the real neighbouring clip.
+    // Two things override that and keep the FULL pipeline on screen:
+    //   - a TRANSITION graph, always. It mixes two sides that only exist in the
+    //     composite, so isolation is meaningless — scrub the region and you
+    //     watch the actual transition against the real neighbouring clip.
+    //   - `clipPreviewMode === 'context'`, the user asking for the same thing
+    //     for an ordinary clip graph: judge the effect against the tracks under
+    //     it, its blend mode, its fades and the master chain, not in a vacuum.
+    //     Costs the whole pipeline every frame, hence opt-in.
     const editingTransition = graphLevel === 'clip' && isTransitionGraphKey(graphClipId)
-    if (graphLevel === 'clip' && graphClipId && !editingTransition) {
+    const editingClipGraph = graphLevel === 'clip' && !!graphClipId && !editingTransition
+    const inContext = editingClipGraph && appState.clipPreviewMode === 'context'
+
+    // The clip whose graph is being edited in context. Its track is exempted
+    // from mute/solo below, because a mode whose entire purpose is "show me
+    // this clip in its surroundings" is useless if the surroundings hide it.
+    // Gated on `previewTapEnabled` — the renderer's standing "this frame is for
+    // the eye, not for output" flag — so an export can never bake it in.
+    const focusClipId = (inContext && this.previewTapEnabled) ? graphClipId : null
+
+    if (editingClipGraph && !inContext) {
       this._renderClipGraphIsolated(graphClipId, clips, graphState, standardState)
     } else {
       // Full compositing pipeline
-      this._renderFullPipeline(tracks, clips, graphState, standardState, playheadTime)
+      this._renderFullPipeline(tracks, clips, graphState, standardState, playheadTime, focusClipId)
     }
 
     // High-performance direct DOM updates for modulated parameters to bypass React re-renders
@@ -1625,13 +1640,24 @@ export class Renderer {
 
   /**
    * Render the full multi-track compositing pipeline.
+   *
+   * @param {string|null} focusClipId — the clip whose graph is being edited in
+   *   "in context" preview mode, or null. Its track is exempted from mute and
+   *   solo: you opened this clip's graph and asked to see it in place, so a
+   *   muted track (or another track being soloed) must not silently hide the
+   *   very thing you're authoring. Scoped to preview only — `_renderFrame`
+   *   passes null whenever the frame is bound for an export.
    */
-  _renderFullPipeline(tracks, clips, graphState, standardState, playheadTime) {
+  _renderFullPipeline(tracks, clips, graphState, standardState, playheadTime, focusClipId = null) {
     const gl = this.gl
+
+    const focusTrackId = focusClipId
+      ? (clips.find(c => c.id === focusClipId)?.trackId ?? null)
+      : null
 
     // Get sorted video tracks (by zOrder, bottom to top)
     const videoTracks = tracks
-      .filter(t => t.type === 'video' && !t.muted)
+      .filter(t => t.type === 'video' && (!t.muted || t.id === focusTrackId))
       .sort((a, b) => (a.zOrder || 0) - (b.zOrder || 0))
 
     const audioTracks = tracks
@@ -1668,7 +1694,7 @@ export class Renderer {
     let hasContent = false
 
     for (const track of videoTracks) {
-      if (soloTrack && track.id !== soloTrack.id) continue
+      if (soloTrack && track.id !== soloTrack.id && track.id !== focusTrackId) continue
 
       // Every clip active on this track at the playhead, earliest first. When clips
       // overlap in time on one track, each later-starting clip composites over the
@@ -1816,9 +1842,15 @@ export class Renderer {
     // tracks, bottom-to-top by audio-track zOrder, using each clip's blend mode +
     // opacity (+ fades). Only clips with real effect nodes contribute, so plain
     // audio clips stay invisible.
-    const audioVisTracks = [...audioTracks].sort((a, b) => (a.zOrder || 0) - (b.zOrder || 0))
+    // Built from `tracks` rather than reusing `audioTracks`, so the focus track
+    // exemption can apply to the PICTURE without also un-muting the SOUND: a
+    // muted audio track whose clip graph you're editing in context should still
+    // show its visuals, and still be silent.
+    const audioVisTracks = tracks
+      .filter(t => t.type === 'audio' && (!t.muted || t.id === focusTrackId))
+      .sort((a, b) => (a.zOrder || 0) - (b.zOrder || 0))
     for (const track of audioVisTracks) {
-      if (soloTrack && track.id !== soloTrack.id) continue
+      if (soloTrack && track.id !== soloTrack.id && track.id !== focusTrackId) continue
       for (const clip of getActiveClips(clips, track.id, playheadTime)) {
         if (clip.fileType !== 'audio' || !clip.fileUrl) continue
         const visFBOId = this._renderAudioClipVisualToFBO(clip, graphState, standardState, playheadTime)
@@ -2432,7 +2464,7 @@ export class Renderer {
       // pass it through the master effect chain to screen — so a node can be
       // previewed *with* master FX applied, not only in raw isolation.
       const masterGraph = graphState.masterGraph
-      const throughMaster = this.previewTapEnabled && appState.previewThroughMaster &&
+      const throughMaster = this.previewTapEnabled && appState.clipPreviewMode === 'master' &&
         masterGraph && masterGraph.nodes.some(n => !NON_EFFECT_TYPES.includes(n.type))
 
       // Keyframes animate in the isolated view too, so authoring is WYSIWYG.

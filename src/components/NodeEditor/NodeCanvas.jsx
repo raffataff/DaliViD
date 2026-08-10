@@ -22,6 +22,26 @@ import { parseTransitionGraphKey, edgeLabel } from '../../utils/clipTransitions'
 import TransitionGraphBar from './TransitionGraphBar'
 import './NodeCanvas.css'
 
+// The three ways a clip's effect graph can be previewed while you edit it.
+// Ordered cheapest → most truthful, which is also least → most context.
+const CLIP_PREVIEW_MODES = [
+  {
+    id: 'isolated',
+    label: 'Clip',
+    tooltip: 'Preview this clip alone, full-screen. Cheapest, and the only mode where 👁 shows a node\'s raw output.',
+  },
+  {
+    id: 'master',
+    label: '+ Master',
+    tooltip: 'Preview this clip alone, then through the Master FX chain.',
+  },
+  {
+    id: 'context',
+    label: 'In Context',
+    tooltip: 'Preview the real timeline: tracks below, blend mode, opacity, fades, transitions, Master FX and bars. Truthful but slower — the whole pipeline runs every frame.',
+  },
+]
+
 const EXCLUDED_FROM_MARQUEE = new Set([
   'OUTPUT', 'CLIP_OUTPUT', 'EFFECT_OUTPUT',
   'CLIP_SOURCE', 'VIDEO_INPUT', 'CAMERA_INPUT', 'SCREEN_INPUT',
@@ -110,8 +130,8 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   const exitClipGraph = useAppStore(s => s.exitClipGraph)
   const openMonaco = useAppStore(s => s.openMonaco)
   const enterCompound = useAppStore(s => s.enterCompound)
-  const previewThroughMaster = useAppStore(s => s.previewThroughMaster)
-  const togglePreviewThroughMaster = useAppStore(s => s.togglePreviewThroughMaster)
+  const clipPreviewMode = useAppStore(s => s.clipPreviewMode)
+  const setClipPreviewMode = useAppStore(s => s.setClipPreviewMode)
 
   const masterGraph = useGraphStore(s => s.masterGraph)
   const clipGraphs = useGraphStore(s => s.clipGraphs)
@@ -145,6 +165,29 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     }
     return `Effect Graph: ${graph.nodes.find(n => n.type === 'CLIP_SOURCE')?.name || 'Clip'}`
   }, [graphLevel, graphClipId, graph])
+
+  /**
+   * Switch how the clip graph is previewed.
+   *
+   * Switching INTO 'context' also parks the playhead inside the edited clip
+   * when it is sitting outside it. In isolation the clip renders wherever the
+   * playhead is, so you never notice having drifted off it; the full pipeline
+   * only shows clips that are actually active, so the same drift would present
+   * as "I turned the mode on and the picture vanished". Entering a transition
+   * graph already parks for exactly this reason. Only on the transition INTO
+   * the mode — once you're in it, scrubbing away to see a neighbouring clip is
+   * a legitimate thing to want.
+   */
+  const handleSetPreviewMode = useCallback((mode) => {
+    setClipPreviewMode(mode)
+    if (mode !== 'context' || graphLevel !== 'clip' || !graphClipId) return
+    const { clips } = useTimelineStore.getState()
+    const clip = clips.find(c => c.id === graphClipId)
+    if (!clip) return // a transition key, or a clip that's gone — nothing to park on
+    const { playheadTime, setPlayheadTime } = useAppStore.getState()
+    if (playheadTime >= clip.timelineStart && playheadTime < clip.timelineEnd) return
+    setPlayheadTime(clip.timelineStart)
+  }, [setClipPreviewMode, graphLevel, graphClipId])
 
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
@@ -1213,20 +1256,23 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
           </button>
         )}
         <div style={{ flex: 1 }} />
-        {/* A transition graph is previewed in the FULL pipeline (it mixes two
-            sides that only exist there), so the isolated/through-master choice
-            doesn't apply. Its own controls live in the strip below the header,
-            which needs two rows. */}
+        {/* A transition graph is ALWAYS previewed in the full pipeline (it mixes
+            two sides that only exist there), so the mode choice doesn't apply.
+            Its own controls live in the strip below the header. */}
         {!isTransitionGraph && graphLevel === 'clip' && (
-          <button
-            className={`node-canvas__masterfx-toggle ${previewThroughMaster ? 'node-canvas__masterfx-toggle--on' : ''}`}
-            onClick={togglePreviewThroughMaster}
-            data-tooltip={previewThroughMaster
-              ? 'Preview is routed through the Master FX chain — click to show the raw, isolated clip'
-              : 'Preview shows the clip in isolation — click to apply the Master FX chain'}
-          >
-            Master FX: {previewThroughMaster ? 'On' : 'Off'}
-          </button>
+          <div className="node-canvas__preview-mode" role="group" aria-label="Clip preview mode">
+            {CLIP_PREVIEW_MODES.map(({ id, label, tooltip }) => (
+              <button
+                key={id}
+                className={`node-canvas__preview-mode-btn ${clipPreviewMode === id ? 'node-canvas__preview-mode-btn--on' : ''}`}
+                onClick={() => handleSetPreviewMode(id)}
+                aria-pressed={clipPreviewMode === id}
+                data-tooltip={tooltip}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         )}
         {previewTapId && (
           <button
