@@ -20,6 +20,9 @@
  *   3. @param integrity — re-runs the real `parseParams()`, flags `@param`
  *      directives that don't resolve to a uniform (a silently-dropped slider),
  *      and validates each control's ranges / defaults / options.
+ *   4. Opaque-alpha writes — an effect that writes a hard-coded `1.0` alpha
+ *      throws the source's matte away. See `opaqueAlphaWrites` for why that is
+ *      worth failing a build over.
  *
  * Run:  node scripts/smoke-shaders.mjs        (also chained into `npm run lint`)
  * Exits non-zero if any shader fails, so it slots straight into CI.
@@ -118,6 +121,106 @@ function validateParam(cfg) {
   return errs
 }
 
+// ── opaque-alpha check ───────────────────────────────────────────────────────
+
+/**
+ * Node types that are opaque BY DESIGN, so a hard-coded 1.0 alpha is correct.
+ * Keep this list short and justified — every entry is a shader that can never
+ * be used over a lower track without filling the frame.
+ */
+const OPAQUE_BY_DESIGN = new Set([
+  'DEPTH',       // greyscale depth map — a data buffer sampled by consumers, not a picture
+  'NORMALS_3D',  // normal / curvature / slope map, same
+  'IMAGE_INPUT', // the Background fit mode deliberately fills the frame with a solid colour
+])
+
+/** The fragment output's name, e.g. `fragColor` from `out vec4 fragColor;`. */
+function fragOutName(code) {
+  const m = /\bout\s+vec4\s+(\w+)\s*;/.exec(code)
+  return m ? m[1] : null
+}
+
+/**
+ * Split a comma-separated argument list at DEPTH ZERO, so
+ * `vec4(mix(a, b, t), x)` yields two arguments rather than four.
+ */
+function splitArgs(s) {
+  const out = []
+  let depth = 0
+  let start = 0
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (ch === '(' || ch === '[') depth++
+    else if (ch === ')' || ch === ']') depth--
+    else if (ch === ',' && depth === 0) { out.push(s.slice(start, i)); start = i + 1 }
+  }
+  out.push(s.slice(start))
+  return out.map(a => a.trim()).filter(a => a.length)
+}
+
+/** A GLSL literal equal to one: 1, 1., 1.0, 1.00 … */
+const ONE_LITERAL = /^(?:1|1\.|1\.0+)$/
+
+/**
+ * Flag `fragColor = … vec4(…, 1.0)` — an effect writing a hard-coded opaque
+ * alpha, which throws the source's matte away.
+ *
+ * Worth failing a build over because it is INVISIBLE on opaque footage, so it
+ * ships, and on footage with a matte it does two bad things at once: the
+ * transparent region stops being transparent, AND whatever the shader computed
+ * from the matte's *undefined* colour becomes visible. For alpha video that
+ * colour is whatever the codec left in the plane — stepped at macroblock
+ * boundaries — so a derivative or thresholding effect renders it as a blocky
+ * fringe hugging the silhouette, which reads as a rendering bug rather than as
+ * a missing line of shader code. Effects must carry the source alpha through.
+ *
+ * Deliberately narrow, so it can't cry wolf: only the LAST argument of a vec4,
+ * only when that argument is a bare literal, and only inside a statement that
+ * assigns to the fragment output. `vec4(0.0)`, `vec4(rgb, someAlpha)` and the
+ * many vec4s used for maths elsewhere in a shader are all untouched.
+ *
+ * NOT run on transitions: a transition legitimately introduces opaque solids
+ * (DIP_COLOR's dip colour, FILM_ROLL's frame bar), and its output space is the
+ * compositor's, not a clip's matte.
+ */
+function opaqueAlphaWrites(code) {
+  const name = fragOutName(code)
+  if (!name) return []
+
+  const hits = []
+  const assign = new RegExp(`\\b${name}\\s*=`, 'g')
+  let m
+  while ((m = assign.exec(code)) !== null) {
+    // The statement runs to the next `;` at paren depth zero.
+    let depth = 0
+    let end = code.length
+    for (let i = assign.lastIndex; i < code.length; i++) {
+      const ch = code[i]
+      if (ch === '(') depth++
+      else if (ch === ')') depth--
+      else if (ch === ';' && depth === 0) { end = i; break }
+    }
+    const rhs = code.slice(assign.lastIndex, end)
+
+    const ctor = /\bvec4\s*\(/g
+    let c
+    while ((c = ctor.exec(rhs)) !== null) {
+      let d = 1
+      let i = ctor.lastIndex
+      for (; i < rhs.length && d > 0; i++) {
+        if (rhs[i] === '(') d++
+        else if (rhs[i] === ')') d--
+      }
+      if (d !== 0) break // unbalanced — the delimiter check already reports it
+      const args = splitArgs(rhs.slice(ctor.lastIndex, i - 1))
+      if (args.length >= 2 && ONE_LITERAL.test(args[args.length - 1])) {
+        hits.push(`vec4(${args.join(', ')})`)
+      }
+    }
+  }
+  return hits
+}
+
 // ── per-shader validation ─────────────────────────────────────────────────────
 
 function validateShader(type) {
@@ -150,6 +253,17 @@ function validateShader(type) {
     errors.push(`${directiveCount} @param directive(s) but ${configs.length} resolved — an @param is not followed by a uniform`)
   }
   for (const cfg of configs) errors.push(...validateParam(cfg))
+
+  // 4. Opaque-alpha writes — an effect must not destroy the source's matte.
+  if (!OPAQUE_BY_DESIGN.has(type)) {
+    for (const hit of opaqueAlphaWrites(stripped)) {
+      errors.push(
+        `writes a hard-coded opaque alpha: ${hit} — carry the source alpha through ` +
+        `(e.g. texture(u_texture, v_uv).a). If this shader really is an opaque data ` +
+        `map, add "${type}" to OPAQUE_BY_DESIGN in scripts/smoke-shaders.mjs.`
+      )
+    }
+  }
 
   return errors
 }
