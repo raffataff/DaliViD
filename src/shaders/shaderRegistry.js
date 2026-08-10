@@ -77,25 +77,41 @@ uniform float u_strength;
 uniform bool u_show_original;
 out vec4 fragColor;
 
+// One Sobel tap, weighted by its OWN alpha. Straight RGB inside a matte is
+// undefined — for alpha video it is whatever the codec left in the colour
+// plane, which is stepped at macroblock boundaries and smeared a few pixels
+// into the matte by 4:2:0 chroma subsampling. A derivative operator turns those
+// steps into hard edges, which is where the blocky fringe around transparent
+// content came from. Premultiplying makes the matte a flat zero, so the only
+// edge left along a silhouette is the silhouette itself — which is the edge you
+// actually wanted. One fetch per tap, exactly as before.
+float edTap(vec2 uv) {
+  vec4 s = texture(u_texture, uv);
+  return length(s.rgb * s.a);
+}
+
 void main() {
   vec2 px = 1.0 / u_resolution;
-  float tl = length(texture(u_texture, v_uv + vec2(-px.x, px.y)).rgb);
-  float t  = length(texture(u_texture, v_uv + vec2(0.0, px.y)).rgb);
-  float tr = length(texture(u_texture, v_uv + vec2(px.x, px.y)).rgb);
-  float l  = length(texture(u_texture, v_uv + vec2(-px.x, 0.0)).rgb);
-  float r  = length(texture(u_texture, v_uv + vec2(px.x, 0.0)).rgb);
-  float bl = length(texture(u_texture, v_uv + vec2(-px.x, -px.y)).rgb);
-  float b  = length(texture(u_texture, v_uv + vec2(0.0, -px.y)).rgb);
-  float br = length(texture(u_texture, v_uv + vec2(px.x, -px.y)).rgb);
+  float tl = edTap(v_uv + vec2(-px.x, px.y));
+  float t  = edTap(v_uv + vec2(0.0, px.y));
+  float tr = edTap(v_uv + vec2(px.x, px.y));
+  float l  = edTap(v_uv + vec2(-px.x, 0.0));
+  float r  = edTap(v_uv + vec2(px.x, 0.0));
+  float bl = edTap(v_uv + vec2(-px.x, -px.y));
+  float b  = edTap(v_uv + vec2(0.0, -px.y));
+  float br = edTap(v_uv + vec2(px.x, -px.y));
   float gx = -tl - 2.0*l - bl + tr + 2.0*r + br;
   float gy = -tl - 2.0*t - tr + bl + 2.0*b + br;
   // Audio driver (0 until wired): treble sharpens the edges.
   float edge = sqrt(gx*gx + gy*gy) * (u_strength + u_treble * 2.0);
   edge = step(u_threshold, edge);
   vec4 original = texture(u_texture, v_uv);
+  // Alpha is PASSED THROUGH, never forced to 1.0. Forcing it opaque destroyed
+  // the source's matte, and that is what made anything computed in the matte
+  // visible at all — with the matte intact the compositor multiplies it away.
   fragColor = u_show_original
     ? vec4(mix(original.rgb, vec3(edge), 0.5), original.a)
-    : vec4(vec3(edge), 1.0);
+    : vec4(vec3(edge), original.a);
 }
 `)
 
@@ -173,10 +189,18 @@ void main() {
   float rnd2 = random(vec2(floor(u_time * u_speed * 2.0), 0.0));
   if (rnd2 < gIntensity * 0.3 + u_treble * 0.15) {
     float rgbOffset = u_intensity * 0.01;
-    float r = texture(u_texture, vec2(uv.x + rgbOffset, uv.y)).r;
-    float g = texture(u_texture, uv).g;
-    float b = texture(u_texture, vec2(uv.x - rgbOffset, uv.y)).b;
-    fragColor = vec4(r, g, b, 1.0);
+    vec4 sr = texture(u_texture, vec2(uv.x + rgbOffset, uv.y));
+    vec4 sg = texture(u_texture, uv);
+    vec4 sb = texture(u_texture, vec2(uv.x - rgbOffset, uv.y));
+    // Split the channels in PREMULTIPLIED space, then divide back out to the
+    // pipeline's straight convention. A tap that landed in the matte has no
+    // defined colour, so it must contribute nothing rather than whatever the
+    // codec left there. Alpha is the union of the three taps — a channel split
+    // genuinely widens the silhouette by the offset — and is never forced to
+    // 1.0, which used to destroy the matte outright.
+    float ga = max(sr.a, max(sg.a, sb.a));
+    vec3 split = vec3(sr.r * sr.a, sg.g * sg.a, sb.b * sb.a);
+    fragColor = ga > 0.0001 ? vec4(split / ga, ga) : vec4(0.0);
   } else {
     fragColor = texture(u_texture, uv);
   }
@@ -236,10 +260,14 @@ void main() {
       if (y < -rad || y > rad) continue;
       vec2 off = vec2(float(x), float(y)) * px * 2.0;
       vec4 s = texture(u_texture, v_uv + off);
-      float lum = dot(s.rgb, vec3(0.299, 0.587, 0.114));
+      // Premultiplied: a tap inside the matte has no defined colour, so it must
+      // not contribute glow. Without this a transparent region's codec garbage
+      // reads as "bright" and blooms into the silhouette.
+      vec3 srgb = s.rgb * s.a;
+      float lum = dot(srgb, vec3(0.299, 0.587, 0.114));
       float bright = max(0.0, lum - u_threshold);
       float weight = exp(-float(x*x + y*y) / (r * r * 0.5));
-      bloom += s.rgb * bright * weight;
+      bloom += srgb * bright * weight;
       total += weight;
     }
   }
@@ -444,12 +472,18 @@ void main() {
   vec2 cellCenter = (cell + 0.5) * u_dot_size;
   vec2 origCenter = vec2(c * cellCenter.x + s * cellCenter.y, -s * cellCenter.x + c * cellCenter.y);
   vec4 col = texture(u_texture, origCenter / u_resolution);
-  float lum = dot(col.rgb, vec3(0.299, 0.587, 0.114));
+  // Luma is read PREMULTIPLIED. A cell centre that landed in the matte has no
+  // defined colour, and reading it straight sized the dot from codec garbage —
+  // which is how a halftone grid appeared inside transparent regions.
+  float lum = dot(col.rgb * col.a, vec3(0.299, 0.587, 0.114));
   float dist = distance(rotUV, cellCenter);
   // Audio driver (0 until wired): bass fattens the dots.
   float radius = lum * u_dot_size * 0.5 * (1.0 + u_bass * 0.8);
   float dot = smoothstep(radius, radius - 1.0, dist);
-  fragColor = vec4(vec3(dot), 1.0);
+  // Alpha comes from THIS pixel, not from the cell centre, so the matte keeps
+  // its own shape instead of being quantised to the dot grid — and is never
+  // forced to 1.0, which destroyed it entirely.
+  fragColor = vec4(vec3(dot), texture(u_texture, v_uv).a);
 }
 `)
 
@@ -608,11 +642,19 @@ void main() {
     for (int y = -MAX_RAD; y <= MAX_RAD; y++) {
       if (y < -rad || y > rad) continue;
       float w = exp(-(float(x*x + y*y)) / max(r * r * 0.5, 0.001));
-      color += texture(u_texture, v_uv + vec2(float(x), float(y)) * px) * w;
+      // Accumulate PREMULTIPLIED. Averaging straight RGBA weights a fully
+      // transparent texel's colour exactly as heavily as an opaque one's, and
+      // that colour is undefined (codec garbage in an alpha video's matte), so
+      // a blur crossing a silhouette drags it inward as a coloured halo.
+      // Premultiplied, a transparent tap contributes nothing but its coverage.
+      vec4 s = texture(u_texture, v_uv + vec2(float(x), float(y)) * px);
+      color += vec4(s.rgb * s.a, s.a) * w;
       totalSpace += w;
     }
   }
-  fragColor = color / max(totalSpace, 1.0);
+  color /= max(totalSpace, 1.0);
+  // Back to straight — the pipeline's convention everywhere outside a gather.
+  fragColor = color.a > 0.0001 ? vec4(color.rgb / color.a, color.a) : vec4(0.0);
 }
 `)
 
@@ -724,10 +766,14 @@ void main() {
   vec2 px = 1.0 / u_resolution;
   vec4 c00 = texture(u_texture, v_uv + vec2(-px.x, -px.y));
   vec4 c22 = texture(u_texture, v_uv + vec2(px.x, px.y));
-  vec3 diff = c00.rgb - c22.rgb;
+  // Premultiplied difference: a tap in the matte has no defined colour, and a
+  // difference operator turns the codec's macroblock steps there into relief.
+  vec3 diff = c00.rgb * c00.a - c22.rgb * c22.a;
   // Audio driver (0 until wired): treble deepens the relief.
   float lum = dot(diff, vec3(0.299, 0.587, 0.114)) * (u_intensity + u_treble * 2.0);
-  fragColor = vec4(vec3(0.5 + lum), 1.0);
+  // Pass the source alpha through rather than forcing opaque — the flat grey
+  // this shader emits would otherwise fill the whole matte.
+  fragColor = vec4(vec3(0.5 + lum), texture(u_texture, v_uv).a);
 }
 `)
 
@@ -1730,7 +1776,11 @@ void main() {
   // Beat flash overlay
   finalCol += vec3(flash * 0.1) * hsv2rgb(vec3(u_color_hue, 0.3, 1.0));
 
-  fragColor = vec4(finalCol, 1.0);
+  // Coverage is the union of what came in and what this node drew over it: the
+  // visualiser's own graphics are opaque where alpha is high, but where it drew
+  // nothing the incoming frame's matte must survive. Forcing 1.0 here made a
+  // transparent source opaque and filled its matte with the dimmed backdrop.
+  fragColor = vec4(finalCol, clamp(max(bg.a, alpha), 0.0, 1.0));
 }
 `)
 
@@ -1816,7 +1866,10 @@ void main() {
   if (u_color_mode == 0) {
     fragColor = texture(u_texture, closestCell) * edge;
   } else {
-    fragColor = vec4(vec3(minDist * edge), 1.0);
+    // Alpha follows the source, scaled by edge exactly like mode 0 above,
+    // instead of being forced opaque — otherwise the cell pattern fills the
+    // matte of a transparent source.
+    fragColor = vec4(vec3(minDist * edge), texture(u_texture, v_uv).a * edge);
   }
 }
 `)
@@ -1918,19 +1971,25 @@ void main() {
   //
   // The params are untouched on purpose, so existing projects keep their values
   // and simply get faster.
+  // Gathered PREMULTIPLIED and divided back out at the end — see BLUR. A
+  // gather that crosses a silhouette otherwise pulls the matte's undefined
+  // colour into the blurred edge, since straight RGB weights a transparent tap
+  // as heavily as an opaque one.
   const int N = 24;
   float rot = d3_ign(gl_FragCoord.xy) * D3_TAU;
-  vec4 sum = center;
+  vec4 sum = vec4(center.rgb * center.a, center.a);
   float wsum = 1.0;
   for (int i = 0; i < N; i++) {
     vec2 s = d3_vogel(i, N, rot);
     // Gaussian falloff across the disc, so this stays the soft blur it always
     // was rather than becoming a hard-edged bokeh disc (that is BOKEH_3D's job).
     float w = exp(-dot(s, s) * 2.0);
-    sum += texture(u_texture, v_uv + s * blur * px) * w;
+    vec4 t = texture(u_texture, v_uv + s * blur * px);
+    sum += vec4(t.rgb * t.a, t.a) * w;
     wsum += w;
   }
-  fragColor = sum / wsum;
+  sum /= wsum;
+  fragColor = sum.a > 0.0001 ? vec4(sum.rgb / sum.a, sum.a) : vec4(0.0);
 }
 `)
 

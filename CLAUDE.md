@@ -379,6 +379,85 @@ then failed the build from inside rolldown with `'node:util' does not provide an
 
 ## Recently completed
 
+- **The same blocky fringe from an EFFECT NODE was a different bug with the same shape
+  (2026-08-10).** Reported right after the transition fix: drop an Edge Detection or Halftone into
+  a clip graph and the blocks return; bypass the node and they go. Nothing to do with alpha space —
+  **those shaders wrote `fragColor = vec4(…, 1.0)`, throwing the source's matte away.**
+  - **Two faults conspiring, and the order matters.** The alpha discard is the *necessary*
+    condition: with `a = 1` the matte is no longer a matte, so anything computed inside it becomes
+    visible — with alpha intact `_compositeTrack` multiplies it by zero and it never shows (which is
+    exactly why bypassing the node "fixed" it). The garbage supplies the *pattern*: straight RGB
+    inside a matte is undefined, and for alpha video it is codec plane data, stepped at macroblock
+    boundaries with 4:2:0 chroma smearing real colour a few pixels in. A Sobel fires hard on those
+    steps; Halftone sized dots from them. Hence blocks, hugging the silhouette.
+  - **Fixed to pass the source alpha through:** `EDGE_DETECTION`, `HALFTONE`, `EMBOSS`, `GLITCH`
+    (its RGB-split branch), `VORONOI` (colour mode 1), `AUDIO_VISUALIZER` (now
+    `max(bg.a, alpha)` — the union of what came in and what it drew, not a blanket 1.0).
+  - **Taps are now alpha-weighted too**, which is the half that keeps garbage out of the *maths*
+    rather than just out of the picture: `EDGE_DETECTION` (new `edTap`, still one fetch per tap),
+    `EMBOSS`, `HALFTONE`'s cell-centre luma, `BLOOM`'s gather, and — properly premultiplied,
+    averaged, then divided back out — `BLUR` and `DEPTH_BLUR`. A transparent tap now contributes
+    nothing but its (zero) coverage instead of being weighted as heavily as an opaque one.
+  - **`scripts/smoke-shaders.mjs` gained check 4 so this can't return.** `opaqueAlphaWrites` fails
+    any registry shader whose fragment-output statement contains a `vec4(…, 1.0)` with a literal
+    final argument. Deliberately narrow — last argument only, literal only, inside a fragColor
+    assignment only — so `vec4(0.0)`, `vec4(rgb, someAlpha)` and vec4 maths elsewhere are untouched.
+    `OPAQUE_BY_DESIGN` allowlists the three that are genuinely opaque: `DEPTH` and `NORMALS_3D`
+    (data maps consumers sample, not pictures) and `IMAGE_INPUT` (its Background fit mode). Not run
+    on transitions — those legitimately introduce opaque solids (`DIP_COLOR`, `FILM_ROLL`'s bar).
+  - **Why a build failure and not a lint warning:** this class of bug is invisible on opaque
+    footage, so it ships, and when it does surface it reads as a renderer fault rather than as a
+    missing line of shader code. The failure message names the fix and names the allowlist.
+
+- **The blocky fringe around transparent content during a transition was an ALPHA-SPACE bug
+  (2026-08-10).** Blocks appeared right where alpha met drawn pixels, only while a transition
+  region was live. Nothing was wrong with any transition shader — the compositor was feeding them
+  two textures in two different conventions.
+  - **The mismatch was structural and always there.** `applyBlendMode` emits PREMULTIPLIED (that is
+    what the accumulator holds), while a clip's own result is STRAIGHT (the pipeline's convention
+    end to end). A transition mixes those two directly: `mix(texture(u_from, uv), texture(u_to, uv), p)`.
+  - **Why it reads as *blocks*, specifically.** Interpolating RGBA is only valid premultiplied. On
+    straight colour a fully transparent pixel's RGB is weighted exactly as heavily as an opaque
+    one's — and in a transparent region straight RGB is *undefined*: for alpha video it is whatever
+    the codec left in the colour plane (macroblock-shaped garbage), which 4:2:0 chroma subsampling
+    then smears a few pixels INTO the matte. So the mix drags that garbage in wherever the two
+    sides' alphas disagree (i.e. along every alpha edge), and `PRESENT_FS`'s `rgb / a` **amplifies**
+    it, because the alpha it divides by there is small. Hence bright blocks, hence only on edges,
+    hence only during a transition — the plain path (`_compositeTrack`) multiplies the straight
+    blend by its own alpha, so garbage at a = 0 is annihilated.
+  - **Fix: reconcile the two sides before the pass, in `Renderer._compositeEdgeTransition`.** Which
+    side is which follows from the **edge alone** (head mixes accumulator → clip, tail mixes clip →
+    accumulator), so nothing new had to be plumbed down. The two consumers want *opposite* spaces,
+    so each converts only the one side that is wrong for it — one full-screen pass, and only on the
+    frames a region is live:
+    - built-in shader → both **premultiplied** (`PREMULTIPLY_FS`). Its result is written straight
+      into the accumulator so it must *be* premultiplied, and `TRANSITION_FOOTER`'s lerp toward
+      `u_backdrop` then interpolates two premultiplied values, which is valid. **Provably right at
+      the ends:** at p = 1 a head now produces byte-identical output to a plain `_compositeTrack`
+      cut, which it did not before.
+    - node graph → both **straight** (the existing `UNPREMULTIPLY_FS`). Its interior is ordinary
+      effect shaders and its result is handed to `_compositeTrack` as the *blend* (straight) side.
+    - `_convertAlphaSpace(program, src, dst)` is the shared one-pass helper; `TR_PREMUL_FBO` /
+      `TR_STRAIGHT_FBO` are its two canvas-sized scratch targets (so `resizeAll` keeps them right).
+      Only the clip side is ever converted for the built-in path, so `u_backdrop` still points at
+      the real premultiplied accumulator.
+  - **Two transitions constructed colour in straight space and had to move with it.** `SLIDE`'s
+    seam composite was `vec4(mix(bot.rgb, top.rgb, top.a), max(bot.a, top.a))` → now premultiplied
+    source-over, `top + bot * (1.0 - top.a)`. `SLICE_SHIFT`'s translucent gap was `vec4(rgb, a)` →
+    `vec4(rgb * a, a)`; left alone it would have been over-bright by 1/a once the present pass
+    divided the alpha back out. Everything else was already safe: `vec4(colour, 1.0)` solids agree
+    in both conventions, and the emissive glow pattern (`c.rgb += glow` then `c.a = max(c.a, glow)`)
+    is already premultiplied by its own coverage.
+  - **`TRANSITION_HEADER` now states the contract** ("all three samplers are premultiplied") with
+    the four rules for writing a new entry. Note it sits ABOVE the `float t_hash(` marker that
+    `TRANSITION_HELPERS` slices on, so the `TRANSITION_FX` node path is untouched by it.
+  - **Known divergence, documented at `transitionNodeHeader`:** a `TRANSITION_FX` *node* gets
+    ordinary graph FBOs, i.e. straight alpha, so the shared bodies now run in two spaces. Identical
+    on opaque content (which is what a node mid-graph realistically sees); a transparent
+    `TRANSITION_FX` will still show the old fringe. Premultiplying at sample time can't be done
+    from the prelude — the bodies call `texture()` directly and GLSL ES forbids overloading it — so
+    a real fix means a conversion pass in the DAG executor. Deferred.
+
 - **Clip graphs can preview in the full pipeline ("In Context"), like transition graphs always have.**
   `useAppStore.previewThroughMaster` (boolean) became **`clipPreviewMode`** — `'isolated'` |
   `'master'` | `'context'` — driving a 3-segment control in the Node Editor header
@@ -1025,6 +1104,64 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
     guaranteed user-gesture path. One blob URL per file, not per clip (splits share sources).
 
 ## Backlog / potential improvements
+
+- **Verify the effect-node alpha fix in `npm run dev`** — sandbox still down, nothing run. Order:
+  1. **`npm run smoke:shaders` FIRST, and expect it to pass with zero failures.** Check 4 is brand
+     new and has never executed; it was hand-verified against the tree (the only literal-1.0 alpha
+     writes left are the three `OPAQUE_BY_DESIGN` entries), but a parser bug in `opaqueAlphaWrites`
+     would show up as false positives on unrelated shaders. If it cries wolf, the suspect is
+     `splitArgs`' depth tracking, not the shaders.
+  2. **The headline case.** Alpha video (or a `SHAPE`/`TEXT` generator) on track 2 over something
+     on track 1, with Edge Detection in its clip graph. No blocks in the matte; the outline should
+     now trace the silhouette itself, which is the edge you wanted. Repeat with Halftone, Emboss,
+     Glitch, Voronoi (colour mode 1) and Audio Visualizer.
+  3. **Nothing regressed on opaque footage.** All six should look identical to before on a normal
+     clip — every change is a no-op at `a = 1`. Edge Detection with **Show Original** on was already
+     correct, so it must be unchanged in both cases.
+  4. **The blurs are the riskiest edit** because they now premultiply / divide back out. `BLUR` at
+     radius 0 and 16, and `DEPTH_BLUR` at Max Blur 18, on opaque footage: identical to before. On
+     transparent footage the blurred edge must stay the source's colour rather than picking up a
+     dark or coloured halo. Watch for any dark ring at the silhouette — that would mean the
+     un-premultiply guard (`a > 0.0001`) is biting too early.
+  5. **`AUDIO_VISUALIZER` over an opaque clip must still fill the frame** — `max(bg.a, alpha)` is
+     1.0 there. Over nothing (audio-only, no video under it) its graphics should now carry their own
+     coverage instead of a black card.
+  6. **Round trip.** These are shader-source edits, so any node whose shader was customised in
+     Monaco keeps the OLD source (`getNodeSource` prefers the custom edit) and will still show the
+     blocks. That is correct behaviour, not a regression — but it is the likely explanation if one
+     specific node in an existing project stays broken.
+
+- **Verify the transition alpha-space fix in `npm run dev`** — sandbox down again, so `npm run lint`
+  / `smoke:shaders` / `npm run build` have NOT been run. Checks, highest value first:
+  1. **`npm run smoke:shaders` first.** `TRANSITION_HEADER` was edited, so a malformed comment
+     fails all 35 entries at once — the fastest signal. (The comment deliberately contains no
+     backticks; the header is a JS template literal.)
+  2. **The headline case.** A clip with real transparency (VP9+alpha, or a `SHAPE`/`TEXT`
+     generator) over a clip on a lower track, with a Crossfade on its head. Scrub through the
+     region: no blocks, no bright fringe where alpha meets picture. Then a tail transition on the
+     same clip — that's the swapped-sides path.
+  3. **Nothing regressed on opaque footage.** Two opaque clips crossfading should look identical to
+     before. Also confirm the last frame of a head region is now *exactly* the plain cut (it should
+     be byte-identical — that equality is what proves the space is right).
+  4. **The two edited shaders.** `SLIDE` at all 3 modes with Shadow up, over transparent content —
+     the seam shadow must darken the lower layer without eating its coverage. `SLICE_SHIFT` at Gap
+     Opacity 0.5 — the gap must be half-strength, not blown out.
+  5. **The graph path.** A node-graph / library-compound transition over transparent content. Its
+     inputs are now correctly straight, but its *interior* `MIX_BLEND` is still a straight-space
+     mix, so some fringing may remain there — that's the known limit below, not a new bug.
+  6. **Frame time.** One extra full-screen pass per transitioning clip per frame, only inside a
+     region. Should be unmeasurable; confirm it isn't.
+  7. **Export parity + transparent export.** A short MP4 over the region should match the preview,
+     and a VP9+Alpha export of a transparent clip's transition should keep clean edges over a
+     coloured page.
+
+- **Straight-space mixing inside node graphs has the same latent fault.** The transition
+  compositor's inputs are fixed, but `MIX_BLEND` (and any node doing `mix(a, b, t)` on two texture
+  inputs) still interpolates STRAIGHT RGBA, so crossfading transparent content *inside* a graph can
+  still pull undefined colour out of the matte. The pipeline-wide fix is the one the older backlog
+  entry already names — pick ONE alpha convention app-wide instead of straight-for-effects /
+  premultiplied-for-the-compositor. Short of that, `MIX_BLEND` could premultiply, mix, and
+  un-premultiply internally, which is 2 divides and correct; worth doing if it bites.
 
 - **Verify "In Context" clip preview in `npm run dev`** — written with the Cowork sandbox down, so
   no lint/build run. No shader changed, so `smoke:shaders` is not the signal here; the risk is all

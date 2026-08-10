@@ -144,6 +144,44 @@ void main() {
 }
 `
 
+// Straight → premultiplied. The inverse of the two shaders above, and the whole
+// of the transition compositor's alpha-space reconciliation.
+//
+// **Why this exists: interpolating RGBA is only correct in PREMULTIPLIED space.**
+// A transition's entire job is `mix(from, to, p)` — plus disc/streak blurs,
+// which are the same weighted sum. On STRAIGHT colour that weights a fully
+// transparent pixel's RGB exactly as heavily as an opaque one's, and in a
+// transparent region straight RGB is *undefined*: for alpha video it is
+// whatever the codec left in the colour plane, which is macroblock-shaped
+// garbage, and 4:2:0 chroma subsampling smears it a few pixels INTO the matte.
+// So a straight-space mix drags that garbage in wherever the two sides' alphas
+// disagree — i.e. exactly along an alpha edge — and PRESENT_FS's `rgb / a` then
+// AMPLIFIES it, because the alpha it divides by there is small. That is the
+// blocky fringe that appears around transparent content only while a transition
+// is running. Premultiplying first makes a transparent pixel contribute exactly
+// zero colour, which is the whole fix; it costs one full-screen pass, and only
+// on the frames a transition region is actually live.
+//
+// Kept separate from PASSTHROUGH_FS for the same reason PRESENT_FS is: that
+// shader is also used for plain FBO→FBO copies, which must not change space.
+const PREMULTIPLY_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+out vec4 fragColor;
+void main() {
+  vec4 c = texture(u_texture, v_uv);
+  fragColor = vec4(c.rgb * c.a, c.a);
+}
+`
+
+// Scratch targets for the conversion above. One each, reused by every
+// transition on every track: a region's two sides are converted, read and
+// consumed within a single _compositeEdgeTransition call, so there is never
+// more than one live at a time. Canvas-sized, so resizeAll keeps them right.
+const TR_PREMUL_FBO = '__tr_premul'
+const TR_STRAIGHT_FBO = '__tr_straight'
+
 // Composite shader — blends source over destination with blend mode
 const COMPOSITE_FS = `#version 300 es
 precision highp float;
@@ -394,6 +432,8 @@ export class Renderer {
     this.alphaProgram = createShaderProgram(this.gl, ALPHA_INTERPRET_FS)
     this.backdropProgram = createShaderProgram(this.gl, BACKDROP_FS)
     this.unpremultiplyProgram = createShaderProgram(this.gl, UNPREMULTIPLY_FS)
+    // Straight → premultiplied, for the transition compositor's two inputs.
+    this.premultiplyProgram = createShaderProgram(this.gl, PREMULTIPLY_FS)
 
     // Image source program — the IMAGE_INPUT shader (fit/transform/reactive).
     // Single source of truth: the same registry shader the node card parses for
@@ -2046,6 +2086,39 @@ export class Renderer {
   }
 
   /**
+   * One full-screen pass converting an FBO between straight and premultiplied
+   * alpha, into a scratch buffer. Used only by the transition compositor, which
+   * is the one place in the pipeline where the two conventions meet (see
+   * PREMULTIPLY_FS for why that mismatch shows up as a blocky alpha fringe).
+   *
+   * @param {object} program  — this.premultiplyProgram or this.unpremultiplyProgram
+   * @param {string} srcFBOId — the FBO to convert (never written)
+   * @param {string} dstFBOId — scratch destination, created on first use
+   * @returns {string} the FBO the caller should bind — dstFBOId normally, or
+   *   srcFBOId unchanged if the program failed to compile. Degrading to the
+   *   unconverted texture keeps the old (slightly wrong) picture rather than
+   *   dropping the transition to a hard cut, which is the worse failure.
+   */
+  _convertAlphaSpace(program, srcFBOId, dstFBOId) {
+    const gl = this.gl
+    if (!program?.program) return srcFBOId
+    if (!this.fbos.getTexture(dstFBOId)) this.fbos.create(dstFBOId, this.width, this.height)
+
+    this.fbos.bind(dstFBOId)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    gl.useProgram(program.program)
+    this.fbos.bindTexture(srcFBOId, 0)
+    const loc = program.uniformLocations.u_texture
+    if (loc != null) gl.uniform1i(loc, 0)
+    this.drawQuad()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    return dstFBOId
+  }
+
+  /**
    * Composite one layer onto another with the blend-mode shader.
    * Reads baseFBOId (everything composited so far) and blendFBOId (the layer to
    * add) and writes the blended result into destFBOId. base / blend / dest must
@@ -2120,6 +2193,34 @@ export class Renderer {
     // invisible — so each one now says why.
     const statusKey = transitionGraphKey(clip.id, edge)
 
+    // ── Alpha-space reconciliation ──────────────────────────────────────────
+    // The two sides arrive in DIFFERENT alpha conventions, and always have: the
+    // accumulator is PREMULTIPLIED (that is what applyBlendMode emits) while a
+    // clip's own result is STRAIGHT (the pipeline's convention end to end).
+    // Which side is which follows from the edge alone — a head mixes
+    // accumulator → clip, a tail mixes clip → accumulator — so nothing extra
+    // has to be plumbed down here to tell them apart.
+    //
+    // Mixing across that mismatch is what produced the blocky fringe along an
+    // alpha edge during a transition; see PREMULTIPLY_FS for the mechanism. The
+    // two consumers want OPPOSITE spaces, so each converts the one side that is
+    // wrong for it and leaves the other untouched — one pass, not two:
+    //
+    //   built-in shader → both PREMULTIPLIED. Its result is written straight
+    //     into the accumulator, so it must BE premultiplied, and the footer's
+    //     lerp toward u_backdrop then interpolates two premultiplied values,
+    //     which is valid.
+    //   node graph → both STRAIGHT. Its interior is ordinary effect shaders
+    //     (straight, like every other graph in the app) and its result is handed
+    //     to _compositeTrack as the *blend* side, which is the straight one.
+    //
+    // On a head, fromFBOId === baseFBOId (and on a tail, toFBOId === baseFBOId).
+    // Only the clip side is ever converted for the built-in path, so u_backdrop
+    // keeps pointing at the real premultiplied accumulator either way.
+    const isTail = edge === EDGE_TAIL
+    const clipSideId = isTail ? fromFBOId : toFBOId    // straight
+    const accumSideId = isTail ? toFBOId : fromFBOId   // premultiplied
+
     if (isGraphType(type)) {
       const key = statusKey
       const graph = graphState?.clipGraphs?.[key]
@@ -2129,8 +2230,11 @@ export class Renderer {
           'This edge is set to its own node graph, but the graph is empty — the cut plays as a hard cut.')
         return false
       }
+      const straight = this._convertAlphaSpace(this.unpremultiplyProgram, accumSideId, TR_STRAIGHT_FBO)
       return this._compositeGraphTransition(
-        baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge,
+        baseFBOId, destFBOId,
+        isTail ? fromFBOId : straight, isTail ? straight : toFBOId,
+        clip, edge,
         graph, key, null, null, progress, opacity, standardState, statusKey,
         this.previewTapEnabled ? graph.tapPointNodeId : null
       )
@@ -2145,14 +2249,20 @@ export class Renderer {
           'This transition points at a library entry that no longer exists — the cut plays as a hard cut.')
         return false
       }
+      const straight = this._convertAlphaSpace(this.unpremultiplyProgram, accumSideId, TR_STRAIGHT_FBO)
       return this._compositeGraphTransition(
-        baseFBOId, destFBOId, fromFBOId, toFBOId, clip, edge,
+        baseFBOId, destFBOId,
+        isTail ? fromFBOId : straight, isTail ? straight : toFBOId,
+        clip, edge,
         entry.subGraph, `lib:${libId}`, entry, transition.params, progress, opacity, standardState, statusKey, null
       )
     }
 
+    const premul = this._convertAlphaSpace(this.premultiplyProgram, clipSideId, TR_PREMUL_FBO)
     const ok = this._compositeBuiltinTransition(
-      baseFBOId, destFBOId, fromFBOId, toFBOId, transition, progress, opacity, standardState
+      baseFBOId, destFBOId,
+      isTail ? premul : fromFBOId, isTail ? toFBOId : premul,
+      transition, progress, opacity, standardState
     )
     if (ok) setTransitionStatus(statusKey, true)
     else {
