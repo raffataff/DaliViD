@@ -379,6 +379,35 @@ then failed the build from inside rolldown with `'node:util' does not provide an
 
 ## Recently completed
 
+- **Clip graphs can preview in the full pipeline ("In Context"), like transition graphs always have.**
+  `useAppStore.previewThroughMaster` (boolean) became **`clipPreviewMode`** — `'isolated'` |
+  `'master'` | `'context'` — driving a 3-segment control in the Node Editor header
+  (Clip / + Master / In Context). View state, not serialized.
+  - **There was never a structural blocker; the gate was one clause.** `_renderFrame` read
+    `if (graphLevel === 'clip' && graphClipId && !editingTransition)` → isolated. Everything the
+    composited path needs already existed: `_runClipGraph` honours `tapPointNodeId` exactly like
+    the isolated path, and keyframes, `_setClipTimeContext`, `hasSource` and `_applyClipTransform`
+    are applied identically in both. The condition just gained `&& !inContext`.
+  - **The edited clip's track is exempt from mute and solo** (`focusClipId` → `focusTrackId` in
+    `_renderFullPipeline`). A mode whose whole purpose is "show me this clip in its surroundings"
+    is useless if a muted track or another track's solo hides it. `audioVisTracks` is now built
+    from `tracks` rather than reusing `audioTracks`, so the exemption reaches the **picture**
+    without also un-muting the **sound**. Gated on `previewTapEnabled` — the renderer's standing
+    "this frame is for the eye, not for output" flag — so an export can't bake it in.
+  - **Switching INTO context parks the playhead** inside the clip if it's outside it. In isolation
+    the clip renders wherever the playhead is, so you never notice having drifted off it; the full
+    pipeline only shows *active* clips, so the same drift reads as "I turned the mode on and the
+    picture vanished". Only on the transition into the mode — scrubbing away afterwards to see a
+    neighbouring clip is legitimate. Inspector's "Open Effect Graph" now parks too (the timeline's
+    two entry points always did).
+  - **A tap means something different per mode, and that's why isolation stays the default.**
+    Isolated shows the tapped node's raw output full-screen; in context it's substituted as the
+    clip's output and then blended, faded, transitioned and pushed through master. Good for
+    judging a look, misleading for debugging a node. Context also runs every active clip graph
+    plus master every frame, where isolated renders one clip and pauses every other media element.
+  - Playback still loops within the edited clip in every mode (that clamp is keyed on graph
+    context, not on the render branch, so it was already mode-agnostic).
+
 - **Params inside a transition graph (or any compound) were frozen at compile time — fixed
   (2026-08-08).** Moving any slider on a node inside a transition graph did nothing at all.
   - `executeGraphDAG` resolved a node's params as `liveNodes[id] ?? node.params`, skipping the
@@ -996,6 +1025,26 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
     guaranteed user-gesture path. One blob URL per file, not per clip (splits share sources).
 
 ## Backlog / potential improvements
+
+- **Verify "In Context" clip preview in `npm run dev`** — written with the Cowork sandbox down, so
+  no lint/build run. No shader changed, so `smoke:shaders` is not the signal here; the risk is all
+  in the `_renderFrame` branch and the mute/solo exemption. Checks, highest value first:
+  1. **Nothing regressed in the default mode.** Open a clip graph — it must render isolated
+     exactly as before, and the **Clip** segment must be lit. **+ Master** must behave identically
+     to the old "Master FX: On".
+  2. **In Context shows the composite.** A clip on track 2 over a clip on track 1, with a blend
+     mode and an opacity < 1: In Context should show the real result, edits updating live.
+  3. **The parking jump.** Scrub off the clip, then click In Context — the playhead should jump to
+     the clip's start. Scrub away *again* while already in the mode and it must NOT jump back.
+  4. **Mute / solo exemption.** Mute the edited clip's track: it must still show. Solo a different
+     track: it must still show. Then **exit to master and confirm both hide again** — the exemption
+     must not survive `exitClipGraph`.
+  5. **Export can't inherit it.** Mute the edited clip's track, stay in In Context, export a short
+     MP4 — the muted track must be absent from the file (that's the `previewTapEnabled` gate).
+  6. **Taps.** Set a 👁 tap in each mode. Isolated = the node raw; In Context = that node's output
+     standing in as the clip's output, composited. Both should be legible; neither should crash.
+  7. **Perf is the real cost.** Watch the frame time switching Clip → In Context on a project with
+     several tracks and heavy clip graphs. Expect a real drop — that's why the default is isolated.
 
 - **Verify `TRANSITION_FX` in `npm run dev`** — sandbox still down, so no lint/build/smoke run.
   0. **Sliders are live.** Open a transition graph, drag any param on any node — the preview must

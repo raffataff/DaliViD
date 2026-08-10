@@ -108,31 +108,43 @@
   border-bottom: 1px solid var(--border-subtle, #3a3d45);
 }
 
-/* ── Master FX preview toggle (clip graph only) ── */
+/* ── Clip preview mode (clip graph only) ──
+   A 3-segment control: Clip / + Master / In Context. One shared border with
+   dividers between segments, so it reads as a single choice rather than three
+   independent toggles. */
 
-.node-canvas__masterfx-toggle {
+.node-canvas__preview-mode {
+  display: flex;
   margin-right: var(--space-xs);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.node-canvas__preview-mode-btn {
   padding: 2px 8px;
   font-size: 11px;
   color: var(--text-secondary, #9aa);
   background: rgba(255, 255, 255, 0.05);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-sm);
+  border: none;
+  border-left: 1px solid var(--border-default);
   cursor: pointer;
   white-space: nowrap;
   transition: all var(--duration-fast);
 }
-.node-canvas__masterfx-toggle:hover {
-  background: rgba(255, 255, 255, 0.1);
+.node-canvas__preview-mode-btn:first-child {
+  border-left: none;
 }
-.node-canvas__masterfx-toggle--on {
+.node-canvas__preview-mode-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary, #e8e8ea);
+}
+.node-canvas__preview-mode-btn--on {
   color: #00e5ff;
   background: rgba(0, 229, 255, 0.12);
-  border-color: rgba(0, 229, 255, 0.35);
 }
-.node-canvas__masterfx-toggle--on:hover {
+.node-canvas__preview-mode-btn--on:hover {
   background: rgba(0, 229, 255, 0.22);
-  border-color: #00e5ff;
+  color: #00e5ff;
 }
 
 /* ── Minimap ── */
