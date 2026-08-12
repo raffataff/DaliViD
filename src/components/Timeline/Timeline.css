@@ -25,12 +25,21 @@
   border-right: 1px solid var(--border-default);
 }
 
+/* The ruler is a scrub surface, not a click target — press anywhere and drag. */
 .timeline__ruler {
   flex: 1;
   position: relative;
   overflow: hidden;
-  cursor: pointer;
+  cursor: ew-resize;
+  user-select: none;
   background: var(--bg-surface);
+}
+/* Set on <body> for the duration of a scrub, so the cursor doesn't flicker back
+   to a text/pointer cursor the moment the drag wanders off the ruler. */
+body.is-scrubbing,
+body.is-scrubbing * {
+  cursor: ew-resize !important;
+  user-select: none !important;
 }
 
 .timeline__ruler-marks {
@@ -69,24 +78,45 @@
   width: 0;
   height: 24px;
   z-index: 50;
+  /* Only the grab strip inside is interactive; the arrow must not swallow
+     presses on the ruler next to it. Pseudo-elements inherit this. */
+  pointer-events: none;
 }
 .timeline__playhead-marker::before {
   content: '';
   position: absolute;
   top: 0;
-  left: -5px;
-  border-left: 5px solid transparent;
-  border-right: 5px solid transparent;
-  border-top: 6px solid #ff3344;
+  left: -6px;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 8px solid #ff3344;
+  transition: filter var(--duration-fast);
 }
 .timeline__playhead-marker::after {
   content: '';
   position: absolute;
-  top: 6px;
+  top: 8px;
   left: 0;
   width: 1px;
-  height: 18px;
+  height: 16px;
   background: #ff3344;
+}
+
+/* The real drag target. The arrow is ~12×8px, which is not something anyone can
+   reliably grab, so the hit zone is a full-height strip centred on the line. */
+.timeline__playhead-grab {
+  position: absolute;
+  top: 0;
+  left: -10px;
+  width: 21px;
+  height: 24px;
+  pointer-events: auto;
+  cursor: ew-resize;
+}
+
+.timeline__playhead-marker--dragging::before,
+.timeline__playhead-marker:has(.timeline__playhead-grab:hover)::before {
+  filter: drop-shadow(0 0 5px #ff3344) brightness(1.25);
 }
 
 .timeline__playhead-line {
@@ -108,10 +138,31 @@
   overflow-x: hidden;
 }
 
+/* Rows are rendered TOP = front layer (the array is reversed for display), so
+   dragging a track up moves it toward the front of the picture. */
 .timeline__track {
   display: flex;
   height: 48px;
   border-bottom: 1px solid var(--border-subtle);
+}
+/* The row being restacked. It already moves with the pointer (the reorder is
+   live), so this only has to say "this is the one you're holding". */
+.timeline__track--dragging {
+  opacity: 0.65;
+}
+.timeline__track--dragging .timeline__track-header {
+  background: var(--bg-hover);
+  box-shadow: inset 0 0 0 1px var(--accent-cyan);
+}
+.timeline__track--selected .timeline__track-header {
+  background: var(--bg-elevated);
+}
+
+/* Keep the grab cursor for the whole restack, even off the header. */
+body.is-reordering,
+body.is-reordering * {
+  cursor: grabbing !important;
+  user-select: none !important;
 }
 
 /* ── Track Header ── */
@@ -126,11 +177,29 @@
   border-right: 1px solid var(--border-default);
   border-left: 3px solid transparent;
   user-select: none;
-  cursor: pointer;
+  cursor: grab;
   transition: background var(--duration-fast);
 }
 .timeline__track-header:hover {
   background: var(--bg-elevated);
+}
+.timeline__track-header:active {
+  cursor: grabbing;
+}
+
+/* Drag affordance. Two dotted columns drawn with a repeating gradient — no glyph
+   font dependency, and it stays crisp at any zoom. */
+.timeline__track-grip {
+  width: 6px;
+  height: 18px;
+  flex-shrink: 0;
+  opacity: 0.35;
+  background-image: radial-gradient(circle, var(--text-muted) 1px, transparent 1px);
+  background-size: 3px 4px;
+  transition: opacity var(--duration-fast);
+}
+.timeline__track-header:hover .timeline__track-grip {
+  opacity: 0.8;
 }
 
 .timeline__track-name {
@@ -474,7 +543,10 @@
   border-right: 4px solid transparent;
   margin-left: -4px;
   cursor: ew-resize;
-  z-index: 4;
+  /* Above the playhead's 21px grab strip (z 50), below the In/Out handles
+     (z 60). M drops a marker exactly AT the playhead, so at z 4 the grab strip
+     covered it and it became impossible to pick up again. */
+  z-index: 55;
 }
 .timeline__marker::after {
   /* thin drop-line under the flag so the exact time reads clearly */

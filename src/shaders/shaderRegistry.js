@@ -1030,6 +1030,388 @@ void main() {
 }
 `)
 
+// ── Array (Repeat / Instance) ───────────────────────────────────────────────
+// Repeats the incoming frame as many copies, in a grid, a cascading chain or a
+// ring/spiral. Three things about how it is built are load-bearing:
+//
+// 1. GRID DOES NOT LOOP OVER COPIES. A grid is a lattice, so the copies that
+//    can cover THIS pixel are found by inverse-mapping the pixel to its cell and
+//    then visiting only the neighbours whose footprint can still reach it. Cost
+//    is therefore independent of the count: a 3x3 mosaic and a 40x40 one both
+//    cost ONE texture fetch per pixel at the default spacing. A naive
+//    for-each-copy loop is O(count) per pixel and is exactly the mistake the
+//    house rule about radius loops warns against (see DEPTH_BLUR in CLAUDE.md).
+//    The neighbourhood half-width is derived from the worst-case copy extent and
+//    capped at AR_NB (a 5x5 window), so even pathological overlap stays bounded.
+//
+// 2. CHAIN AND RADIAL ARE WALKED FRONT TO BACK, WITH AN EARLY OUT. Those two
+//    are genuinely not lattices, so they need a bounded loop (AR_MAX_I). Walking
+//    from the front copy backwards means the accumulator saturates as soon as an
+//    opaque copy covers the pixel and the loop stops — on ordinary opaque
+//    footage that is ~1 fetch per pixel however many copies are configured.
+//    Chain positions compound (copy k sits at the sum of k rotated, scaled
+//    steps), which would normally force build-order iteration; the sum is a
+//    geometric series in the complex plane, so it closes to (1 - z^k)/(1 - z)
+//    and any copy can be evaluated directly. That closed form IS what makes the
+//    front-to-back early out possible.
+//
+// 3. COUNT AND ROWS ARE FLOATS ON PURPOSE. The slider steps by 1, but step is a
+//    UI attribute only — a float socket (LFO / RAMP / audio band / keyframe)
+//    writes any value, and the fractional part FADES the last copy in instead of
+//    popping it. An audio-driven Count is unusable without that.
+//
+// Conventions are TRANSFORM's and SHAPE_INPUT's: aspect-corrected frame units
+// where 1.0 == the frame HEIGHT on both axes, v_uv.y UP, rotation
+// counter-clockwise-positive on screen, and position params +-1 at the frame
+// edges. Everything accumulates PREMULTIPLIED and converts back to straight at
+// the end, for the same reason BLUR does — a transparent copy carries undefined
+// colour, and blending it straight drags that colour into the picture.
+registerShader('ARRAY', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_audio_bands[8];   // always-live FFT bands
+uniform float u_beat;             // always-live beat trigger
+// @param name="Mode" min=0 max=2 default=0 step=1 type=select options="Grid,Chain,Radial"
+uniform int u_ar_mode;
+// @param name="Count" min=1 max=64 default=3 step=1
+uniform float u_ar_count;
+// @showif u_ar_mode != Chain
+// @param name="Rows / Rings" min=1 max=64 default=3 step=1
+uniform float u_ar_rows;
+// @param name="Size (0=Auto Fit)" min=0.0 max=4.0 default=0.0 step=0.005
+uniform float u_ar_size;
+// @showif u_ar_mode != Radial
+// @param name="Spacing X" min=0.05 max=4.0 default=1.0 step=0.005
+uniform float u_ar_gap_x;
+// @showif u_ar_mode == Grid
+// @param name="Spacing Y" min=0.05 max=4.0 default=1.0 step=0.005
+uniform float u_ar_gap_y;
+// @showif u_ar_mode == Radial
+// @param name="Radius" min=0.0 max=2.0 default=0.35 step=0.005
+uniform float u_ar_radius;
+// @showif u_ar_mode == Radial
+// @param name="Radius / Turn" min=-1.0 max=1.0 default=0.0 step=0.005
+uniform float u_ar_radius_step;
+// @showif u_ar_mode == Radial
+// @param name="Arc" min=0.0 max=360.0 default=360.0 step=1.0
+uniform float u_ar_arc;
+// @showif u_ar_mode == Radial
+// @param name="Face Center" type=bool default=false
+uniform bool u_ar_orient;
+// @param name="Array Angle" min=-180.0 max=180.0 default=0.0 step=0.5
+uniform float u_ar_angle;
+// @param name="Copy Angle" min=-180.0 max=180.0 default=0.0 step=0.5
+uniform float u_ar_rot;
+// @param name="Spin / Copy" min=-180.0 max=180.0 default=0.0 step=0.5
+uniform float u_ar_spin;
+// @param name="Scale / Copy" min=0.25 max=1.75 default=1.0 step=0.005
+uniform float u_ar_scale_step;
+// @param name="Fade / Copy" min=0.0 max=1.0 default=1.0 step=0.005
+uniform float u_ar_fade;
+// @param name="Hue / Copy" min=-0.5 max=0.5 default=0.0 step=0.005
+uniform float u_ar_hue;
+// @param name="Center X" min=-2.0 max=2.0 default=0.0 step=0.005
+uniform float u_ar_cx;
+// @param name="Center Y" min=-2.0 max=2.0 default=0.0 step=0.005
+uniform float u_ar_cy;
+// @param name="Jitter Position" min=0.0 max=2.0 default=0.0 step=0.005
+uniform float u_ar_jit_pos;
+// @param name="Jitter Size" min=0.0 max=1.0 default=0.0 step=0.005
+uniform float u_ar_jit_size;
+// @param name="Seed" min=0.0 max=64.0 default=0.0 step=1.0
+uniform float u_ar_seed;
+// @param name="Mirror" min=0 max=3 default=0 step=1 type=select options="Off,Alternate X,Alternate Y,Checker"
+uniform int u_ar_mirror;
+// @param name="Blend" min=0 max=3 default=0 step=1 type=select options="Over,Add,Screen,Max"
+uniform int u_ar_blend;
+// @showif u_ar_blend == Over
+// @param name="Stacking" min=0 max=1 default=0 step=1 type=select options="Last on Top,First on Top"
+uniform int u_ar_order;
+// @param name="Filtering" min=0 max=1 default=1 step=1 type=select options="Fast,Smooth"
+uniform int u_ar_filter;
+// @param name="Original" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_ar_orig;
+// @param name="Bass Size" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_ar_bass;
+// @param name="Beat Punch" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_ar_punch;
+out vec4 fragColor;
+
+const float AR_TAU = 6.28318530718;
+const float AR_D2R = 0.01745329252;
+const int   AR_MAX_I = 64;   // hard cap on the Chain / Radial loop
+const int   AR_NB    = 2;    // lattice neighbourhood half-width (5x5 worst case)
+
+float arHash(vec2 c) {
+  return fract(sin(dot(c, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+// Rotate rgb about the grey axis (Rodrigues on the 1,1,1 axis). A hue shift with
+// no rgb-to-hsv round trip, and because it is LINEAR it gives the same answer on
+// premultiplied colour as on straight — which is why it can be applied after the
+// premultiply without unwinding it first.
+vec3 arHue(vec3 c, float h) {
+  if (h == 0.0) return c;
+  float a = h * AR_TAU;
+  vec3 k = vec3(0.57735027);
+  float ca = cos(a);
+  return c * ca + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - ca);
+}
+
+// Complex divide, used only by the chain's geometric series.
+vec2 arCDiv(vec2 a, vec2 b) {
+  return vec2(dot(a, b), a.y * b.x - a.x * b.y) / max(dot(b, b), 1e-8);
+}
+
+// R(-a) applied to a QUERY point, i.e. the content turns counter-clockwise by a.
+// Same sign convention as TRANSFORM and the shape gizmo.
+mat2 arQRot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+
+// Fetch one copy, PREMULTIPLIED. fp is the source-uv footprint of one screen
+// pixel inside this copy.
+//
+// textureLod(..., 0.0) rather than texture(): every FBO in the pipeline is
+// LINEAR with no mip chain, so the implicit derivative would be computed and
+// thrown away — and these calls sit inside non-uniform control flow, where the
+// spec leaves implicit derivatives undefined.
+vec4 arFetch(vec2 luv, vec2 fp) {
+  if (u_ar_filter == 1 && max(fp.x * u_resolution.x, fp.y * u_resolution.y) > 1.05) {
+    // Minifying, and there are no mipmaps to fall back on — so prefilter with a
+    // 4-tap box over the pixel footprint, which is what keeps a 12x12 grid from
+    // shimmering. Accumulated premultiplied for BLUR's reason: a transparent tap
+    // carries undefined colour and must contribute nothing but its coverage.
+    vec2 o = fp * 0.25;
+    vec4 a0 = textureLod(u_texture, luv + vec2( o.x,  o.y), 0.0);
+    vec4 a1 = textureLod(u_texture, luv + vec2(-o.x,  o.y), 0.0);
+    vec4 a2 = textureLod(u_texture, luv + vec2( o.x, -o.y), 0.0);
+    vec4 a3 = textureLod(u_texture, luv + vec2(-o.x, -o.y), 0.0);
+    return (vec4(a0.rgb * a0.a, a0.a) + vec4(a1.rgb * a1.a, a1.a)
+          + vec4(a2.rgb * a2.a, a2.a) + vec4(a3.rgb * a3.a, a3.a)) * 0.25;
+  }
+  vec4 c = textureLod(u_texture, luv, 0.0);
+  return vec4(c.rgb * c.a, c.a);
+}
+
+// Evaluate one copy at query point q (array space) and composite it into the
+// premultiplied accumulator. Returns true once Over has saturated, which is the
+// caller's signal to stop walking.
+bool arAccum(inout vec4 acc, vec2 q, vec2 pos, float scl, float rotA,
+             float op, float hue, vec2 flip, float aspect) {
+  float s = max(scl, 1e-4);
+  vec2 lp = arQRot(rotA) * (q - pos) / s;
+  vec2 luv = vec2(lp.x / aspect, lp.y) + 0.5;
+  if (flip.x < 0.0) luv.x = 1.0 - luv.x;
+  if (flip.y < 0.0) luv.y = 1.0 - luv.y;
+
+  // One frame unit is u_resolution.y pixels on BOTH axes (x is aspect-corrected),
+  // so a copy is s*aspect*H by s*H pixels and luv spans 0..1 across that.
+  vec2 fp = 1.0 / max(vec2(s * aspect, s) * u_resolution.y, vec2(1e-4));
+
+  // Coverage, measured in screen pixels from the copy's edge — this is what
+  // keeps a rotated or heavily minified copy from having a stair-stepped border.
+  vec2 d = min(luv, vec2(1.0) - luv);
+  float cov = clamp(min(d.x / fp.x, d.y / fp.y) + 0.5, 0.0, 1.0);
+  if (cov <= 0.0) return false;
+
+  vec4 c = arFetch(luv, fp);
+  c.rgb = arHue(c.rgb, hue);
+  c *= cov * op;
+
+  if (u_ar_blend == 1)      acc += c;                    // Add
+  else if (u_ar_blend == 2) acc = acc + c - acc * c;     // Screen
+  else if (u_ar_blend == 3) acc = max(acc, c);           // Max
+  else {
+    acc += (1.0 - acc.a) * c;                            // Over, front to back
+    return acc.a > 0.996;
+  }
+  return false;
+}
+
+// Where copy k of a CHAIN lands, relative to the first copy. See note 2 above:
+// this is the closed form of sum(j = 0 .. k-1) of scaleStep^j * R(spin*j) * step.
+vec2 arChain(float k, float lenX, float st, float spin, bool degen, vec2 den) {
+  if (degen) return vec2(lenX * k, 0.0);
+  float sk = clamp(pow(st, k), 0.0, 1e6);
+  vec2 zk = sk * vec2(cos(spin * k), sin(spin * k));
+  return lenX * arCDiv(vec2(1.0, 0.0) - zk, den);
+}
+
+void main() {
+  float aspect = u_resolution.x / max(u_resolution.y, 1.0);
+  vec2 p = vec2((v_uv.x - 0.5) * aspect, v_uv.y - 0.5);
+
+  // Always-live audio: bass swells every copy, a beat punches them.
+  float pulse = 1.0 + u_audio_bands[1] * u_ar_bass * 1.2 + u_beat * u_ar_punch * 0.5;
+
+  int mode = clamp(u_ar_mode, 0, 2);
+  float fcount = clamp(u_ar_count, 1.0, 64.0);
+  float frows  = (mode == 1) ? 1.0 : clamp(u_ar_rows, 1.0, 64.0);
+  int cols = int(ceil(fcount - 1e-4));
+  int rows = int(ceil(frows - 1e-4));
+  // The fractional tail (see note 3) — 1.0 on a whole number, otherwise the
+  // opacity of the copy currently fading in at the end of the run.
+  float tailC = clamp(fcount - float(cols - 1), 0.0, 1.0);
+  float tailR = clamp(frows - float(rows - 1), 0.0, 1.0);
+
+  // Auto size: the largest copy that still tiles the frame at this count, so
+  // dropping the node in and setting Count / Rows gives an exact mosaic with no
+  // arithmetic. Explicit Size wins the moment it leaves 0.
+  float autoS = 1.0 / float(max(max(cols, rows), 1));
+  float baseS = max((u_ar_size <= 0.0005 ? autoS : u_ar_size) * pulse, 1e-4);
+
+  vec2 cell  = vec2(baseS * aspect, baseS);
+  vec2 pitch = cell * vec2(max(u_ar_gap_x, 0.02), max(u_ar_gap_y, 0.02));
+
+  float rotB = u_ar_rot * AR_D2R;
+  // Audio driver (0 until wired): mids twist the cascade.
+  float spin = (u_ar_spin + u_mid * 45.0) * AR_D2R;
+  float st   = max(u_ar_scale_step, 0.05);
+  float fade = max(u_ar_fade, 1e-4);
+  // Audio driver (0 until wired): loudness scatters the copies.
+  float jit  = max(u_ar_jit_pos + u_rms * 0.5, 0.0);
+
+  // Array space: undo the array's own rotation and centre ONCE, so every copy is
+  // then a plain translate / rotate / scale of the query point.
+  vec2 centre = vec2(u_ar_cx * 0.5 * aspect, u_ar_cy * 0.5);
+  vec2 q = arQRot(u_ar_angle * AR_D2R) * (p - centre);
+
+  vec4 acc = vec4(0.0);
+  // Walk front to back so Over can stop early. Only Over is order-dependent;
+  // Add / Screen / Max are commutative, so the direction is free there.
+  bool desc = (u_ar_order == 0);
+  bool done = false;
+
+  if (mode == 0) {
+    // ── GRID — inverse-mapped lattice, no per-copy loop.
+    // Cell coordinate of this pixel. y counts DOWN so row 0 is the top row.
+    vec2 g = vec2(q.x, -q.y) / max(pitch, vec2(1e-4))
+           + 0.5 * vec2(float(cols - 1), float(rows - 1));
+    ivec2 c0 = ivec2(floor(g + 0.5));
+
+    // How far the copies around this cell can reach. Scale / Copy compounds by
+    // index, so bound it over the LOCAL index window rather than the whole grid
+    // — a global bound would push a 40x40 array to the 5x5 cap for no reason.
+    int total = cols * rows;
+    float kHere = float(clamp(c0.y * cols + c0.x, 0, max(total - 1, 0)));
+    float span = float(AR_NB * cols + AR_NB);
+    float kLo = max(kHere - span, 0.0);
+    float kHi = min(kHere + span, float(max(total - 1, 0)));
+    float grow = clamp(max(pow(st, kLo), pow(st, kHi)), 0.0, 64.0);
+    float maxS = baseS * grow * (1.0 + 0.5 * u_ar_jit_size);
+
+    // A rotated copy needs its bounding CIRCLE; an unrotated one only its box,
+    // which is what makes the common case a single fetch.
+    bool spun = (u_ar_rot != 0.0) || (u_ar_spin != 0.0) || (u_mid != 0.0);
+    vec2 ext = spun ? vec2(0.5 * maxS * length(vec2(aspect, 1.0)))
+                    : 0.5 * maxS * vec2(aspect, 1.0);
+    ext += 0.5 * jit * cell;
+    ivec2 nb = ivec2(clamp(ceil(ext / max(pitch, vec2(1e-4)) - 0.5),
+                           vec2(0.0), vec2(float(AR_NB))));
+
+    // Index rises with iy then ix, so descending dy then dx IS descending copy
+    // order — no sorting needed for the front-to-back walk.
+    for (int sy = 0; sy <= 2 * AR_NB; sy++) {
+      if (done) break;
+      int dy = desc ? (AR_NB - sy) : (sy - AR_NB);
+      if (dy < -nb.y || dy > nb.y) continue;
+      int iy = c0.y + dy;
+      if (iy < 0 || iy >= rows) continue;
+      for (int sx = 0; sx <= 2 * AR_NB; sx++) {
+        int dx = desc ? (AR_NB - sx) : (sx - AR_NB);
+        if (dx < -nb.x || dx > nb.x) continue;
+        int ix = c0.x + dx;
+        if (ix < 0 || ix >= cols) continue;
+
+        float k = float(iy * cols + ix);
+        vec2 pos = (vec2(float(ix), float(iy)) - 0.5 * vec2(float(cols - 1), float(rows - 1)))
+                 * pitch * vec2(1.0, -1.0);
+        pos += (vec2(arHash(vec2(k, u_ar_seed + 1.0)),
+                     arHash(vec2(k, u_ar_seed + 7.0))) - 0.5) * jit * cell;
+
+        float scl = baseS * clamp(pow(st, k), 1e-4, 64.0)
+                  * (1.0 + (arHash(vec2(k, u_ar_seed + 13.0)) - 0.5) * u_ar_jit_size);
+        float op = pow(fade, k)
+                 * (ix == cols - 1 ? tailC : 1.0)
+                 * (iy == rows - 1 ? tailR : 1.0);
+
+        vec2 flip = vec2(1.0);
+        if (u_ar_mirror == 1 || u_ar_mirror == 3) flip.x = mod(float(ix), 2.0) < 0.5 ? 1.0 : -1.0;
+        if (u_ar_mirror == 2 || u_ar_mirror == 3) flip.y = mod(float(iy), 2.0) < 0.5 ? 1.0 : -1.0;
+
+        if (arAccum(acc, q, pos, scl, rotB + spin * k, op, u_ar_hue * k, flip, aspect)) {
+          done = true;
+          break;
+        }
+      }
+    }
+  } else {
+    // ── CHAIN / RADIAL — bounded loop, front to back, early out.
+    int n = clamp(cols * rows, 1, AR_MAX_I);
+    vec2 zc = st * vec2(cos(spin), sin(spin));
+    vec2 den = vec2(1.0, 0.0) - zc;
+    bool degen = dot(den, den) < 1e-6;
+    // Centre the chain on the array centre rather than growing off one end.
+    vec2 mid = 0.5 * arChain(float(n - 1), pitch.x, st, spin, degen, den);
+    bool full = u_ar_arc >= 359.5;
+    float arcR = u_ar_arc * AR_D2R;
+
+    for (int i = 0; i < AR_MAX_I; i++) {
+      if (i >= n || done) break;
+      int idx = desc ? (n - 1 - i) : i;
+      float k = float(idx);
+
+      vec2 pos;
+      float faceRot = 0.0;
+      float tail = 1.0;
+      if (mode == 1) {
+        pos = arChain(k, pitch.x, st, spin, degen, den) - mid;
+        tail = (idx == n - 1) ? tailC : 1.0;
+      } else {
+        // Radius / Turn is the radius gained per FULL turn, so a 360 arc with
+        // Rings > 1 is one continuous spiral while a partial arc is a fan
+        // repeated per ring.
+        int ring = idx / cols;
+        int j = idx - ring * cols;
+        float dn = full ? float(cols) : max(float(cols - 1), 1.0);
+        float turn = float(ring) + float(j) / float(cols);
+        float a = full ? arcR * turn : arcR * (float(j) / dn);
+        float rad = max(u_ar_radius + u_ar_radius_step * turn, 0.0);
+        pos = rad * vec2(cos(a), sin(a));
+        faceRot = u_ar_orient ? a : 0.0;
+        tail = (j == cols - 1 ? tailC : 1.0) * (ring == rows - 1 ? tailR : 1.0);
+      }
+      pos += (vec2(arHash(vec2(k, u_ar_seed + 1.0)),
+                   arHash(vec2(k, u_ar_seed + 7.0))) - 0.5) * jit * cell;
+
+      float scl = baseS * clamp(pow(st, k), 1e-4, 64.0)
+                * (1.0 + (arHash(vec2(k, u_ar_seed + 13.0)) - 0.5) * u_ar_jit_size);
+      float op = pow(fade, k) * tail;
+
+      vec2 flip = vec2(1.0);
+      float par = mod(k, 2.0) < 0.5 ? 1.0 : -1.0;
+      if (u_ar_mirror == 1 || u_ar_mirror == 3) flip.x = par;
+      if (u_ar_mirror == 2 || u_ar_mirror == 3) flip.y = par;
+
+      if (arAccum(acc, q, pos, scl, rotB + spin * k + faceRot, op, u_ar_hue * k, flip, aspect)) {
+        done = true;
+      }
+    }
+  }
+
+  // The untouched frame underneath, so the copies can fly over the shot they
+  // came from. Composited UNDER in premultiplied space, like everything else.
+  vec4 src = textureLod(u_texture, v_uv, 0.0);
+  vec4 bg = vec4(src.rgb * src.a, src.a) * clamp(u_ar_orig, 0.0, 1.0);
+  acc += (1.0 - clamp(acc.a, 0.0, 1.0)) * bg;
+
+  // Back to STRAIGHT — the pipeline's convention everywhere outside a gather.
+  float oa = clamp(acc.a, 0.0, 1.0);
+  fragColor = oa > 0.0001 ? vec4(clamp(acc.rgb / oa, 0.0, 1.0), oa) : vec4(0.0);
+}
+`)
+
 // ── Video Input (passthrough — texture uploaded externally by Renderer) ──
 registerShader('VIDEO_INPUT', `#version 300 es
 precision highp float;
@@ -1072,6 +1454,20 @@ uniform float u_beat_punch;
 uniform vec3 u_bg_color;
 out vec4 fragColor;
 
+// The image is uploaded PREMULTIPLIED (Renderer.renderImageNode), because every
+// fetch here is a FILTERED one — a weighted sum of texels — and a weighted sum
+// of RGBA only means anything once colour carries its own coverage. Fit, Scale
+// and Tile all resample, so a straight-alpha texture lost intensity along every
+// soft edge: averaging opaque white with a transparent texel gave half-grey at
+// half alpha instead of white at half alpha, which reads as a dark fringe and,
+// on a hard-edged cutout, as stair-stepping. Undone here so the rest of the
+// pipeline still sees its straight-alpha convention. An opaque image divides by
+// 1.0 and is bit-identical, which covers every JPEG and most PNGs.
+vec4 imgSample(vec2 uv) {
+  vec4 t = texture(u_image, uv);
+  return t.a > 0.0001 ? vec4(t.rgb / t.a, t.a) : vec4(0.0);
+}
+
 void main() {
   vec2 c = v_uv - 0.5;
 
@@ -1101,11 +1497,11 @@ void main() {
   vec2 suv = c + 0.5;
 
   if (u_fit == 3) {                       // Tile: wrap
-    fragColor = texture(u_image, fract(suv));
+    fragColor = imgSample(fract(suv));
   } else if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
-    fragColor = vec4(u_bg_color, 1.0);    // outside image → background
+    fragColor = vec4(u_bg_color, 1.0);    // outside image → background (opaque by design)
   } else {
-    fragColor = texture(u_image, suv);
+    fragColor = imgSample(suv);
   }
 }
 `)
@@ -1159,7 +1555,13 @@ void main() {
   if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
     fragColor = vec4(0.0);        // transparent outside the raster
   } else {
-    fragColor = texture(u_image, suv);
+    // u_image is uploaded PREMULTIPLIED (Renderer.renderTextNode), because this
+    // single tap is what resolves the 2x supersampled raster and a filtered sum
+    // of RGBA is only valid when colour carries its own coverage. Undo it here
+    // so the rest of the pipeline sees the straight alpha it expects — the
+    // epsilon and the transparent-black fallback match PRESENT_FS.
+    vec4 t = texture(u_image, suv);
+    fragColor = t.a > 0.0001 ? vec4(t.rgb / t.a, t.a) : vec4(0.0);
   }
 }
 `)
@@ -2103,7 +2505,14 @@ void main() {
   }
 
   // Audio driver (0 until wired): bass pulses the blended result.
-  fragColor = vec4(clamp(result * (1.0 + u_bass * 0.5), 0.0, 1.0), max(a.a, b.a));
+  // Mix (0) is a CROSSFADE, so its COVERAGE has to crossfade too. max() keeps
+  // the outgoing side's silhouette fully opaque for the whole mix, so an image
+  // or shape carrying an alpha channel never actually leaves — which reads as
+  // a second copy of it hanging around. The other operations layer two pictures
+  // rather than replace one, so the union is right for them. This is the node
+  // the starter transition graph is built from.
+  float outA = u_operation == 0 ? mix(a.a, b.a, u_mix) : max(a.a, b.a);
+  fragColor = vec4(clamp(result * (1.0 + u_bass * 0.5), 0.0, 1.0), outA);
 }
 `)
 
@@ -2139,7 +2548,14 @@ void main() {
   }
 
   // Audio driver (0 until wired): bass pulses the blended result.
-  fragColor = vec4(clamp(result * (1.0 + u_bass * 0.5), 0.0, 1.0), max(a.a, b.a));
+  // Mix (0) is a CROSSFADE, so its COVERAGE has to crossfade too. max() keeps
+  // the outgoing side's silhouette fully opaque for the whole mix, so an image
+  // or shape carrying an alpha channel never actually leaves — which reads as
+  // a second copy of it hanging around. The other operations layer two pictures
+  // rather than replace one, so the union is right for them. This is the node
+  // the starter transition graph is built from.
+  float outA = u_operation == 0 ? mix(a.a, b.a, u_mix) : max(a.a, b.a);
+  fragColor = vec4(clamp(result * (1.0 + u_bass * 0.5), 0.0, 1.0), outA);
 }
 `)
 

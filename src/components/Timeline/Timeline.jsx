@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import { useWaveform } from '../../utils/waveformCache'
 import useTimelineStore from '../../store/useTimelineStore'
 import useAppStore from '../../store/useAppStore'
@@ -25,6 +25,18 @@ import './Timeline.css'
 // are the same target.
 const EDGE_HIT_PX = 22
 
+// Ruler tick spacings, in seconds — a 1-2-5 ladder extended into minutes and
+// hours. `pickRulerStep` returns the smallest that is at least `minPx` wide on
+// screen, so both the tick and the label spacing stay in a readable band no
+// matter how far in or out the timeline is zoomed.
+const RULER_STEPS = [
+  0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30,
+  60, 120, 300, 600, 900, 1800, 3600, 7200, 21600,
+]
+function pickRulerStep(pxPerSec, minPx) {
+  return RULER_STEPS.find(s => s * pxPerSec >= minPx) ?? RULER_STEPS[RULER_STEPS.length - 1]
+}
+
 /**
  * Timeline panel — horizontal ruler, tracks, clips, playhead, zoom.
  * Wired to Zustand stores for real state.
@@ -39,6 +51,8 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const toggleMute = useTimelineStore(s => s.toggleMute)
   const toggleSolo = useTimelineStore(s => s.toggleSolo)
   const toggleLock = useTimelineStore(s => s.toggleLock)
+  const moveTrackToIndex = useTimelineStore(s => s.moveTrackToIndex)
+  const moveTrackBy = useTimelineStore(s => s.moveTrackBy)
   const moveClip = useTimelineStore(s => s.moveClip)
   const trimClip = useTimelineStore(s => s.trimClip)
   const updateClip = useTimelineStore(s => s.updateClip)
@@ -82,6 +96,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const selectClip = useAppStore(s => s.selectClip)
   const selectTrack = useAppStore(s => s.selectTrack)
   const selectedClipId = useAppStore(s => s.selectedClipId)
+  const selectedTrackId = useAppStore(s => s.selectedTrackId)
   const enterClipGraph = useAppStore(s => s.enterClipGraph)
   const defaultTransition = useAppStore(s => s.defaultTransition)
   const clipGraphs = useGraphStore(s => s.clipGraphs)
@@ -91,73 +106,206 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   const pxPerSec = 80 * timelineZoom
   const TRACK_HEADER_W = 160
 
-  // Click on ruler to set playhead
-  const handleRulerClick = useCallback((e) => {
-    const rect = rulerRef.current.getBoundingClientRect()
-    const x = e.clientX - rect.left + timelineScrollLeft
-    const time = Math.max(0, x / pxPerSec)
-    setPlayheadTime(time)
-  }, [timelineScrollLeft, pxPerSec, setPlayheadTime])
+  // (Playhead scrubbing lives below `applySnap`, which it depends on.)
 
-  // Zoom via scroll, pan via Shift+scroll
-  const handleRulerWheel = useCallback((e) => {
-    if (e.shiftKey) {
-      // Shift+scroll = horizontal pan
-      setTimelineScrollLeft(timelineScrollLeft + e.deltaX + e.deltaY)
-    } else {
+  // ── Viewport width ──
+  // Measured, not assumed. Zoom-fit, scroll clamping and mark culling all need
+  // it, and the culling used to use a hard-coded 2500px window — so on a monitor
+  // wider than that, the right-hand end of the ruler had no marks or beat lines
+  // at all, and on a narrow one it built ~2× the DOM it needed.
+  // The ruler and every clip lane share a left edge (a 160px header/spacer sits
+  // left of both), so ONE measurement and ONE content origin serve both.
+  const [viewportWidth, setViewportWidth] = useState(0)
+  useEffect(() => {
+    const el = rulerRef.current
+    if (!el) { setViewportWidth(0); return }
+    setViewportWidth(el.clientWidth)
+    const ro = new ResizeObserver(([entry]) => setViewportWidth(entry.contentRect.width))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [collapsed])
+
+  // Clamp a scroll position to the content. Without an upper bound you can pan
+  // into unbounded empty space, and zooming OUT leaves you parked past the end
+  // with a blank timeline and no obvious way back.
+  // The playhead counts as content, so scrubbing past the last clip still lets
+  // the view follow it.
+  const clampScrollLeft = useCallback((x, pps = pxPerSec) => {
+    const extent = Math.max(projectDuration, useAppStore.getState().playheadTime) * pps
+    // Stop when the end of the content reaches the middle of the view.
+    const max = Math.max(0, extent - viewportWidth / 2)
+    return Math.max(0, Math.min(max, x))
+  }, [projectDuration, pxPerSec, viewportWidth])
+
+  // Zoom by `factor`, keeping `anchorTime` pinned to the pixel it currently
+  // occupies. Zoom used to change the scale and nothing else, which pins t=0
+  // instead — so everything fanned out from the far left and the thing you were
+  // looking at slid off screen.
+  // The store owns the zoom limits, so the new zoom is read BACK from it rather
+  // than re-clamped here; otherwise the anchor maths would use a value the store
+  // rejected and the view would drift at the extremes.
+  const zoomBy = useCallback((factor, anchorTime = null) => {
+    const prev = useTimelineStore.getState().timelineZoom
+    setTimelineZoom(prev * factor)
+    const next = useTimelineStore.getState().timelineZoom
+    if (next === prev) return
+
+    const scroll = useTimelineStore.getState().timelineScrollLeft
+    const prevPps = 80 * prev
+    const nextPps = 80 * next
+    const t = anchorTime != null ? anchorTime : (scroll + viewportWidth / 2) / prevPps
+    const anchorX = t * prevPps - scroll // where the anchor sits on screen now
+    setTimelineScrollLeft(clampScrollLeft(t * nextPps - anchorX, nextPps))
+  }, [setTimelineZoom, setTimelineScrollLeft, clampScrollLeft, viewportWidth])
+
+  // Keyboard zoom anchors on the playhead when it's visible (Premiere's
+  // behaviour — you're almost always zooming to look at where you are), and on
+  // the middle of the view when it isn't, so it can't teleport somewhere else.
+  const zoomAtPlayhead = useCallback((factor) => {
+    const scroll = useTimelineStore.getState().timelineScrollLeft
+    const ph = useAppStore.getState().playheadTime
+    const x = ph * pxPerSec - scroll
+    zoomBy(factor, x >= 0 && x <= viewportWidth ? ph : null)
+  }, [pxPerSec, viewportWidth, zoomBy])
+
+  const handleTimelineWheel = useCallback((e) => {
+    // Firefox reports wheel deltas in LINES (deltaMode 1, ~3 per notch) and some
+    // configurations in PAGES (2). Unnormalised, one notch zoomed 30× further in
+    // Chrome than in Firefox.
+    const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? (viewportWidth || 800) : 1
+    const dx = e.deltaX * unit
+    const dy = e.deltaY * unit
+    const scroll = useTimelineStore.getState().timelineScrollLeft
+
+    // A tilt wheel / horizontal trackpad swipe PANS.
+    // This is the "it always scrolls left" bug: a horizontal tick has deltaY 0,
+    // so it fell through to the zoom branch, where `deltaY > 0` was false and it
+    // therefore zoomed IN by 10% — in both tilt directions. Zoom anchoring at
+    // time 0 then pushed the picture rightward, which reads as the view sliding
+    // left. Two bugs that looked like one.
+    if (Math.abs(dx) > Math.abs(dy)) {
       e.preventDefault()
-      const delta = e.deltaY > 0 ? 0.9 : 1.1
-      setTimelineZoom(timelineZoom * delta)
+      setTimelineScrollLeft(clampScrollLeft(scroll + dx))
+      return
     }
-  }, [timelineZoom, timelineScrollLeft, setTimelineZoom, setTimelineScrollLeft])
+
+    // Shift+wheel = horizontal pan, for mice with no tilt wheel.
+    if (e.shiftKey) {
+      e.preventDefault()
+      setTimelineScrollLeft(clampScrollLeft(scroll + dy))
+      return
+    }
+
+    // Alt+wheel scrolls the track list. The lanes are a native scroll container,
+    // but plain wheel is taken by zoom and preventDefault'd — so a project with
+    // more tracks than fit could previously only be scrolled by dragging the
+    // scrollbar.
+    if (e.altKey) {
+      const area = tracksAreaRef.current
+      if (area) { e.preventDefault(); area.scrollTop += dy }
+      return
+    }
+
+    // Everything else zooms at the cursor. `ctrlKey` lands here too: that is how
+    // browsers report a trackpad pinch, and preventDefault stops it zooming the
+    // whole page instead.
+    e.preventDefault()
+    if (dy === 0) return
+    // Exponential, so a slow scroll and a fast flick feel the same per unit of
+    // travel. Clamped so one huge delta (or a coarse deltaMode) can't jump the
+    // entire zoom range in a single event.
+    const factor = Math.min(2, Math.max(0.5, Math.pow(1.002, -dy)))
+
+    const rect = rulerRef.current?.getBoundingClientRect()
+    // Over the 160px track header, cursorX is negative — anchor on the left edge
+    // of the lane rather than on a negative time.
+    const cursorX = rect ? Math.max(0, e.clientX - rect.left) : viewportWidth / 2
+    zoomBy(factor, (cursorX + scroll) / pxPerSec)
+  }, [pxPerSec, viewportWidth, setTimelineScrollLeft, clampScrollLeft, zoomBy])
 
   // Zoom to fit — scale so the whole project fills the visible ruler width and
   // reset the scroll. This is the standard "fit sequence to window" control found
   // in professional NLEs/DAWs (Premiere/Resolve's `\`, etc.).
   const handleZoomFit = useCallback(() => {
-    const el = rulerRef.current
-    if (!el) return
-    const width = el.clientWidth
+    const width = viewportWidth || rulerRef.current?.clientWidth || 0
     const dur = calculateDuration() || 30
     if (width <= 0 || dur <= 0) return
-    const targetZoom = (width - 24) / (dur * 80) // 80 = base px/sec
-    setTimelineZoom(targetZoom)
+    setTimelineZoom((width - 24) / (dur * 80)) // 80 = base px/sec
     setTimelineScrollLeft(0)
-  }, [calculateDuration, setTimelineZoom, setTimelineScrollLeft])
+  }, [calculateDuration, viewportWidth, setTimelineZoom, setTimelineScrollLeft])
+
+  // Re-clamp whenever the zoom, the panel width or the project length changes by
+  // any route (keyboard zoom, window resize, project load, deleting the last
+  // clip). Without this you can be left parked in empty space showing nothing.
+  useEffect(() => {
+    const cur = useTimelineStore.getState().timelineScrollLeft
+    const clamped = clampScrollLeft(cur)
+    if (clamped !== cur) setTimelineScrollLeft(clamped)
+  }, [clampScrollLeft, setTimelineScrollLeft])
+
+  // Follow the playhead when it leaves the visible window — during playback it
+  // otherwise just runs off the right edge a few seconds in and you have to
+  // chase it, and a jump (In/Out, "Playhead to Clip Start") could land somewhere
+  // you can't see.
+  //
+  // Subscribed imperatively rather than via a hook selector: playheadTime
+  // changes every frame, so a subscribed Timeline would re-render the whole
+  // panel 60×/sec. This only writes when the view actually has to page.
+  useEffect(() => {
+    if (viewportWidth <= 0) return
+    return useAppStore.subscribe(
+      (s) => s.playheadTime,
+      (t) => {
+        // Never fight a manual scrub — that gesture owns the scroll, and it has
+        // its own edge auto-scroll.
+        if (document.body.classList.contains('is-scrubbing')) return
+        const scroll = useTimelineStore.getState().timelineScrollLeft
+        const x = t * pxPerSec - scroll
+        const margin = Math.min(80, viewportWidth * 0.1)
+        if (x >= margin && x <= viewportWidth - margin) return
+        // Page, don't centre. Re-centring every frame slides the entire timeline
+        // continuously under the eye, which is much harder to read than one jump
+        // per screenful.
+        setTimelineScrollLeft(Math.max(0, t * pxPerSec - margin))
+      }
+    )
+  }, [pxPerSec, viewportWidth, setTimelineScrollLeft])
 
   // Attach native wheel listeners because React 18 makes onWheel passive,
   // which silently prevents e.preventDefault() from working.
   useEffect(() => {
     const el = rulerRef.current
     if (!el) return
-    el.addEventListener('wheel', handleRulerWheel, { passive: false })
-    return () => el.removeEventListener('wheel', handleRulerWheel)
-  }, [handleRulerWheel])
+    el.addEventListener('wheel', handleTimelineWheel, { passive: false })
+    return () => el.removeEventListener('wheel', handleTimelineWheel)
+  }, [handleTimelineWheel])
 
   useEffect(() => {
     const el = tracksAreaRef.current
     if (!el) return
-    el.addEventListener('wheel', handleRulerWheel, { passive: false })
-    return () => el.removeEventListener('wheel', handleRulerWheel)
-  }, [handleRulerWheel])
+    el.addEventListener('wheel', handleTimelineWheel, { passive: false })
+    return () => el.removeEventListener('wheel', handleTimelineWheel)
+  }, [handleTimelineWheel])
 
   // ── Beat grid lines (beats faint, bars strong) ──
   // Rendered inside the same translated container as the ruler marks. Beats are
   // skipped when they'd be denser than ~7px so zoomed-out views stay readable.
   const generateBeatLines = () => {
-    if (!beatGridEnabled || !bpm || bpm <= 0) return null
+    if (!beatGridEnabled || !bpm || bpm <= 0 || viewportWidth <= 0) return null
     const app = useAppStore.getState()
     const spb = 60 / bpm // seconds per beat
     const beatPx = spb * pxPerSec
     if (beatPx < 3) return null
     const showBeats = beatPx >= 7
     const lines = []
-    const totalSeconds = Math.max(300, Math.ceil(projectDuration * 1.1))
     const startBeat = Math.max(0, Math.floor((timelineScrollLeft / pxPerSec - app.beatOffset) / spb) - 1)
-    const endTime = (timelineScrollLeft + 2500) / pxPerSec
+    // Culled to the MEASURED viewport (was a hard-coded 2500px, which left the
+    // right of a wide panel bare and over-drew on a narrow one).
+    const endTime = (timelineScrollLeft + viewportWidth) / pxPerSec
     for (let b = startBeat; ; b++) {
       const t = app.beatOffset + b * spb
-      if (t > endTime || t > totalSeconds) break
+      if (t > endTime) break
+      if (t < 0) continue
       const isBar = b % 4 === 0
       if (!isBar && !showBeats) continue
       lines.push(
@@ -194,34 +342,45 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     }
   }, [setBpm, setBeatOffset])
 
-  // Generate ruler time marks
+  // Generate ruler time marks.
+  //
+  // Both spacings come off the same 1-2-5 ladder, so marks stay in a readable
+  // pixel band at ANY zoom. The old fixed table bottomed out at "10s apart below
+  // 20px/sec" — at the minimum zoom (0.16 px/sec) that put marks 1.6px apart and
+  // built ~1500 DOM nodes for a solid grey bar — and topped out at 0.5s, so past
+  // ~300px/sec the labels were unreadably dense and every one of them read the
+  // same whole second.
   const generateRulerMarks = () => {
+    if (pxPerSec <= 0 || viewportWidth <= 0) return null
+    const minor = pickRulerStep(pxPerSec, 14) // tick only
+    let major = pickRulerStep(pxPerSec, 72)   // labelled, full-height
+    // The ladder isn't uniformly divisible (15 isn't a multiple of 2), and where
+    // it isn't, labels land only on the LCM of the two steps — e.g. every 30s on
+    // a 2s tick, so half the expected labels vanish. Round the labelled step up
+    // to an exact multiple of the tick step.
+    if (Math.abs(major / minor - Math.round(major / minor)) > 1e-6) {
+      major = Math.ceil(major / minor) * minor
+    }
+
+    const startIdx = Math.max(0, Math.floor((timelineScrollLeft / pxPerSec) / minor))
+    const endIdx = Math.ceil(((timelineScrollLeft + viewportWidth) / pxPerSec) / minor)
+
     const marks = []
-    // Determine spacing based on zoom
-    let interval = 1 // seconds between marks
-    if (pxPerSec < 20) interval = 10
-    else if (pxPerSec < 40) interval = 5
-    else if (pxPerSec < 80) interval = 2
-    else if (pxPerSec > 300) interval = 0.5
-
-    // Span the whole project (plus headroom), not a fixed 5 minutes, so long
-    // songs get ruler marks across their full length. Off-screen marks are
-    // skipped below, so this stays cheap regardless of duration.
-    const totalSeconds = Math.max(300, Math.ceil(projectDuration * 1.1))
-    for (let s = 0; s <= totalSeconds; s += interval) {
-      const x = s * pxPerSec
-      if (x < timelineScrollLeft - 100 || x > timelineScrollLeft + 2500) continue
-
-      const isMinor = (s * 10) % 50 !== 0
+    for (let i = startIdx; i <= endIdx; i++) {
+      // Indexed rather than accumulated (`t += minor`), which drifts on floats
+      // and made mark positions disagree with the beat grid over long timelines.
+      const t = i * minor
+      const ratio = t / major
+      const isMajor = Math.abs(ratio - Math.round(ratio)) < 1e-6
       marks.push(
         <div
-          key={s}
-          className={`timeline__ruler-mark ${isMinor ? '' : 'timeline__ruler-mark--major'}`}
-          style={{ left: x }}
+          key={i}
+          className={`timeline__ruler-mark ${isMajor ? 'timeline__ruler-mark--major' : ''}`}
+          style={{ left: t * pxPerSec }}
         >
-          {!isMinor && (
+          {isMajor && (
             <span className="timeline__ruler-label mono">
-              {formatTimecode(s)}
+              {formatTimecode(t, major)}
             </span>
           )}
         </div>
@@ -234,9 +393,13 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
   // Snap targets (seconds): other clips' edges, markers, in/out, playhead, 0.
   // Collected once at drag start; the beat grid is evaluated analytically in
   // applySnap so it never needs enumerating.
-  const collectSnapPoints = useCallback((excludeClipId = null) => {
+  // `includePlayhead` exists for the playhead's OWN drag: it is the thing being
+  // moved, so leaving it in the target list would snap it to itself and pin it
+  // in place. Every other caller wants it.
+  const collectSnapPoints = useCallback((excludeClipId = null, includePlayhead = true) => {
     const state = useTimelineStore.getState()
-    const pts = [0, useAppStore.getState().playheadTime]
+    const pts = [0]
+    if (includePlayhead) pts.push(useAppStore.getState().playheadTime)
     for (const c of state.clips) {
       if (c.id === excludeClipId) continue
       pts.push(c.timelineStart, c.timelineEnd)
@@ -267,6 +430,157 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     }
     return Math.max(0, best)
   }, [pxPerSec])
+
+  // ── Playhead scrubbing ──
+  // One gesture, two entry points. Pressing anywhere on the ruler jumps there
+  // and keeps dragging; pressing the playhead's own grab strip drags it WITHOUT
+  // jumping (the cursor keeps its offset from the line, so it doesn't teleport
+  // a few px the instant you touch it). Both land here so they can never drift
+  // apart, and so missing the ~10px arrow still gives you the drag you meant
+  // instead of a single jump.
+  const [scrubbing, setScrubbing] = useState(false)
+  const beginScrub = useCallback((e, grabHandle = false) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    e.stopPropagation()
+
+    const snapPoints = collectSnapPoints(null, false)
+
+    // Read the rect and scroll live rather than closing over them: the ruler can
+    // resize mid-drag, and the auto-scroll below moves the scroll under us.
+    const timeAt = (clientX, shiftKey, offsetPx) => {
+      const rect = rulerRef.current?.getBoundingClientRect()
+      if (!rect) return useAppStore.getState().playheadTime
+      const scroll = useTimelineStore.getState().timelineScrollLeft
+      const x = clientX + offsetPx - rect.left + scroll
+      return applySnap(Math.max(0, x / pxPerSec), snapPoints, shiftKey)
+    }
+
+    let grabOffset = 0
+    if (grabHandle) {
+      const rect = rulerRef.current?.getBoundingClientRect()
+      if (rect) {
+        const scroll = useTimelineStore.getState().timelineScrollLeft
+        const headX = rect.left + useAppStore.getState().playheadTime * pxPerSec - scroll
+        grabOffset = headX - e.clientX
+      }
+    } else {
+      setPlayheadTime(timeAt(e.clientX, e.shiftKey, 0))
+    }
+
+    setScrubbing(true)
+    document.body.classList.add('is-scrubbing')
+
+    // Auto-scroll while the drag sits near either edge, so the playhead can be
+    // taken past the visible window on a zoomed-in timeline — otherwise "drag it
+    // where I want" stops dead at the panel border.
+    const EDGE_PX = 32
+    const MAX_SCROLL_SPEED = 1200 // px/sec at full deflection
+    let pointer = { x: e.clientX, shift: e.shiftKey }
+    let prevT = 0
+    let raf = 0
+
+    const tick = (t) => {
+      raf = requestAnimationFrame(tick)
+      const dt = prevT ? Math.min(0.05, (t - prevT) / 1000) : 0
+      prevT = t
+      const rect = rulerRef.current?.getBoundingClientRect()
+      if (!rect || dt === 0) return
+
+      let push = 0
+      if (pointer.x > rect.right - EDGE_PX) push = (pointer.x - (rect.right - EDGE_PX)) / EDGE_PX
+      else if (pointer.x < rect.left + EDGE_PX) push = (pointer.x - (rect.left + EDGE_PX)) / EDGE_PX
+      if (push === 0) return
+
+      const speed = Math.max(-1, Math.min(1, push)) * MAX_SCROLL_SPEED
+      // Zustand `set` is synchronous, so the playhead below reads the new scroll.
+      // clampScrollLeft counts the playhead as content, so dragging past the last
+      // clip still lets the view follow instead of stopping at the content edge.
+      setTimelineScrollLeft(clampScrollLeft(useTimelineStore.getState().timelineScrollLeft + speed * dt))
+      setPlayheadTime(timeAt(pointer.x, pointer.shift, grabOffset))
+    }
+    raf = requestAnimationFrame(tick)
+
+    const onMove = (me) => {
+      pointer = { x: me.clientX, shift: me.shiftKey }
+      setPlayheadTime(timeAt(me.clientX, me.shiftKey, grabOffset))
+    }
+    const onUp = () => {
+      cancelAnimationFrame(raf)
+      setScrubbing(false)
+      document.body.classList.remove('is-scrubbing')
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [pxPerSec, setPlayheadTime, setTimelineScrollLeft, collectSnapPoints, applySnap, clampScrollLeft])
+
+  // A scrub that is still live when the panel unmounts (collapse, project load)
+  // would leave the body class stuck on and every cursor in the app wrong.
+  useEffect(() => () => document.body.classList.remove('is-scrubbing'), [])
+
+  const handlePlayheadGrab = useCallback((e) => beginScrub(e, true), [beginScrub])
+
+  // ── Track stacking order ──
+  // `tracks` is bottom-to-top: index 0 is the BACK of the picture, which is what
+  // the Renderer composites first (ascending zOrder). The panel renders it
+  // REVERSED so the top row is the FRONT layer, as in Premiere/Resolve. Only the
+  // view is flipped — the array stays the single source of truth, so no saved
+  // project's picture moves.
+  const displayTracks = useMemo(() => [...tracks].reverse(), [tracks])
+
+  // Drag a track header to restack. Reorders LIVE (rather than dropping a ghost
+  // at the end) so the picture updates as you drag and you can judge the
+  // composite while choosing where to land.
+  const [draggingTrackId, setDraggingTrackId] = useState(null)
+  const handleTrackHeaderMouseDown = useCallback((e, track) => {
+    if (e.button !== 0) return
+    // The M / S / L buttons live inside the header; a press on one must not arm
+    // a drag, or the row slides out from under the click.
+    if (e.target.closest('button')) return
+
+    selectTrack(track.id)
+
+    const startY = e.clientY
+    let dragging = false
+
+    const onMove = (me) => {
+      // 4px of slop, so a plain click still just selects the track.
+      if (!dragging) {
+        if (Math.abs(me.clientY - startY) < 4) return
+        dragging = true
+        setDraggingTrackId(track.id)
+        document.body.classList.add('is-reordering')
+      }
+
+      const area = tracksAreaRef.current
+      if (!area) return
+      const rect = area.getBoundingClientRect()
+      // Measure a real row rather than hard-coding 48px, so a CSS change to the
+      // track height can't silently desync the drop target from the picture.
+      const rowH = area.querySelector('.timeline__track')?.getBoundingClientRect().height || 48
+      const count = useTimelineStore.getState().tracks.length
+      if (!count || rowH <= 0) return
+
+      const row = Math.max(0, Math.min(count - 1,
+        Math.floor((me.clientY - rect.top + area.scrollTop) / rowH)))
+      // Display row → array index. The list is reversed, so this is the one
+      // conversion the whole feature hinges on.
+      moveTrackToIndex(track.id, count - 1 - row)
+    }
+
+    const onUp = () => {
+      setDraggingTrackId(null)
+      document.body.classList.remove('is-reordering')
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [selectTrack, moveTrackToIndex])
+
+  useEffect(() => () => document.body.classList.remove('is-reordering'), [])
 
   // Snap a moving clip by whichever of its two edges lands closest to a target.
   const snapClipStart = useCallback((start, duration, snapPoints, disable = false) => {
@@ -1114,14 +1428,14 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
           e.preventDefault(); handleZoomFit()
           break
 
-        // = / + — zoom in,  - / _ — zoom out
+        // = / + — zoom in,  - / _ — zoom out (anchored on the playhead)
         case 'Equal':
         case 'NumpadAdd':
-          e.preventDefault(); setTimelineZoom(timelineZoom * 1.25)
+          e.preventDefault(); zoomAtPlayhead(1.25)
           break
         case 'Minus':
         case 'NumpadSubtract':
-          e.preventDefault(); setTimelineZoom(timelineZoom * 0.8)
+          e.preventDefault(); zoomAtPlayhead(0.8)
           break
 
         // I / O — set In / Out points at the playhead
@@ -1141,6 +1455,15 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
           e.preventDefault(); addMarker(playhead)
           break
 
+        // ↑ / ↓ — restack the selected track one place. Up is toward the top
+        // row, which is the FRONT of the picture, hence +1 on the array index.
+        case 'ArrowUp':
+          if (selectedTrackId) { e.preventDefault(); moveTrackBy(selectedTrackId, +1) }
+          break
+        case 'ArrowDown':
+          if (selectedTrackId) { e.preventDefault(); moveTrackBy(selectedTrackId, -1) }
+          break
+
         // 1 / 2 — jump playhead to In / Out points
         case 'Numpad1':
         case 'Digit1':
@@ -1158,8 +1481,8 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     window.addEventListener('keydown', handleKey)
     return () => window.removeEventListener('keydown', handleKey)
   }, [selectedClipId, handleSplitAtPlayhead, handleDeleteClip, handleZoomFit,
-      timelineZoom, setTimelineZoom, setInPoint, setOutPoint, clearInOutPoints,
-      addMarker, inPoint, outPoint, setPlayheadTime])
+      zoomAtPlayhead, setInPoint, setOutPoint, clearInOutPoints,
+      addMarker, inPoint, outPoint, setPlayheadTime, selectedTrackId, moveTrackBy])
 
 
 
@@ -1235,7 +1558,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
             <div
               className="timeline__ruler"
               ref={rulerRef}
-              onClick={handleRulerClick}
+              onMouseDown={beginScrub}
             >
               <div className="timeline__ruler-marks" style={{ transform: `translateX(-${timelineScrollLeft}px)` }}>
                 {generateBeatLines()}
@@ -1282,8 +1605,13 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                   {marker.label && <span className="timeline__marker-label">{marker.label}</span>}
                 </div>
               ))}
-              {/* Playhead on ruler */}
-              <TimelinePlayhead pxPerSec={pxPerSec} timelineScrollLeft={timelineScrollLeft} />
+              {/* Playhead on ruler — draggable */}
+              <TimelinePlayhead
+                pxPerSec={pxPerSec}
+                timelineScrollLeft={timelineScrollLeft}
+                onGrab={handlePlayheadGrab}
+                scrubbing={scrubbing}
+              />
             </div>
           </div>
 
@@ -1302,16 +1630,23 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
                 <p>No tracks — click + to add a track</p>
               </div>
             )}
-            {tracks.map(track => {
+            {displayTracks.map(track => {
               const trackClips = clips.filter(c => c.trackId === track.id)
               return (
-                <div key={track.id} className="timeline__track" data-track-id={track.id} data-track-type={track.type}>
-                  {/* Track Header */}
+                <div
+                  key={track.id}
+                  className={`timeline__track${draggingTrackId === track.id ? ' timeline__track--dragging' : ''}${selectedTrackId === track.id ? ' timeline__track--selected' : ''}`}
+                  data-track-id={track.id}
+                  data-track-type={track.type}
+                >
+                  {/* Track Header — drag to restack (↑/↓ moves it one place) */}
                   <div
                     className="timeline__track-header"
                     style={{ borderLeftColor: track.color }}
-                    onClick={() => selectTrack(track.id)}
+                    onMouseDown={(e) => handleTrackHeaderMouseDown(e, track)}
+                    title={`${track.name} — drag to restack, ↑/↓ moves it one layer (higher rows render in front)`}
                   >
+                    <span className="timeline__track-grip" aria-hidden="true" />
                     <span className="timeline__track-name">{track.name}</span>
                     <div className="timeline__track-controls">
                       <button
@@ -1630,23 +1965,52 @@ function ClipWaveform({ clip, width, color }) {
   return <canvas ref={canvasRef} className="timeline__clip-waveform-canvas" />
 }
 
-function formatTimecode(seconds) {
-  const m = Math.floor(seconds / 60)
-  const s = Math.floor(seconds % 60)
-  return `${m}:${String(s).padStart(2, '0')}`
+/**
+ * m:ss, with sub-second precision only when the caller says the context is that
+ * fine (`step` = the ruler's label spacing). Zoomed past ~1s per label, every
+ * mark used to print the same whole second.
+ *
+ * Truncates rather than rounds — `toFixed(0)` on 59.7 gives "60", i.e. "1:60".
+ */
+function formatTimecode(seconds, step = 1) {
+  const neg = seconds < 0
+  const abs = Math.abs(seconds) + 1e-6 // absorb i*step float drift
+  const decimals = step >= 1 ? 0 : step >= 0.1 ? 1 : 2
+  const p = Math.pow(10, decimals)
+  const m = Math.floor(abs / 60)
+  const rest = Math.floor((abs - m * 60) * p) / p
+  const width = decimals ? 3 + decimals : 2
+  return `${neg ? '-' : ''}${m}:${rest.toFixed(decimals).padStart(width, '0')}`
 }
 
-function TimelinePlayhead({ pxPerSec, timelineScrollLeft }) {
+/**
+ * Playhead head on the ruler. The marker itself is a zero-width div whose arrow
+ * and stem are pseudo-elements — about 10×6px of hit area, which is not a
+ * draggable thing — so the interactive part is an explicit grab strip child.
+ * The marker is `pointer-events: none` and only the strip is `auto`, which also
+ * stops the arrow from silently swallowing ruler presses next to it.
+ */
+function TimelinePlayhead({ pxPerSec, timelineScrollLeft, onGrab, scrubbing }) {
   const playheadTime = useAppStore(s => s.playheadTime)
   const playheadX = playheadTime * pxPerSec
   return (
     <div
-      className="timeline__playhead-marker"
+      className={`timeline__playhead-marker${scrubbing ? ' timeline__playhead-marker--dragging' : ''}`}
       style={{ left: `${playheadX - timelineScrollLeft}px` }}
-    />
+    >
+      <div
+        className="timeline__playhead-grab"
+        onMouseDown={onGrab}
+        title="Drag to scrub — Shift bypasses snapping"
+      />
+    </div>
   )
 }
 
+// The line across the tracks stays non-interactive on purpose: a grab strip here
+// would sit on top of clips wherever the playhead crosses one and steal their
+// drag/select presses. The ruler above is the scrub surface (as in Premiere and
+// Resolve).
 function TimelinePlayheadLine({ pxPerSec, timelineScrollLeft, trackHeaderWidth }) {
   const playheadTime = useAppStore(s => s.playheadTime)
   const playheadX = playheadTime * pxPerSec

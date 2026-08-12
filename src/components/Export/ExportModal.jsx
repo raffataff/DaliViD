@@ -16,7 +16,21 @@ import {
   EDGE_HEAD, getEdgeTransition, findPrevOverlap, findNextOverlap,
   clipEdgeState, clipEnvelopeGain,
 } from '../../utils/clipTransitions'
+import { ensureFontsReady } from '../../utils/fontRegistry'
+import { collectUsedFontValues } from '../../utils/fontUsage'
 import './ExportModal.css'
+
+/**
+ * Wait for every typeface this project uses to be usable.
+ *
+ * Reads the stores directly rather than through hooks: this runs inside an
+ * export handler, not a render, and it wants the state as it is at the moment
+ * the user pressed the button.
+ */
+async function ensureProjectFontsReady() {
+  const values = collectUsedFontValues(useGraphStore.getState(), useTimelineStore.getState())
+  if (values.length) await ensureFontsReady(values)
+}
 
 /**
  * Render timeline audio to a single AudioBuffer using an OfflineAudioContext.
@@ -391,6 +405,42 @@ const AUDIO_SAMPLE_RATE_OPUS = 48000
 // it; Safari does not (it wants HEVC-with-alpha, which no browser will encode).
 const VP9_ALPHA_CODEC = 'vp09.00.10.08'
 
+/**
+ * Target video bitrate in bits/second.
+ *
+ * This used to be the constant `quality * 10 Mbps`, which ignored resolution and
+ * frame rate entirely: a 4K60 export was handed the same budget as 720p30, i.e.
+ * about a twelfth of the bits per pixel. That is precisely the regime where
+ * H.264 rings around high-contrast edges, so hard-edged content — text above
+ * all — stopped looking rasterized and started looking chewed, no matter how
+ * clean the frame the renderer produced. Bits are spent per pixel per second, so
+ * the budget has to be counted that way too.
+ *
+ * `quality` maps onto bits per pixel per frame. 0.1 is the usual "visually
+ * clean H.264" figure; the range either side gives the slider somewhere useful
+ * to go. The default (0.9 → ~0.139 bpp) is chosen to land near the old 9 Mbps at
+ * 1080p30, so existing habits about the slider still hold at the common size and
+ * only the scaling changes.
+ *
+ * VP9 is roughly 30% more efficient than H.264 at equal quality, but the alpha
+ * path is also carrying a second plane; the two approximately cancel, so both
+ * use the same budget.
+ *
+ * @param {number} width
+ * @param {number} height
+ * @param {number} fps
+ * @param {number} quality — 0.1 … 1 from the modal's slider
+ * @returns {number} bits per second, integer
+ */
+function targetBitrate(width, height, fps, quality) {
+  const bpp = 0.04 + Math.max(0, Math.min(1, quality)) * 0.11   // 0.04 … 0.15
+  const raw = Math.max(1, width) * Math.max(1, height) * Math.max(1, fps) * bpp
+  // Floor: a tiny or low-fps export still needs enough bits to not fall apart.
+  // Ceiling: past this, hardware encoders start rejecting the config outright,
+  // which would surface as a failed export rather than a large file.
+  return Math.round(Math.min(Math.max(raw, 2_000_000), 200_000_000))
+}
+
 // Single source of truth for the codec dropdown AND the branching below.
 // `webCodecs` = frame-locked VideoEncoder path (deterministic, audio muxed in);
 // false = the legacy real-time MediaRecorder path.
@@ -442,9 +492,13 @@ export default function ExportModal() {
 
   if (!exportModalOpen) return null
 
-  const handleExportFrame = () => {
+  const handleExportFrame = async () => {
     const canvas = document.getElementById('preview-canvas')
     if (!canvas) return
+
+    // Same reason as the video path below: a still captured while a webfont was
+    // still in flight would be written out in a fallback typeface.
+    await ensureProjectFontsReady()
 
     // Capture the final OUTPUT, not a live preview tap. Render one clean frame
     // with the tap suppressed, then restore so the on-screen preview is unaffected.
@@ -553,6 +607,14 @@ export default function ExportModal() {
     setIsExporting(true)
     setProgress(0)
     exportActiveRef.current = true
+
+    // Canvas 2D never waits for a font: a text raster drawn before its face has
+    // downloaded is silently drawn in a fallback. In the preview that self-heals
+    // a frame later, but an export writes the mistake to a file the user has no
+    // reason to re-check — and a font landing mid-render would change the
+    // typeface partway through the video. So block here, once, before frame one.
+    await ensureProjectFontsReady()
+
     // Exports must always come from the OUTPUT node — never a live preview tap.
     renderer.previewTapEnabled = false
 
@@ -588,13 +650,18 @@ export default function ExportModal() {
           : ['avc1.4d0034' /* Main */, 'avc1.64002a' /* High */, 'avc1.42001f' /* Baseline */]
         let selectedCodecString = configsToTry[0]
 
+        // One budget for the probe AND the real configure() below — they must
+        // agree, or a bitrate the encoder accepted in the probe is not the one
+        // it is later asked for.
+        const videoBitrate = targetBitrate(exportWidth, exportHeight, exportFps, quality)
+
         let supportedConfig = null
         for (const testCodec of configsToTry) {
           const testConfig = {
             codec: testCodec,
             width: exportWidth,
             height: exportHeight,
-            bitrate: Math.round(quality * 10000000),
+            bitrate: videoBitrate,
             framerate: exportFps,
             ...(codecInfo.alpha ? { alpha: 'keep' } : {}),
           }
@@ -706,7 +773,7 @@ export default function ExportModal() {
           codec: selectedCodecString,
           width: exportWidth,
           height: exportHeight,
-          bitrate: Math.round(quality * 10000000),
+          bitrate: videoBitrate,
           framerate: exportFps,
           ...(codecInfo.alpha
             ? { alpha: 'keep' }
@@ -944,7 +1011,7 @@ export default function ExportModal() {
 
         const recorder = new MediaRecorder(stream, {
           mimeType: MediaRecorder.isTypeSupported(mimeType) ? mimeType : 'video/webm',
-          videoBitsPerSecond: Math.round(quality * 10000000),
+          videoBitsPerSecond: targetBitrate(exportWidth, exportHeight, exportFps, quality),
         })
 
         const chunks = []
@@ -1087,7 +1154,12 @@ export default function ExportModal() {
                 <div className="export-modal__slider-row">
                   <input type="range" min={0.1} max={1} step={0.05} value={quality}
                     onChange={(e) => setQuality(parseFloat(e.target.value))} disabled={isExporting} />
-                  <span className="mono">{Math.round(quality * 100)}%</span>
+                  {/* The percentage alone says nothing about whether this size
+                      and frame rate are actually being paid for — which is the
+                      only question the slider answers. Show the real number. */}
+                  <span className="mono">
+                    {Math.round(quality * 100)}% · {(targetBitrate(exportWidth, exportHeight, exportFps, quality) / 1e6).toFixed(1)} Mb/s
+                  </span>
                 </div>
               </div>
               <div className="export-modal__field">

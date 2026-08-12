@@ -7,12 +7,15 @@
 import { get as idbGet, set as idbSet, del as idbDel, keys as idbKeys } from 'idb-keyval'
 import useAppStore from '../store/useAppStore.js'
 import useGraphStore from '../store/useGraphStore.js'
-import useTimelineStore from '../store/useTimelineStore.js'
+import useTimelineStore, { restoreTrackOrder } from '../store/useTimelineStore.js'
 import { STARTER_TRANSITION_COMPOUND } from '../shaders/compoundPresets.js'
 import { clearDetectedAlpha } from '../gl/alphaRegistry.js'
 import { resetTransitionStatus } from '../gl/transitionStatus.js'
 import { migrateTimeNodeParams } from '../shaders/dataNodeParams.js'
 import { clearHistory } from './history.js'
+import { serializeCustomFontRefs, embedCustomFontData, restoreCustomFonts } from './fontRegistry.js'
+import { collectUsedFontValues } from './fontUsage.js'
+import { addToast } from '../components/common/Toast.jsx'
 
 const PROJECT_PREFIX = 'dalivid_project_'
 const AUTOSAVE_KEY = 'dalivid_autosave'
@@ -229,6 +232,14 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
       })),
     },
 
+    // Metadata for the user-added fonts this project references — deliberately
+    // NOT the font binaries. This object is rewritten by autosave on a debounce
+    // as the user types, and a font is megabytes; the bytes live under their own
+    // IndexedDB keys and are only inlined by exportProjectAsJSON, which runs
+    // once when the user asks for a file. Restricting the list to fonts actually
+    // in use also keeps one project from carrying someone's whole font library.
+    fonts: serializeCustomFontRefs(collectUsedFontValues(graph, timeline)),
+
     ui: {
       graphLevel: app.graphLevel,
       graphClipId: app.graphClipId,
@@ -265,6 +276,23 @@ export function deserializeProject(data, getAppStore) {
   // nothing and stops a stale warning outliving the thing it described.
   resetTransitionStatus()
 
+  // Re-register the project's custom fonts. Deliberately not awaited: a project
+  // must open at once, and text that is briefly drawn in a fallback corrects
+  // itself as each face lands (the font's load state is part of the text raster
+  // signature, so the renderer redraws it on the next frame).
+  if (data.fonts?.length) {
+    restoreCustomFonts(data.fonts).then(({ missing }) => {
+      if (!missing.length) return
+      addToast({
+        message: missing.length === 1
+          ? `This project uses the font "${missing[0]}", which isn't on this machine. Add the font file in Media Pool → Fonts to restore it.`
+          : `${missing.length} fonts used by this project aren't on this machine. Add them in Media Pool → Fonts to restore them.`,
+        type: 'warning',
+        duration: 8000,
+      })
+    })
+  }
+
   // Restore project settings
   if (data.project) {
     app.setProjectSettings({
@@ -291,7 +319,11 @@ export function deserializeProject(data, getAppStore) {
   // Restore timeline — need to set state directly via Zustand
   if (data.timeline) {
     useTimelineStore.setState({
-      tracks: data.timeline.tracks || [],
+      // Rebuilt from the saved zOrders so index == zOrder, which the panel's
+      // reversed row order now depends on. Sorting by zOrder (rather than
+      // trusting array order) is what guarantees a legacy project still renders
+      // exactly as it did — see restoreTrackOrder.
+      tracks: restoreTrackOrder(data.timeline.tracks || []),
       // Two migrations, both of which keep older projects rendering identically:
       //
       // 1. clip blendMode 'Normal' used to mean "fall back to the track's mode" —
@@ -476,6 +508,13 @@ export async function exportProjectAsJSON(getAppStore, getGraphStore, getTimelin
   }
 
   const data = serializeProject(getAppStore, getGraphStore, getTimelineStore)
+
+  // A downloaded project file is the copy that leaves this machine, so it is the
+  // one that has to carry its fonts. Saves to IndexedDB skip this — the bytes
+  // are already there under their own keys, and re-encoding them into base64 on
+  // every autosave would be the single most expensive thing the editor does.
+  if (data.fonts?.length) data.fonts = await embedCustomFontData(data.fonts)
+
   const json = JSON.stringify(data, null, 2)
 
   if (fileHandle) {

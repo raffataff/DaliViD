@@ -1,0 +1,201 @@
+/* ═══════════════════════════════════════════════════════════
+   DaliVid — Font Browser Modal
+   Shared by "fonts on this computer" and "Google Fonts": the
+   sources differ, the outcome (an embedded project font) does not.
+   ═══════════════════════════════════════════════════════════ */
+
+.font-browser__overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+}
+
+.font-browser {
+  width: 540px;
+  max-width: calc(100vw - 32px);
+  max-height: min(720px, calc(100vh - 64px));
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+.font-browser__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-md) var(--space-lg);
+  border-bottom: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+}
+.font-browser__header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.font-browser__close {
+  display: flex;
+  padding: 4px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.font-browser__close:hover { color: var(--text-primary); background: var(--bg-hover); }
+
+.font-browser__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-lg);
+  overflow-y: auto;
+}
+
+.font-browser__note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+/* The permission ask gets its own breathing room — it's a decision, not a step
+   to click past, and the explanation above it is the point. */
+.font-browser__gate {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding: var(--space-md) 0;
+}
+
+.font-browser__primary {
+  padding: 8px var(--space-lg);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bg-base);
+  background: var(--accent-cyan);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--duration-fast);
+}
+.font-browser__primary:hover:not(:disabled) { background: var(--accent-cyan-dim); }
+.font-browser__primary:disabled { opacity: 0.45; cursor: default; }
+
+.font-browser__search {
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+.font-browser__search:focus { outline: none; border-color: var(--accent-cyan); }
+
+.font-browser__error {
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--status-warning);
+  background: rgba(255, 170, 0, 0.08);
+  border: 1px solid rgba(255, 170, 0, 0.3);
+  border-radius: var(--radius-sm);
+}
+
+.font-browser__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+}
+
+.font-browser__family {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  padding: 5px 6px;
+  border-radius: var(--radius-sm);
+}
+.font-browser__family:hover { background: var(--bg-hover); }
+
+/* Installed fonts are already available to CSS, so the name can be set in
+   itself with no loading step. */
+.font-browser__family-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 17px;
+  line-height: 1.3;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* One button per cut, so "Bold Italic" is a single click rather than a font
+   picked and then a weight guessed at. */
+.font-browser__faces {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  justify-content: flex-end;
+  flex: 0 0 auto;
+  max-width: 55%;
+}
+.font-browser__face {
+  padding: 2px 7px;
+  font-size: 10px;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.font-browser__face:hover:not(:disabled) {
+  color: var(--bg-base);
+  background: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+}
+.font-browser__face:disabled { opacity: 0.4; cursor: default; }
+
+.font-browser__group {
+  margin-top: var(--space-sm);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-muted);
+}
+
+.font-browser__chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.font-browser__chip {
+  padding: 4px 9px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.font-browser__chip:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--accent-cyan);
+}
+.font-browser__chip:disabled { opacity: 0.4; cursor: default; }
+
+.font-browser__empty,
+.font-browser__truncated {
+  padding: var(--space-sm) 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}

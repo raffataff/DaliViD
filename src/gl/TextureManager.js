@@ -85,10 +85,23 @@ export class TextureManager {
 
   /**
    * Upload a video/camera frame to an existing texture via texSubImage2D.
+   *
+   * `premultiply` exists because a texture that will be MINIFIED cannot be
+   * stored straight. Bilinear filtering is a weighted sum of texels, and a
+   * weighted sum of RGBA is only meaningful when the colour is already scaled
+   * by its own coverage: averaging straight (1,1,1,1) with (0,0,0,0) gives
+   * (0.5,0.5,0.5,0.5), which composites at HALF the brightness half-coverage
+   * white should have. Every antialiased edge in the source therefore comes out
+   * darker and harder than it went in — which is what wrecked supersampled text
+   * (see Renderer.renderTextNode). Premultiplied, the same average is exactly
+   * right. The consumer is responsible for dividing the alpha back out if it
+   * needs the pipeline's straight-alpha convention.
+   *
    * @param {string} id — texture id
    * @param {HTMLVideoElement|HTMLCanvasElement|ImageBitmap} source
+   * @param {boolean} [premultiply=false] — store premultiplied (filterable) alpha
    */
-  uploadVideoFrame(id, source) {
+  uploadVideoFrame(id, source, premultiply = false) {
     const gl = this.gl
     const entry = this.textures.get(id)
     if (!entry) return
@@ -108,14 +121,15 @@ export class TextureManager {
 
     // HTML elements are top-down, WebGL expects bottom-up
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true)
-    // Ask for STRAIGHT (unassociated) alpha. This was previously left at
+    // Default is STRAIGHT (unassociated) alpha. This was previously left at
     // whatever the context default happened to be, which only ever mattered
     // once alpha video became a supported source — an opaque frame is identical
     // either way. Setting it explicitly makes the upload deterministic; how the
     // resulting values are INTERPRETED is then decided per clip by the alpha
     // pass in Renderer._renderClipToFBO (see utils/alphaModes), because browsers
-    // do not agree on whether they honour this hint for <video>.
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
+    // do not agree on whether they honour this hint for <video>. Callers that
+    // will filter the result opt into premultiplied instead.
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !!premultiply)
 
     if (entry.width === sourceWidth && entry.height === sourceHeight) {
       gl.texSubImage2D(

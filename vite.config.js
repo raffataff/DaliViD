@@ -17,7 +17,29 @@ import react from '@vitejs/plugin-react'
  * - frame-ancestors is deliberately absent: it is ignored in a <meta> CSP and
  *   would only log a console warning. Clickjacking cover needs a real header,
  *   which GitHub Pages cannot set.
+ *
+ * ── The one exception to "never talks to another origin" ──
+ * GOOGLE_FONTS_ORIGINS widens connect-src by exactly two hosts so the Google
+ * Fonts importer (src/utils/googleFonts.js) can fetch a family the user asked
+ * for by name. This is a real, if narrow, softening of the paragraph above, and
+ * is worth understanding before keeping it:
+ *
+ *   • connect-src only. font-src stays 'self' data: because the woff2 is fetched
+ *     as bytes and registered through FontFace — a Google stylesheet never
+ *     enters the render path, so there is no per-visit request and no per-visit
+ *     IP leak. That is the distinction from the @import this project removed.
+ *   • Two named hosts, not a wildcard. An injected script gains the ability to
+ *     encode data into a URL aimed at fonts.gstatic.com and nothing more;
+ *     exfiltration to an attacker-controlled origin is still blocked.
+ *   • Fetched fonts are stored in the project, so a family is downloaded once
+ *     ever rather than once per session, and the app still works offline.
+ *
+ * To drop the feature and restore the original policy: remove
+ * GOOGLE_FONTS_ORIGINS from connect-src below, delete src/utils/googleFonts.js,
+ * and remove the "Google Fonts…" buttons from FontPicker and FontsTab.
  */
+const GOOGLE_FONTS_ORIGINS = 'https://fonts.googleapis.com https://fonts.gstatic.com'
+
 const CSP = [
   "default-src 'self'",
   "script-src 'self'",
@@ -26,7 +48,7 @@ const CSP = [
   "font-src 'self' data:",
   "img-src 'self' blob: data:",
   "media-src 'self' blob: data:",
-  "connect-src 'self' blob: data:",
+  `connect-src 'self' blob: data: ${GOOGLE_FONTS_ORIGINS}`,
   "object-src 'none'",
   "base-uri 'self'",
   "form-action 'none'",

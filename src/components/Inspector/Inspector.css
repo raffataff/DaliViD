@@ -208,6 +208,23 @@
   color: var(--text-primary);
   border-color: var(--border-strong);
 }
+/* Square nudge button (track layer ▲/▼) — `.inspector__btn` is full-width by
+   default, which would push the readout onto its own line. */
+.inspector__btn--icon {
+  width: 22px;
+  min-width: 22px;
+  padding: 2px 0;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.inspector__btn--icon:disabled {
+  opacity: 0.35;
+  cursor: default;
+  background: var(--bg-hover);
+  color: var(--text-disabled);
+  border-color: var(--border-default);
+}
+
 .inspector__btn--primary {
   background: rgba(0, 229, 255, 0.1);
   border-color: rgba(0, 229, 255, 0.3);
@@ -237,3 +254,17 @@
   font-size: 12px;
 }
 
+
+/* ── Inline advisory under a field ──
+   For facts the control itself can't express: a synthesized italic, a font the
+   project references but this machine doesn't have. Deliberately quiet — it is
+   information, not an error. */
+.inspector__hint {
+  margin: -2px 0 2px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+.inspector__hint--warn {
+  color: var(--status-warning);
+}

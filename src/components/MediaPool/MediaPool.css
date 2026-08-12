@@ -461,3 +461,104 @@
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
 }
+
+/* ═══════════════════════════════════════════════════════════
+   Fonts Tab
+   Every row is drawn in its own typeface — the only property of
+   a font that actually matters when you are choosing one.
+   ═══════════════════════════════════════════════════════════ */
+
+/* The drop target is the whole panel, not a dashed rectangle inside it: a font
+   file is a thing you throw at the tab, and hunting for a small target first is
+   friction with no purpose. min-height keeps it a target even when empty. */
+.media-pool__font-drop {
+  position: relative;
+  min-height: 100%;
+  border-radius: var(--radius-sm);
+  transition: background var(--duration-fast), box-shadow var(--duration-fast);
+}
+.media-pool__font-drop--over {
+  background: rgba(0, 229, 255, 0.06);
+  box-shadow: inset 0 0 0 1px var(--accent-cyan);
+}
+
+.media-pool__font-group {
+  margin: var(--space-sm) 0 var(--space-xs);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-muted);
+}
+
+/* "Ag" in the face itself — an ascender, a descender and a bowl, which is about
+   the smallest sample that still tells two grotesques apart. */
+.media-pool__font-thumb {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 19px;
+  line-height: 1;
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border-radius: var(--radius-sm);
+}
+
+.media-pool__font-name {
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+/* Kept quiet until the row is hovered: removing a font is destructive, and a
+   permanently visible × invites the accident. */
+.media-pool__font-remove {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity var(--duration-fast), color var(--duration-fast);
+}
+.media-pool__file-item:hover .media-pool__font-remove {
+  opacity: 1;
+}
+.media-pool__font-remove:hover {
+  color: var(--status-error);
+  background: var(--bg-active);
+}
+
+/* Secondary font sources, under the primary "+ Add Fonts" button. Same weight
+   as each other because none of the three is the "real" way in. */
+.media-pool__font-sources {
+  display: flex;
+  gap: var(--space-xs);
+  margin-bottom: var(--space-sm);
+}
+.media-pool__font-source {
+  flex: 1 1 0;
+  padding: 5px 6px;
+  font-size: 10px;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.media-pool__font-source:hover {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  background: var(--bg-active);
+}

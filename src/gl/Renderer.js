@@ -182,6 +182,38 @@ void main() {
 const TR_PREMUL_FBO = '__tr_premul'
 const TR_STRAIGHT_FBO = '__tr_straight'
 
+// The node-graph transition's equivalent of TRANSITION_FOOTER, and the reason it
+// has to exist: a region's output REPLACES what has been composited so far, it
+// does not layer over it.
+//
+// The graph path used to hand its result to _compositeTrack as an ordinary
+// blend layer over the accumulator — but the accumulator is one of the two
+// things the graph just mixed (FROM, on a head). Compositing the mix back over
+// its own input double-counts that side, so wherever the result is not fully
+// opaque the un-transitioned outgoing clip keeps showing through at full
+// strength for the whole region and only disappears when the region ends. On
+// opaque footage the two are identical (alpha 1 occludes the base completely),
+// which is exactly why it survived: it only shows up on images/video that carry
+// an alpha channel or don't fill the frame.
+//
+// So this mirrors the built-in footer exactly: premultiply the graph's STRAIGHT
+// result (the accumulator it is written into is premultiplied), then fall back
+// toward the backdrop by the clip's opacity.
+const TRANSITION_RESOLVE_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;   // the graph's result — STRAIGHT alpha
+uniform sampler2D u_backdrop;  // what is behind the region — PREMULTIPLIED
+uniform float u_opacity;       // clip × track opacity
+out vec4 fragColor;
+void main() {
+  vec4 r = texture(u_texture, v_uv);
+  vec4 backC = texture(u_backdrop, v_uv);
+  vec4 rp = vec4(r.rgb * r.a, r.a);
+  fragColor = mix(backC, rp, clamp(u_opacity, 0.0, 1.0));
+}
+`
+
 // Composite shader — blends source over destination with blend mode
 const COMPOSITE_FS = `#version 300 es
 precision highp float;
@@ -434,6 +466,8 @@ export class Renderer {
     this.unpremultiplyProgram = createShaderProgram(this.gl, UNPREMULTIPLY_FS)
     // Straight → premultiplied, for the transition compositor's two inputs.
     this.premultiplyProgram = createShaderProgram(this.gl, PREMULTIPLY_FS)
+    // Node-graph transitions' write-back pass — the peer of TRANSITION_FOOTER.
+    this.transitionResolveProgram = createShaderProgram(this.gl, TRANSITION_RESOLVE_FS)
 
     // Image source program — the IMAGE_INPUT shader (fit/transform/reactive).
     // Single source of truth: the same registry shader the node card parses for
@@ -516,7 +550,14 @@ export class Renderer {
       }
 
       this.textures.create(texId, uw, uh)
-      this.textures.uploadVideoFrame(texId, uploadSource) // handles HTMLImageElement/Canvas
+      // PREMULTIPLIED, for the same reason as the text raster: IMAGE_INPUT's
+      // Fit / Scale / Tile all RESAMPLE this texture, and a filtered sum of
+      // straight RGBA weights a transparent texel's colour as heavily as an
+      // opaque one's — so a PNG cutout lost intensity along every soft edge and
+      // picked up a dark fringe. IMAGE_INPUT divides the alpha back out, so the
+      // pipeline still receives straight alpha. An opaque image is unaffected
+      // either way, which is why this never showed on photographic content.
+      this.textures.uploadVideoFrame(texId, uploadSource, true) // handles HTMLImageElement/Canvas
       entry.uploadedSrc = src
       entry.texWidth = uw
       entry.texHeight = uh
@@ -573,7 +614,19 @@ export class Renderer {
       // Re-create on any change: the canvas size tracks the output resolution.
       if (tex) this.textures.delete(texId)
       this.textures.create(texId, entry.canvas.width, entry.canvas.height)
-      this.textures.uploadVideoFrame(texId, entry.canvas) // handles HTMLCanvasElement
+      // PREMULTIPLIED, and that is the whole point of the supersample above.
+      // The 2× raster is resolved by one bilinear tap in TEXT_INPUT, i.e. a
+      // weighted sum of texels — and a weighted sum of RGBA is only correct
+      // when colour is already scaled by its own coverage. Uploaded straight
+      // (as this used to be), averaging an opaque white texel with a
+      // transparent one yielded half-grey at half alpha instead of white at
+      // half alpha, so every antialiased glyph edge came out at HALF the
+      // intensity it should have. The supersample wasn't merely wasted, it was
+      // eroding the edges it existed to smooth — which is why exported text
+      // looked stair-stepped while the CSS-downscaled preview hid it.
+      // TEXT_INPUT divides the alpha back out, so the pipeline still receives
+      // its usual straight alpha.
+      this.textures.uploadVideoFrame(texId, entry.canvas, true) // handles HTMLCanvasElement
       entry.uploadedSignature = entry.signature
       tex = this.textures.getTexture(texId)
     }
@@ -2211,8 +2264,10 @@ export class Renderer {
     //     lerp toward u_backdrop then interpolates two premultiplied values,
     //     which is valid.
     //   node graph → both STRAIGHT. Its interior is ordinary effect shaders
-    //     (straight, like every other graph in the app) and its result is handed
-    //     to _compositeTrack as the *blend* side, which is the straight one.
+    //     (straight, like every other graph in the app), so its result comes
+    //     back straight and is converted once on the way into the accumulator
+    //     by TRANSITION_RESOLVE_FS — which is also where its opacity fallback
+    //     lives, so both paths write the region's output the same way.
     //
     // On a head, fromFBOId === baseFBOId (and on a tail, toFBOId === baseFBOId).
     // Only the clip side is ever converted for the built-in path, so u_backdrop
@@ -2428,8 +2483,55 @@ export class Renderer {
     }
 
     if (!cached.errors?.length) setTransitionStatus(statusKey, true)
-    this._compositeTrack(baseFBOId, destFBOId, resultFBO, 0 /* Normal */, opacity)
+    // REPLACES the accumulator, exactly like the built-in path — see
+    // TRANSITION_RESOLVE_FS for why layering it over the accumulator instead
+    // left the outgoing clip on screen for the whole region.
+    this._writeTransitionResult(baseFBOId, destFBOId, resultFBO, opacity)
     return true
+  }
+
+  /**
+   * Write a node-graph transition's result into the accumulator.
+   *
+   * The peer of the built-in path's TRANSITION_FOOTER, and it has to be a peer
+   * rather than a plain composite: a transition OWNS its window, so its output
+   * replaces what was composited so far. Layering it over the accumulator
+   * double-counts the FROM side (on a head the accumulator IS u_from), which is
+   * invisible on opaque footage and shows up on anything with alpha as the
+   * outgoing clip refusing to leave until the region ends.
+   *
+   * Also the one place the graph's STRAIGHT output becomes PREMULTIPLIED, which
+   * is what the accumulator holds.
+   *
+   * @param {string} baseFBOId   — the accumulator as it stands (the backdrop)
+   * @param {string} destFBOId   — destination (must differ from base & result)
+   * @param {string} resultFBOId — the graph's output, straight alpha
+   * @param {number} opacity     — 0..1 effective clip × track opacity
+   */
+  _writeTransitionResult(baseFBOId, destFBOId, resultFBOId, opacity) {
+    const gl = this.gl
+    const prog = this.transitionResolveProgram
+    // Degrading to the old over-composite keeps a slightly wrong picture rather
+    // than dropping the transition to a hard cut, which is the worse failure.
+    if (!prog?.program) {
+      this._compositeTrack(baseFBOId, destFBOId, resultFBOId, 0 /* Normal */, opacity)
+      return
+    }
+
+    this.fbos.bind(destFBOId)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    gl.useProgram(prog.program)
+    const locs = prog.uniformLocations
+    this.fbos.bindTexture(resultFBOId, 0)
+    if (locs.u_texture != null) gl.uniform1i(locs.u_texture, 0)
+    this.fbos.bindTexture(baseFBOId, 1)
+    if (locs.u_backdrop != null) gl.uniform1i(locs.u_backdrop, 1)
+    if (locs.u_opacity != null) gl.uniform1f(locs.u_opacity, opacity)
+    this.drawQuad()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
   }
 
   /**

@@ -1,14 +1,15 @@
 /**
  * DaliVid — paramParser.js
  * Parses @param directives from GLSL comments into slider config objects.
- * Also parses @audiobind directives for default audio bindings.
+ * Also parses @audiobind directives for default audio bindings and @showif
+ * directives for conditional control visibility.
  */
 
 /**
- * Parse all @param and @audiobind directives from a GLSL source string.
+ * Parse all @param, @audiobind and @showif directives from a GLSL source string.
  * @param {string} source — full GLSL shader source
  * @returns {Array<ParamConfig>}
- * 
+ *
  * ParamConfig: {
  *   name: string,           // display label
  *   uniformName: string,    // GLSL uniform name
@@ -20,6 +21,7 @@
  *   step: number,
  *   options: string[],      // for type=select
  *   audioBind: object|null, // { band, multiplier, offset }
+ *   showIf: object|null,    // { param, equals } | { param, notEquals }
  * }
  */
 export function parseParams(source) {
@@ -29,6 +31,7 @@ export function parseParams(source) {
   const params = []
   let pendingParam = null
   let pendingAudioBind = null
+  let pendingShowIf = null
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim()
@@ -48,6 +51,13 @@ export function parseParams(source) {
       continue
     }
 
+    // Check for @showif directive — conditional visibility for this control.
+    const showIfMatch = line.match(/\/\/\s*@showif\s+(.+)/)
+    if (showIfMatch) {
+      pendingShowIf = parseShowIfDirective(showIfMatch[1])
+      continue
+    }
+
     // Check for uniform declaration
     const uniformMatch = line.match(/uniform\s+(float|int|bool|vec2|vec3|vec4)\s+(u_\w+)\s*;/)
     if (uniformMatch && pendingParam) {
@@ -57,22 +67,68 @@ export function parseParams(source) {
       const config = buildParamConfig(pendingParam, uniformType, uniformName)
       if (config) {
         config.audioBind = pendingAudioBind || null
+        // Only attach a real rule — `visibleDataParams` fast-paths on
+        // `configs.some(c => c.showIf)`, so a null here keeps every existing
+        // shader on the zero-allocation path.
+        if (pendingShowIf) config.showIf = pendingShowIf
         config.lineNumber = i + 1
         params.push(config)
       }
 
       pendingParam = null
       pendingAudioBind = null
+      pendingShowIf = null
     } else if (!line.startsWith('//') && line.length > 0) {
       // Non-comment, non-empty line clears pending directives
       if (!uniformMatch) {
         pendingParam = null
         pendingAudioBind = null
+        pendingShowIf = null
       }
     }
   }
 
   return params
+}
+
+/**
+ * Parse a @showif directive into the `{ param, equals }` / `{ param, notEquals }`
+ * shape `isParamVisible` (dataNodeParams.js) already understands, so a GLSL
+ * control gets the same conditional visibility the shaderless nodes have had.
+ *
+ *   // @showif u_ar_mode == Radial
+ *   // @showif u_ar_mode == Grid,Chain      (comma = any of)
+ *   // @showif u_ar_mode != Grid
+ *   // @showif u_ar_orient == true
+ *
+ * The left side is the *uniform name* of a sibling param, because that is what
+ * `isParamVisible` matches on. Selects compare by LABEL (it normalises a stored
+ * index through the referenced config's option list first) and checkboxes by
+ * boolean, which is why 'true'/'false' are coerced here. A numeric operand is
+ * emitted in BOTH forms — a select label can legitimately be "3" — so the
+ * comparison lands whichever way the value happens to be stored.
+ *
+ * Returns null for anything unparseable: a typo must not hide the control it
+ * was meant to reveal.
+ */
+function parseShowIfDirective(directiveStr) {
+  const m = directiveStr.match(/^\s*(u_\w+)\s*(==|!=)\s*(.+?)\s*$/)
+  if (!m) return null
+
+  const [, param, op, rhs] = m
+  const values = []
+  for (const raw of rhs.split(',')) {
+    const token = raw.trim()
+    if (!token) continue
+    if (token === 'true') { values.push(true); continue }
+    if (token === 'false') { values.push(false); continue }
+    values.push(token)
+    const n = Number(token)
+    if (token !== '' && Number.isFinite(n)) values.push(n)
+  }
+  if (values.length === 0) return null
+
+  return op === '!=' ? { param, notEquals: values } : { param, equals: values }
 }
 
 /**

@@ -96,6 +96,7 @@ const NODE_CATALOG = [
     category: 'Utility',
     items: [
       { type: 'TRANSFORM', name: 'Transform (Pan / Zoom / Rotate)' },
+      { type: 'ARRAY', name: 'Array (Repeat / Grid / Radial)' },
       { type: 'MIX_BLEND', name: 'Mix / Blend' },
       { type: 'RAMP', name: 'Ramp (0 → 1 over a clip)' },
       { type: 'LFO', name: 'LFO (oscillator)' },
