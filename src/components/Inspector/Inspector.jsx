@@ -1044,7 +1044,6 @@ function ClipInspector({ clipId }) {
 }
 
 /**
-/**
  * One of a clip's two edge transitions. Head and tail are the same control set —
  * the only differences are which region they read and what the region mixes
  * against, both of which come from utils/clipTransitions rather than being

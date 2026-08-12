@@ -112,7 +112,6 @@
    A 3-segment control: Clip / + Master / In Context. One shared border with
    dividers between segments, so it reads as a single choice rather than three
    independent toggles. */
-
 .node-canvas__preview-mode {
   display: flex;
   margin-right: var(--space-xs);
