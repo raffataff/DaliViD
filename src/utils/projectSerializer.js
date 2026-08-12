@@ -21,7 +21,6 @@ const PROJECT_PREFIX = 'dalivid_project_'
 const AUTOSAVE_KEY = 'dalivid_autosave'
 
 /**
-/**
  * Plain-object copy of an edge transition, or null.
  * `params` is copied shallowly on purpose: values are scalars, colour strings,
  * or exposed-param values keyed by index — never nested objects.
