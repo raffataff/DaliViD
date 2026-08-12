@@ -22,16 +22,21 @@ const SHORTCUTS = [
       { keys: ['T'], desc: 'Default Transition on Nearest Edge' },
       { keys: ['⇄ Hotspot'], desc: 'Same, on a Clip’s Start / End (hover)' },
       { keys: ['Right Click Edge'], desc: 'Transition Menu for That Edge' },
+      { keys: ['↑', '↓'], desc: 'Restack Selected Track (up = toward the front)' },
+      { keys: ['Drag Track Header'], desc: 'Restack Track' },
+      { keys: ['Drag Ruler'], desc: 'Scrub Playhead (Shift = no snap)' },
     ]
   },
   {
     category: 'Timeline Zoom',
     items: [
       { keys: ['\\'], desc: 'Zoom to Fit Project' },
-      { keys: ['+'], desc: 'Zoom In' },
-      { keys: ['−'], desc: 'Zoom Out' },
+      { keys: ['+'], desc: 'Zoom In (at Playhead)' },
+      { keys: ['−'], desc: 'Zoom Out (at Playhead)' },
       { keys: ['Wheel'], desc: 'Zoom at Cursor' },
       { keys: ['Shift', 'Wheel'], desc: 'Pan Horizontally' },
+      { keys: ['Tilt Wheel'], desc: 'Pan Horizontally' },
+      { keys: ['Alt', 'Wheel'], desc: 'Scroll Track List' },
     ]
   },
   {

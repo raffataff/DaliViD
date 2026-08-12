@@ -39,16 +39,35 @@ export function makeShapeClipParams(overrides = {}) {
 export const DEFAULT_GENERATOR_DURATION = 5
 
 // Starter title styles, offered as draggable cards + the "+ Add Text" default.
+// `fontFamily` values are fontRegistry ids. Each preset names the face that
+// suits it rather than leaning on the default, because half of what makes a
+// lower third read as a lower third is the typeface it's set in.
 export const TEXT_PRESETS = [
-  { id: 'title', name: 'Title', params: { text: 'Title', fontSize: 150, fontWeight: '800', posY: 0.5 } },
-  { id: 'subtitle', name: 'Subtitle', params: { text: 'Subtitle', fontSize: 66, fontWeight: '500', posY: 0.72 } },
+  { id: 'title', name: 'Title', params: { text: 'Title', fontFamily: 'inter', fontSize: 150, fontWeight: '800', posY: 0.5 } },
+  { id: 'subtitle', name: 'Subtitle', params: { text: 'Subtitle', fontFamily: 'inter', fontSize: 66, fontWeight: '500', posY: 0.72 } },
   {
     id: 'lower-third', name: 'Lower Third',
-    params: { text: 'Name\nRole', fontSize: 56, fontWeight: '700', align: 'left', posX: 0.14, posY: 0.82, bgColor: '#000000', bgOpacity: 0.45, padding: 26 },
+    params: { text: 'Name\nRole', fontFamily: 'archivo', fontSize: 56, fontWeight: '700', align: 'left', posX: 0.14, posY: 0.82, bgColor: '#000000', bgOpacity: 0.45, padding: 26 },
   },
   {
     id: 'caption', name: 'Caption',
-    params: { text: 'Caption text', fontSize: 50, fontWeight: '600', posY: 0.9, strokeColor: '#000000', strokeWidth: 5 },
+    params: { text: 'Caption text', fontFamily: 'inter', fontSize: 50, fontWeight: '600', posY: 0.9, strokeColor: '#000000', strokeWidth: 5 },
+  },
+  {
+    id: 'impact', name: 'Impact',
+    params: { text: 'BIG STATEMENT', fontFamily: 'bebas-neue', fontSize: 190, fontWeight: '400', letterSpacing: 4, posY: 0.5 },
+  },
+  {
+    id: 'elegant', name: 'Elegant',
+    params: { text: 'Elegant', fontFamily: 'playfair-display', fontSize: 130, fontWeight: '500', italic: true, posY: 0.5 },
+  },
+  {
+    id: 'kicker', name: 'Kicker',
+    params: { text: 'CHAPTER ONE', fontFamily: 'oswald', fontSize: 44, fontWeight: '500', letterSpacing: 14, posY: 0.14 },
+  },
+  {
+    id: 'handwritten', name: 'Handwritten',
+    params: { text: 'a note', fontFamily: 'caveat', fontSize: 120, fontWeight: '600', posY: 0.5 },
   },
 ]
 

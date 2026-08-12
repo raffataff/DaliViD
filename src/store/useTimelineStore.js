@@ -8,6 +8,42 @@ import { create } from 'zustand'
 let clipCounter = 0
 let trackCounter = 0
 
+/**
+ * The `tracks` array IS the stacking order, bottom-to-top: index 0 is the BACK
+ * of the picture, the last entry is the FRONT. `zOrder` mirrors the index
+ * because the Renderer sorts by it (`_renderFullPipeline` composites video
+ * tracks in ascending zOrder), and the Timeline panel renders the list REVERSED
+ * so the top row is the front layer, as in Premiere/Resolve.
+ *
+ * Normalising is not cosmetic: `addTrack` used to set `zOrder = tracks.length`,
+ * so adding a track after removing one produced a DUPLICATE zOrder and the two
+ * tracks composited in an arbitrary (sort-stability-dependent) order. Every
+ * mutation of the list runs through here.
+ *
+ * Returns the same object for any track whose zOrder is already correct, so an
+ * unchanged list stays referentially stable for React and the undo snapshots.
+ */
+export function normalizeTrackOrder(tracks) {
+  return tracks.map((t, i) => (t.zOrder === i ? t : { ...t, zOrder: i }))
+}
+
+/**
+ * Load path only: rebuild the array order FROM the saved zOrders, then
+ * normalise. Deliberately not folded into `normalizeTrackOrder` — that one runs
+ * after a reorder, where the array is the new truth and re-sorting by the stale
+ * zOrders would undo the move.
+ *
+ * Sorting by zOrder (not by array position) is what keeps a loaded project
+ * rendering exactly as it did: zOrder is what the Renderer composites by, so it
+ * is the authoritative record of the picture. `Array.prototype.sort` is stable,
+ * so duplicate zOrders fall back to the saved array order.
+ */
+export function restoreTrackOrder(tracks) {
+  const withIndex = tracks.map((t, i) => ({ t, i }))
+  withIndex.sort((a, b) => (a.t.zOrder ?? a.i) - (b.t.zOrder ?? b.i))
+  return normalizeTrackOrder(withIndex.map(e => e.t))
+}
+
 const useTimelineStore = create((set, get) => ({
   // ── Tracks ──
   tracks: [],
@@ -32,7 +68,8 @@ const useTimelineStore = create((set, get) => ({
   // ── Actions ──
 
   /**
-   * Add a new track.
+   * Add a new track. Appends, i.e. the new track becomes the FRONT-most layer
+   * and appears at the TOP of the panel — the NLE convention for "add a track".
    */
   addTrack: (type = 'video', name = null) => {
     const id = `track_${Date.now()}_${++trackCounter}`
@@ -54,18 +91,19 @@ const useTimelineStore = create((set, get) => ({
     }
 
     set((state) => ({
-      tracks: [...state.tracks, track],
+      tracks: normalizeTrackOrder([...state.tracks, track]),
     }))
 
     return id
   },
 
   /**
-   * Remove a track and all its clips.
+   * Remove a track and all its clips. Renumbers so the remaining tracks keep
+   * contiguous zOrders — a gap would collide with the next `addTrack`.
    */
   removeTrack: (trackId) => {
     set((state) => ({
-      tracks: state.tracks.filter(t => t.id !== trackId),
+      tracks: normalizeTrackOrder(state.tracks.filter(t => t.id !== trackId)),
       clips: state.clips.filter(c => c.trackId !== trackId),
     }))
   },
@@ -115,15 +153,44 @@ const useTimelineStore = create((set, get) => ({
   },
 
   /**
-   * Reorder tracks.
+   * Reorder tracks by array index (0 = back of the picture / bottom row).
    */
   reorderTracks: (fromIndex, toIndex) => {
     set((state) => {
+      const n = state.tracks.length
+      if (fromIndex < 0 || fromIndex >= n) return {}
+      const to = Math.max(0, Math.min(n - 1, toIndex))
+      if (to === fromIndex) return {}
       const tracks = [...state.tracks]
       const [moved] = tracks.splice(fromIndex, 1)
-      tracks.splice(toIndex, 0, moved)
-      return { tracks: tracks.map((t, i) => ({ ...t, zOrder: i })) }
+      tracks.splice(to, 0, moved)
+      return { tracks: normalizeTrackOrder(tracks) }
     })
+  },
+
+  /**
+   * Move a track to an absolute stacking index. Id-based rather than
+   * index-based because the panel renders the list REVERSED — passing display
+   * rows around as indices is exactly how an off-by-one reversal bug gets in.
+   * Returns the resulting index, or -1 if the track wasn't found.
+   */
+  moveTrackToIndex: (trackId, toIndex) => {
+    const from = get().tracks.findIndex(t => t.id === trackId)
+    if (from === -1) return -1
+    const to = Math.max(0, Math.min(get().tracks.length - 1, toIndex))
+    if (to !== from) get().reorderTracks(from, to)
+    return to
+  },
+
+  /**
+   * Nudge a track by `delta` places. +1 = one step toward the FRONT of the
+   * picture (one row UP in the panel), -1 = one step back. No-ops at the ends
+   * rather than wrapping. Returns the resulting index, or -1 if not found.
+   */
+  moveTrackBy: (trackId, delta) => {
+    const from = get().tracks.findIndex(t => t.id === trackId)
+    if (from === -1) return -1
+    return get().moveTrackToIndex(trackId, from + delta)
   },
 
   /**

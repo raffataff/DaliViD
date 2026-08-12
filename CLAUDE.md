@@ -35,6 +35,15 @@ then failed the build from inside rolldown with `'node:util' does not provide an
 > shader smoke test) and `npm run build` both pass**, so anything below claiming "lint/build have
 > NOT been run" refers to when it was written, not to now. Those entries' *static* checks are
 > confirmed; only their runtime (WebGL2) checks are still open.
+>
+> **Both static checks CAN be run in-session even with the device sandbox down (2026-08-12).**
+> Neither needs the repo's `node_modules`, only Node: `scripts/smoke-shaders.mjs` is
+> dependency-free, so copying it plus `src/shaders/{shaderRegistry,transitionRegistry,lib3d.glsl}.js`
+> and `src/utils/{paramParser,audioDrivers}.js` into a scratch tree and running it there is the
+> whole job; ESLint needs only `eslint`, `@eslint/js`, `globals` and the three
+> `eslint-plugin-react*` packages installed beside a copy of `eslint.config.js`. `npm run build`
+> is the one that genuinely needs the full install. Worth the five minutes — it is the difference
+> between "hand-audited" and "checked".
 
 ## File map (where things live)
 
@@ -377,7 +386,309 @@ then failed the build from inside rolldown with `'node:util' does not provide an
   samples `u_image` at its natural size (SHAPE is procedural, so it's sharp at any zoom). See the
   backlog for the oversampled-clip-input idea.
 
+## Array node — repeat / instance (added feature)
+
+- **`ARRAY`** (Utility category) repeats the incoming frame as N copies in a **Grid**, a cascading
+  **Chain**, or a **Radial** ring/spiral. Plain effect node, so `DEFAULT_EFFECT_DEF` gives it
+  `hasParamInputs` and every one of its 24 numeric controls gets a float socket free — a `RAMP`
+  into Count, an `LFO` into Array Angle, a splitter band into Radius, keyframes on any of them.
+- **Grid does not loop over copies, and that is the whole design.** A grid is a lattice, so the
+  copies that can cover a pixel are found by inverse-mapping the pixel to its own cell and then
+  visiting only the neighbours whose footprint can still reach it. Cost is therefore **independent
+  of the count**: 3×3 and 40×40 both cost one fetch per pixel at the default spacing (measured:
+  28.3ms vs 31.5ms per frame in SwiftShader at 320×180 — the residual is the wider neighbourhood
+  test, not extra fetches). A `for each copy` loop would be O(count) per pixel, which is the same
+  mistake as the radius loops the house rule above bans.
+  - The neighbourhood half-width comes from the worst-case copy extent over the **local** index
+    window, not the whole grid — `Scale / Copy` compounds by index, and a global bound would push
+    a large array to the 5×5 cap for no reason. Capped at `AR_NB` (5×5) regardless, so pathological
+    overlap stays bounded; with `Over` that cap is invisible, because past ~5 layers the front
+    copies have already covered the pixel.
+  - An **unrotated** copy is bounded by its box, a rotated one by its bounding circle. That branch
+    is what makes the default a single fetch: at Spacing 1 with no rotation the neighbourhood
+    half-width computes to 0.
+- **Chain and Radial are a bounded loop (`AR_MAX_I` = 64), walked FRONT TO BACK with an early
+  out.** On opaque footage the accumulator saturates at the first copy that covers the pixel and
+  the loop stops, so 48 radial copies cost ~1 fetch per pixel plus 48 cheap rejects.
+  - Chain positions **compound** (copy k sits at the sum of k rotated, scaled steps), which would
+    normally force build-order iteration and kill the early out. The sum is a geometric series in
+    the complex plane, so it closes to `(1 - z^k) / (1 - z)` with `z = scaleStep · e^(i·spin)` and
+    any copy is evaluable directly. **That closed form is what buys the front-to-back walk** — it
+    is not a micro-optimisation. `degen` handles z ≈ 1 (the sum is just `k · step`).
+  - `Radius / Turn` is radius gained per **full turn**, so Rings > 1 with a 360° arc is one
+    continuous spiral while a partial arc is a fan repeated per ring. One param, two behaviours
+    that both read as obvious.
+- **Count and Rows are FLOAT uniforms with `step=1`.** `step` is a UI attribute only, so the
+  slider still drags in whole copies, but a float socket (LFO / RAMP / audio band / keyframe)
+  writes any value and the fractional part **fades the last copy in** instead of popping it. An
+  audio-driven Count is unusable without that, and it is free — `tailC`/`tailR` are one clamp each.
+- **`Size` 0 means Auto Fit** (`1 / max(count, rows)`), so dropping the node in and setting Count
+  3 / Rows 3 gives an exact mosaic with no arithmetic. Chosen over a separate Fit checkbox because
+  the sentinel lives at the bottom of the slider's own travel, where nobody lands by accident.
+- **Everything accumulates PREMULTIPLIED and converts back to straight at the end**, for BLUR's
+  reason: a transparent copy carries undefined colour, and blending it straight drags that colour
+  in as a halo. `Original` (the untouched frame underneath) is composited under in the same space.
+- **`textureLod(..., 0.0)`, never `texture()`.** These fetches sit inside non-uniform control flow,
+  where the spec leaves implicit derivatives undefined — and every FBO here is LINEAR with no mip
+  chain, so the derivative would be computed and thrown away anyway.
+- **`Filtering: Smooth` is a 4-tap box over the pixel footprint, and only fires when minifying.**
+  There are no mipmaps to fall back on, so a 12×12 grid shimmers badly without it; the footprint is
+  derived analytically from the copy's scale (`1 / (scale · aspect · H)`) rather than from
+  `fwidth`, which is the same non-uniform-control-flow problem. Edge coverage is measured in screen
+  pixels from the copy's border, which is what keeps a rotated copy's edge from stair-stepping.
+- Conventions are TRANSFORM's and SHAPE_INPUT's throughout: aspect-corrected frame units where 1.0
+  == the frame HEIGHT on both axes, `v_uv.y` UP, rotation counter-clockwise-positive, position
+  params ±1 at the frame edges.
+- **Known limits, all deliberate:** copies are sampled from a canvas-resolution FBO, so `Size` > 1
+  upscales exactly as `TRANSFORM`'s zoom does; heavy overlap past the 5×5 grid cap drops far
+  copies, which is exact for `Over` and approximate for `Add`/`Screen`; and `Spacing Y` is unused
+  in Chain (the chain's direction is `Array Angle`, its step is `Spacing X`).
+
+## `@showif` — conditional visibility for GLSL `@param`s
+
+- `paramParser` now parses a `// @showif <uniform> == A,B` / `!= A` directive line, adjacent to its
+  `@param` the way `@audiobind` is, into the **existing** `{ param, equals }` / `{ param, notEquals }`
+  shape. `NodeCard` and `Inspector` already run every config list through `visibleDataParams`, so
+  nothing else had to change — this was the backlog item, and the plumbing was already there.
+- Comparison follows `isParamVisible`: **selects by label** (it normalises a stored index through
+  the referenced config's option list first), checkboxes by boolean — hence `true`/`false` are
+  coerced. A numeric operand is emitted in **both** string and number form, since a select label
+  can legitimately be "3".
+- An unparseable directive yields `null` rather than a rule: a typo must not hide the control it
+  was meant to reveal.
+- **Sockets stay unconditional** (`getNodeSockets` never sees `showIf`), and a **wired** param keeps
+  its row via the `alwaysShow` set — so a hidden param can still be driven by a noodle and the
+  noodle keeps a real DOM anchor. `ARRAY` is the first shader to use it: Radius / Arc / Face Center
+  appear only in Radial, Spacing Y only in Grid, Stacking only when Blend is Over.
+
 ## Recently completed
+
+- **`ARRAY` node + `@showif` for shader params (2026-08-12).** See the two sections above.
+  **Both static checks AND a real WebGL2 run were done in-session this time.** `smoke:shaders`
+  passes at 65 shaders + 35 transitions; ESLint over the whole tree is 0 errors / 1 pre-existing
+  warning (`NODE_COLORS` in `NodeCard.jsx`). The runtime check was a throwaway Playwright +
+  headless-Chromium/SwiftShader harness that compiled the shader and asserted 15 behaviours —
+  worth repeating for the next GLSL change, since none of these are visible to the static test:
+  identity (1×1 at Size 1 reproduces the source to ±1.5/255), the 3×3 auto-fit mosaic sampling
+  each cell centre at source (0.5, 0.5), full-frame coverage, linear mapping inside a cell, a
+  source alpha ramp surviving inside each copy to ±0.5/255, straight colour restored after the
+  premultiplied blend, fractional Count fading the tail copy to exactly half alpha, Chain and
+  Radial both drawing (Radial landing 4 copies on the compass points), Mirror flipping alternate
+  cells, Stacking changing which overlapping copy wins, Add accumulating in the overlap, Original
+  filling behind, and the flat Grid cost curve quoted above.
+  - Still open (needs a real GPU and real footage): how the Smooth prefilter holds up at 30+
+    copies on live video, whether the 5×5 neighbourhood cap is ever visible with `Add`, and
+    whether 24 float sockets makes the card unwieldy in practice.
+
+- **The font picker wouldn't stay open, and exported text was stair-stepped (2026-08-12).**
+  Reported as two bugs. They were four, and each headline one had a cause that looks nothing like
+  its symptom.
+  - **The picker's dismiss handler was closing the popup on the popup's OWN scroll.**
+    `window.addEventListener('scroll', close, true)` is capture-phase precisely so it can see
+    scrolls in nested containers (scroll events don't bubble) — and `.font-picker__list` is
+    `overflow-y: auto`, so wheeling through the fonts dismissed the thing being wheeled. It now
+    ignores any event whose target the panel `contains`. A document-level scroll targets
+    `document`, which no element contains, so the case the listener actually exists for (the
+    Inspector column moving out from under a `position: fixed` panel) still fires.
+  - **"Closes immediately" was the SAME listener, fired by a scroll the panel caused itself.**
+    Two things scroll that list programmatically on open: `scrollIntoView` revealing the selected
+    row, and the reflow as `preloadPickerFonts` finishes fetching ~20 faces. Which of the two
+    symptoms you got depended only on whether the current font happened to be visible already — a
+    font added from a file lands in the `Project` group, which is FIRST in `FONT_GROUP_ORDER`,
+    while a fresh text clip defaults to `inter` further down. That is why one bug presented as two,
+    and why it appeared to depend on how the text was created.
+  - **`scrollIntoView` now runs only when the highlight moved for a reason the pointer cannot see**
+    (opening, arrow keys, a new query), armed through `revealActiveRef`. Running it on every
+    `activeIndex` change fought the mouse, because hovering a row sets `activeIndex` too: the
+    scroll moved a different row under the cursor, which set it again, which scrolled again. Also
+    `focus({ preventScroll: true })` on the search box — focusing inside a fixed panel can
+    otherwise make the browser scroll an ancestor to "reveal" it, which is a real Inspector scroll
+    and would legitimately dismiss — and `overscroll-behavior: contain` on the list so reaching
+    either end doesn't chain the wheel out into that column.
+  - **Exported text was jagged because ANTIALIASING WAS BEING FILTERED IN STRAIGHT ALPHA.**
+    `renderTextNode` rasterizes at 2× and lets one bilinear tap in `TEXT_INPUT` resolve it — but a
+    filtered fetch is a weighted sum of texels, and a weighted sum of RGBA is only meaningful once
+    colour carries its own coverage. Uploaded straight, averaging an opaque white texel with a
+    transparent one gave half-grey at half alpha instead of white at half alpha, so every edge
+    pixel came out at HALF the intensity it should have. The supersample was not merely wasted —
+    it was eroding the very edges it exists to smooth.
+    - `TextureManager.uploadVideoFrame` gained a `premultiply` flag (default `false`, so the three
+      video/camera call sites are untouched), and `TEXT_INPUT` divides the alpha back out
+      (`a > 0.0001 ? rgb / a`, matching `PRESENT_FS`) — the pipeline's convention is STRAIGHT end
+      to end and only the compositor accumulator is premultiplied, so the conversion belongs at
+      the sample site, not in the FBO.
+    - **Why it hid for so long:** `PreviewCanvas` renders at full project resolution and CSS-scales
+      the canvas down into the panel, so the browser's own downscale filter smoothed over it. An
+      export is the first time those pixels are ever seen 1:1. The preview flatters every
+      edge-quality bug in the app and always has — worth remembering the next time something
+      "only breaks on export".
+  - **`IMAGE_INPUT` had the identical bug**, so it went with it: Fit / Scale / Tile all resample,
+    and a straight-alpha texture meant a PNG cutout lost intensity along every soft edge and picked
+    up a dark fringe. Same fix — premultiplied upload plus an `imgSample()` helper used by both the
+    in-bounds and the Tile branch. Image *clips* get it for free, because both routes go through
+    `renderImageNode` and `img_*` textures are only ever sampled by `imageProgram`.
+    - Its `vec4(u_bg_color, 1.0)` background branch is deliberately UNTOUCHED — that is what
+      `OPAQUE_BY_DESIGN` allowlists this shader for, and those Contain letterbox bars are meant to
+      be opaque. Making them transparent would silently change how every existing project's
+      Contain image composites over its lower tracks.
+    - Opaque sources divide by 1.0 and come out bit-identical, which covers every JPEG, most PNGs
+      and all opaque text — so none of this changes content without an alpha channel.
+  - **The export bitrate ignored resolution and frame rate entirely.** All three sites were
+    `quality * 10 Mbps`, so a 4K60 export got the same budget as 720p30 — roughly a twelfth of the
+    bits per pixel, which is exactly the regime where H.264 rings around high-contrast edges. So
+    text could be rendered perfectly and still arrive chewed. `targetBitrate(w, h, fps, quality)`
+    now budgets bits per pixel per frame (0.04–0.15 bpp); the default lands at ~8.6 Mb/s for
+    1080p30, near the old 9, so the slider feels unchanged at the common size and only the scaling
+    moves. The `isConfigSupported` probe and the real `configure()` share one value — they would
+    otherwise have disagreed, i.e. a bitrate the encoder approved is not the one it is asked for —
+    and the modal shows the resulting Mb/s beside the percentage, since a percentage alone never
+    said whether your resolution was being paid for.
+
+- **Timeline zoom/pan pass — the wheel was doing the wrong thing in three ways (2026-08-10).**
+  Reported as "zoom scales from frame 0, and the side-tilt wheel always scrolls left".
+  - **The tilt wheel was ZOOMING, not panning.** A horizontal tick has `deltaY === 0`, so it fell
+    through to the zoom branch where `e.deltaY > 0` is false → `delta = 1.1` → it zoomed IN 10% on
+    every tick, in *both* tilt directions. Compounded with the next bug (zoom anchored at t=0, so
+    the picture grows rightward) that reads exactly as "the view slides left". Two bugs presenting
+    as one. `deltaX` now pans, always, before any other branch.
+  - **Zoom now anchors on the cursor** (`zoomBy(factor, anchorTime)`). Changing the scale alone
+    pins t=0, so everything fans out from the far left and whatever you were looking at leaves the
+    screen. `zoomBy` reads the applied zoom **back out of the store** rather than re-clamping
+    locally — the store owns the 0.002–50 limits, and duplicating them would make the anchor maths
+    drift at the extremes. `+`/`−` anchor on the **playhead** when it's visible, else the view
+    centre.
+  - **Deltas are normalised by `deltaMode`.** Firefox reports LINES (~3/notch), some setups PAGES;
+    unnormalised, one notch zoomed ~30× further in Chrome than in Firefox. The step is exponential
+    (`1.002^-dy`, clamped 0.5–2) so a slow scroll and a fast flick feel the same per unit of travel.
+  - **`viewportWidth` is measured** (ResizeObserver on the ruler) instead of the hard-coded
+    **2500px** that ruler marks and beat lines both used to cull against — so on a monitor wider
+    than that the right-hand end of the ruler had no marks at all, and on a narrow one it built ~2×
+    the DOM it needed. The ruler and every clip lane share a left edge (160px header/spacer left of
+    both), so **one** measurement and **one** content origin serve both surfaces — the wheel handler
+    needs no per-surface branch.
+  - **`timelineScrollLeft` has an upper bound now** (`clampScrollLeft`): you could previously pan
+    into unbounded empty space, and zooming out left you parked past the end looking at nothing.
+    The playhead counts as content, so a scrub past the last clip still lets the view follow. A
+    re-clamp effect runs whenever zoom / panel width / project length change by any route.
+  - **Ruler marks come off a 1-2-5 ladder** (`RULER_STEPS` / `pickRulerStep`) at ≥14px per tick and
+    ≥72px per label. The old fixed table bottomed out at "10s apart below 20px/sec" — at minimum
+    zoom (0.16 px/sec) that put marks 1.6px apart and built ~1500 DOM nodes for a solid grey bar —
+    and topped out at 0.5s, so past ~300px/sec every label read the same whole second.
+    - The labelled step is **rounded up to an exact multiple of the tick step**: the ladder isn't
+      uniformly divisible (15 isn't a multiple of 2), and where it isn't, labels land only on the
+      LCM and half of them silently vanish.
+    - Ticks are indexed (`i * minor`), not accumulated (`t += minor`), which drifts on floats and
+      made mark positions disagree with the beat grid over a long timeline.
+    - `formatTimecode(seconds, step)` gained sub-second precision driven by the label spacing, and
+      **truncates** rather than rounds — `toFixed(0)` on 59.7 gives "60", i.e. "1:60".
+  - **Alt+wheel scrolls the track list.** The lanes are a native scroll container, but plain wheel
+    is taken by zoom and `preventDefault`ed, so a project with more tracks than fit could only be
+    scrolled by dragging the scrollbar. Plain wheel stays zoom-at-cursor — that is this app's
+    convention (the node editor does the same) even though most NLEs invert it.
+  - **The view follows the playhead** when it leaves the window (playback, or a jump to In/Out).
+    Subscribed imperatively via `useAppStore.subscribe(selector, …)`, because `playheadTime` changes
+    every frame and a hook selector would re-render the whole panel 60×/sec; it only writes when the
+    view actually has to page. **Pages rather than centres** — re-centring every frame slides the
+    entire timeline under the eye continuously, which is far harder to read than one jump per
+    screenful. Suppressed while `body.is-scrubbing`, which owns the scroll during a drag.
+
+- **Tracks could not be restacked, and the panel was upside-down (2026-08-10).** `reorderTracks`
+  existed in `useTimelineStore` but had **no call site**, and no header was draggable.
+  - **The row order was inverted and that had to be settled first.** The Renderer composites video
+    tracks in **ascending zOrder** (`_renderFullPipeline`), so the last entry is the FRONT layer —
+    but the panel rendered `tracks.map` in array order, putting the *back* layer in the *top* row.
+    "Move up" is meaningless until that agrees with every NLE. **Fixed by reversing the VIEW**
+    (`displayTracks = [...tracks].reverse()`), not the compositing: every existing project renders
+    byte-identically and only the row it sits on changes. Flipping the renderer instead would have
+    silently inverted the picture of every saved multi-track project.
+  - **`tracks` array order IS the stacking order**, bottom (index 0, back) to top, and `zOrder`
+    mirrors the index. `normalizeTrackOrder` enforces that on every mutation and returns the *same
+    object* for already-correct tracks, so an unchanged list stays referentially stable for React
+    and the undo snapshots.
+    - This fixed a **pre-existing duplicate-zOrder bug**: `addTrack` set `zOrder = tracks.length`
+      and `removeTrack` never renumbered, so add → remove → add produced two tracks with the same
+      zOrder, composited in whatever order `sort` happened to be stable about.
+  - **`restoreTrackOrder` (load path only) sorts by the saved zOrder, THEN normalizes.** It is
+    deliberately not folded into `normalizeTrackOrder`, which runs *after* a reorder where the array
+    is the new truth and re-sorting by stale zOrders would undo the move. zOrder is what the
+    Renderer composited by, so it — not array position — is the authoritative record of the picture;
+    `sort` is stable, so duplicates fall back to the saved array order.
+  - **Reorder actions are id-based** (`moveTrackToIndex`, `moveTrackBy`). With the panel reversed,
+    passing display rows around as indices is exactly how an off-by-one gets in; the single
+    conversion `arrayIndex = count - 1 - row` lives in one place, in the drag handler.
+  - **Drag a track header** to restack — reorders **live** rather than dropping a ghost at the end,
+    so the composite updates as you drag. 4px of slop before it becomes a drag, so a plain click
+    still just selects; a press on the M/S/L buttons (`e.target.closest('button')`) never arms one.
+    Row height is *measured* from a real `.timeline__track` rather than hard-coded at 48px, so a CSS
+    change can't desync the drop target from the picture. `body.is-reordering` carries the
+    `grabbing` cursor, with an unmount cleanup.
+  - **↑ / ↓ restack the selected track one place** (`moveTrackBy(id, ±1)`; up = toward the front =
+    `+1` on the array index). Both arrows were unused globally. Only `preventDefault` when a track
+    is actually selected, so they still scroll otherwise.
+  - Inspector → Track gained a **Layer** row (▲/▼ + "2 / 3 — front-most"). The position alone
+    doesn't say which end is the front, hence the words.
+
+- **The playhead was not draggable at all (2026-08-10).** The ruler had `onClick` → jump, and
+  `TimelinePlayhead` was a zero-width div with no handlers, so the red head could only be *placed*,
+  never *grabbed*. Now `beginScrub` (Timeline.jsx) is one gesture with two entry points:
+  - **Ruler `onMouseDown`** — jumps to the press point and keeps dragging (replaces `onClick`;
+    a plain click still behaves identically).
+  - **`.timeline__playhead-grab`**, a 21px full-height strip inside the marker — drags *without*
+    jumping. It preserves the cursor's offset from the line (`grabOffset`), so the playhead doesn't
+    teleport a few px the instant you touch it. The arrow itself is ~12×8px, which is not a
+    grabbable target, hence the separate strip; the marker is `pointer-events: none` and only the
+    strip is `auto`, so the arrow can't swallow ruler presses beside it.
+  - **Snapping excludes the playhead** — `collectSnapPoints(excludeClipId, includePlayhead)` gained
+    the second arg. It is the thing being moved, so leaving it in the target list snaps it to itself
+    and pins it at its start position. Shift bypasses snapping as everywhere else.
+  - **Edge auto-scroll** (rAF, ≤1200 px/s, 32px zones) — without it a drag stops dead at the panel
+    border, which on a zoomed-in timeline is most of the point of dragging. Reads rect/scroll live
+    each frame rather than closing over them, because the scroll moves under the drag.
+  - **`body.is-scrubbing`** carries the `ew-resize` cursor + `user-select: none` for the whole
+    gesture (a class on the ruler would flicker the moment the pointer left it); an unmount cleanup
+    removes it so a collapse mid-drag can't leave every cursor in the app stuck.
+  - **`.timeline__marker` z-index 4 → 55** (above the playhead's grab strip, below the In/Out
+    handles at 60). `M` drops a marker exactly *at* the playhead, so at z 4 the new 21px strip
+    covered it and it became impossible to pick back up.
+  - **The line across the tracks stays non-interactive on purpose** — a grab strip there would sit
+    on top of clips wherever the playhead crosses one and steal their drag/select presses. The
+    ruler is the scrub surface, as in Premiere/Resolve.
+  - Scrubbing **during playback** needs no special case: `Renderer._renderFrame` re-reads
+    `playheadTime` from the store each frame and adds `dt`, so a scrub jumps and playback continues
+    from the new position.
+
+- **"Convert to Node Graph" changed how the two clips blended — the graph path LAYERED its
+  result instead of REPLACING the accumulator (2026-08-10).** Reported as: a built-in transition
+  between two images plays correctly, and the moment you convert that edge to a node graph the
+  outgoing image stays on screen at full strength for the whole region, with the transition
+  playing over it — "like there's a 2nd image that stays".
+  - **The two paths ended a region differently, and only one of them was right.**
+    `_compositeBuiltinTransition` writes its result straight into the accumulator (the region
+    OWNS its window — that is what `TRANSITION_FOOTER` means). `_compositeGraphTransition` handed
+    its result to `_compositeTrack` as an ordinary blend layer over `baseFBOId` — but on a head
+    the accumulator **is** `u_from`, so the mix was being composited back over one of its own
+    inputs. The FROM side is counted twice.
+  - **Why it hid for so long:** at `blend.a == 1` source-over occludes the base completely, so on
+    opaque footage the two paths are byte-identical. It only diverges where the result is not
+    fully opaque — an image with an alpha channel, a `SHAPE`/`TEXT` generator, a clip that doesn't
+    fill the frame. There the outgoing clip survives at weight `1 - resultAlpha` for the entire
+    region and only vanishes when the region ends, which is exactly the reported symptom.
+  - **Fix: `TRANSITION_RESOLVE_FS` + `Renderer._writeTransitionResult`**, the graph path's peer of
+    `TRANSITION_FOOTER`. One full-screen pass into `destFBOId`: premultiply the graph's STRAIGHT
+    result (the accumulator is premultiplied) and lerp toward `u_backdrop` by the clip opacity —
+    the same two operations the footer does, in the same order. Both paths now write a region's
+    output identically, so converting an edge to a node graph is a no-op on the picture.
+    A missing/failed program degrades to the old `_compositeTrack` rather than to a hard cut.
+  - **`MIX_BLEND` / `MATH_BLEND` (they are duplicate shaders) mixed RGB but took `max(a.a, b.a)`
+    for alpha** — so at Operation = Mix the outgoing side's silhouette stayed fully opaque across
+    the whole crossfade and an alpha logo never left. Now `mix(a.a, b.a, u_mix)` for Mix only; the
+    other five operations layer two pictures rather than replace one, so the union is right for
+    them. This matters because `MIX_BLEND` is what `STARTER_TRANSITION_COMPOUND` is built from,
+    i.e. what "Convert to Node Graph" seeds when the edge was a plain Fade.
+  - **Known, unchanged, and shared with the built-in path:** near p = 1 a head crossfade is
+    `mix(backdrop, clip, ~1)`, so where the clip is transparent the backdrop is discarded rather
+    than showing through. That falls out of using the accumulator as FROM (there is no separate
+    backdrop layer to composite over) and is the transition model's behaviour, not this pass's.
 
 - **The same blocky fringe from an EFFECT NODE was a different bug with the same shape
   (2026-08-10).** Reported right after the transition fix: drop an Edge Detection or Halftone into
@@ -1105,6 +1416,60 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
 
 ## Backlog / potential improvements
 
+- **Verify the alpha-filtering + bitrate work in `npm run dev` (2026-08-12) — but note that
+  `eslint` and `smoke:shaders` DID run and pass this time**, against the edited tree in a cloud
+  container: 64 shaders + 35 transitions OK, and 0 errors / 0 warnings across all six edited files
+  using the repo's own `eslint.config.js`. `npm run build` and a real WebGL2 context did NOT run,
+  so what is open is runtime behaviour only. Checks, highest value first:
+  1. **Text edges are the headline.** Light text over a dark clip, or anything with a Stroke, at
+     100% preview zoom and then in an exported MP4. Edges should read as smooth ramps rather than
+     stair-steps, and must not have gained a bright halo — too bright means the un-premultiply is
+     running on data that was never premultiplied (i.e. the `true` argument didn't reach
+     `uploadVideoFrame`).
+  2. **Nothing moved on opaque content.** Any project whose text sits on an opaque card, and any
+     JPEG image node: `a == 1` divides by 1.0, so these must be pixel-identical to before. If they
+     are not, the `a > 0.0001` guard is biting somewhere it shouldn't.
+  3. **`IMAGE_INPUT` at each Fit mode**, with a PNG that has soft edges: Cover, Contain, Stretch,
+     Tile. The dark fringe should be gone in all four. Contain's letterbox bars must still be
+     OPAQUE — that branch was left alone on purpose and a transparent bar means the wrong branch
+     got edited.
+  4. **Tile specifically**, since it is the one path that samples `fract(suv)` — a seam that
+     darkens at the tile boundary would mean the filtering fix didn't reach it.
+  5. **The bitrate readout** next to the Quality slider tracks resolution and fps as you change
+     them (1080p30 ≈ 8.6 Mb/s at the default, 4K60 ≈ 69). Then export at 4K and confirm the
+     encoder accepts the config rather than failing the `isConfigSupported` probe — the 200 Mb/s
+     ceiling exists for exactly that, and it has never been exercised on real hardware.
+  6. **File sizes went UP for large exports and DOWN for small ones.** A 720p30 export should now
+     be noticeably smaller than before (3.8 Mb/s vs a flat 9), which is the change most likely to
+     be mistaken for a regression.
+  7. **The font picker**, opened both from a text clip and from a `TEXT_INPUT` node, with the
+     current font both near the top of the list and buried in it: it must stay open, scroll with
+     the wheel, arrow-key through groups, and still dismiss on an outside click, on Escape, and
+     when the Inspector column itself is scrolled.
+
+- **Verify the node-graph transition write-back in `npm run dev`** — sandbox down again, so
+  `npm run lint` / `smoke:shaders` / `npm run build` have NOT been run. Checks, highest value first:
+  1. **`npm run smoke:shaders`.** `MIX_BLEND` and `MATH_BLEND` both changed; the new `outA` is a
+     variable, so check 4 (literal-1.0 alpha writes) must stay silent on them.
+     `TRANSITION_RESOLVE_FS` is a Renderer-local shader, so it is NOT covered — a typo there shows
+     up as a black frame during a graph transition, nothing else.
+  2. **The headline case.** Two images with transparency (PNG with alpha, or `SHAPE`/`TEXT`
+     generators), overlapping on one track, Crossfade on the incoming clip's head. Scrub the
+     region, then Convert to Node Graph and scrub it again — the two must now look the same, and
+     the outgoing image must not linger.
+  3. **Nothing regressed on opaque footage.** A converted graph transition between two opaque
+     clips must look identical to before *and* identical to the built-in — every change is a no-op
+     at alpha 1.
+  4. **Both ends.** First and last frame of the region: p→0 must be exactly the accumulator (no
+     pop entering the region) and p→1 exactly the incoming clip. Repeat on a TAIL (the swapped-
+     sides path) and on a transition out to nothing over the checker backdrop.
+  5. **Opacity.** Drop the clip's opacity to 0.5 with a graph transition live — the backdrop must
+     show through by half, exactly as it does with a built-in (that is the `u_opacity` lerp, which
+     `_compositeTrack` was applying to the wrong side before).
+  6. **Library compounds too** — a `compound:<id>` transition goes through the same write-back.
+  7. **`MIX_BLEND` mid-graph.** Operation = Mix over transparent content now fades coverage; the
+     other five operations must be unchanged. Open a project that uses one to confirm.
+
 - **Verify the effect-node alpha fix in `npm run dev`** — sandbox still down, nothing run. Order:
   1. **`npm run smoke:shaders` FIRST, and expect it to pass with zero failures.** Check 4 is brand
      new and has never executed; it was hand-verified against the tree (the only literal-1.0 alpha
@@ -1633,11 +1998,12 @@ Ideas surfaced but not yet built (roughly by value-to-effort).
 - **Measure real card heights.** `estimateNodeHeight` is now the single shared estimate, but
   expanded compounds / image nodes deviate from it — a DOM-measured height map (ResizeObserver on
   cards) would make marquee/fit/insert/minimap exact.
-- **Extend `showIf` to shader `@param`s.** The mechanism exists and is honoured by NodeCard /
-  Inspector / `estimateNodeHeight`, but only `dataNodeParams` entries declare it — `paramParser`
-  has no `@param` syntax for a condition, so SHAPE still shows `sides` on a Rectangle and
-  `inner ratio` on a non-Star. A `@showIf u_shp_type == Polygon,Star` directive parsed into the
-  same `{ param, equals }` shape would reuse `isParamVisible` verbatim.
+- **Apply `@showif` to the shaders that predate it.** The directive exists now (see its section
+  above) and `ARRAY` uses it, but no older shader declares one — so `SHAPE_INPUT` still shows
+  `Sides / Points` on a Rectangle and `Inner Ratio` on a non-Star, `LETTERBOX` shows `Custom Ratio`
+  alongside the Aspect preset that overrides it, and `TRANSFORM` shows nothing conditional at all.
+  Each is a one-line comment above the uniform; the win is largest on `SHAPE_INPUT`, whose 20
+  controls are mostly inert for any given shape.
 - **Live output readout for float source nodes.** `data-node-param-display` only updates *input*
   params, so a RAMP/LFO/MATH/ENVELOPE card can't show what it's currently outputting. Exposing the
   resolved `floatValues` (not just the per-consumer overrides) would let each card display its own

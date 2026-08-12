@@ -18,6 +18,7 @@ import useTimelineStore from './store/useTimelineStore'
 import {
   saveProject, requestPersistentStorage, purgeStoredFolderHandles
 } from './utils/projectSerializer'
+import { initFontRegistry } from './utils/fontRegistry'
 import { initHistory, undo, redo } from './utils/history'
 import { nearestEdge } from './utils/clipTransitions'
 import { applyTransitionById } from './utils/transitionActions'
@@ -126,6 +127,11 @@ const clearSelection = useAppStore(s => s.clearSelection)
    useEffect(() => {
      requestPersistentStorage()
      purgeStoredFolderHandles()
+     // Re-register every font the user has added in a previous session, before
+     // the autosaved project restores. A text clip whose font arrives late is
+     // drawn in a fallback first and corrected a frame later — harmless, but
+     // visible, and there is no reason to make the user watch it on every load.
+     initFontRegistry()
    }, [])
 
    // Warn before leaving with work that exists nowhere but this browser.

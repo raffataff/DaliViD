@@ -4,7 +4,8 @@ import useGraphStore from '../../store/useGraphStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import { parseParams } from '../../utils/paramParser'
 import { prepareImageDataURL } from '../../utils/imageProcessing'
-import { TEXT_FONTS } from '../../utils/textRenderer'
+import { resolveFont, fontWeightRange, clampWeight } from '../../utils/fontRegistry'
+import FontPicker from './FontPicker'
 import { getNodeSource, getShaderSource } from '../../shaders/shaderRegistry'
 import { getDataNodeParams, visibleDataParams } from '../../shaders/dataNodeParams'
 import { SHAPE_PRESETS } from '../../utils/generatorClips'
@@ -550,12 +551,46 @@ function FieldCheck({ label, value, onChange }) {
   )
 }
 
+// Named weight stops, spanning the full variable-font range. Which of these a
+// user actually sees is filtered per font: offering 900 for a face that ships
+// only 400 doesn't get you a heavier cut, it gets you the browser smearing the
+// outlines to fake one.
+const WEIGHT_STOPS = [
+  ['Thin', '100'], ['ExtraLight', '200'], ['Light', '300'], ['Regular', '400'],
+  ['Medium', '500'], ['Semibold', '600'], ['Bold', '700'], ['Heavy', '800'], ['Black', '900'],
+]
+
 // Text style editor — shared by text clips and TEXT_INPUT nodes. `includeTransform`
 // adds the shader-uniform transform/reactive controls (clips only; on a node those
 // already show as @param sliders in the Parameters section).
 function TextStyleEditor({ params, onChange, includeTransform = true }) {
   const p = params || {}
-  const WEIGHTS = [['Light', '300'], ['Regular', '400'], ['Medium', '500'], ['Semibold', '600'], ['Bold', '700'], ['Heavy', '800'], ['Black', '900']]
+  const fontValue = p.fontFamily ?? 'inter'
+  const font = resolveFont(fontValue)
+  const [wMin, wMax] = fontWeightRange(fontValue)
+
+  // Only the weights this face really has. A single-weight display font ends up
+  // with one entry, which reads as "this font has one weight" rather than as a
+  // dropdown that silently does nothing.
+  const weightOptions = WEIGHT_STOPS
+    .filter(([, v]) => Number(v) >= wMin && Number(v) <= wMax)
+    .map(([label, value]) => ({ label, value }))
+  if (!weightOptions.length) weightOptions.push({ label: 'Regular', value: String(wMin) })
+
+  // Displayed clamped so the dropdown always reflects what will actually be
+  // drawn — the rasterizer clamps too, and a select whose value isn't in its
+  // option list renders blank.
+  const weightValue = clampWeight(fontValue, p.fontWeight ?? '700')
+
+  // Switching to a narrower face carries the weight along with it: picking
+  // Archivo Narrow (400–700) while set to Black would otherwise leave a stale
+  // 900 in the params that only the rasterizer knows to ignore.
+  const handleFontChange = (nextId) => {
+    onChange('fontFamily', nextId)
+    const clamped = clampWeight(nextId, p.fontWeight ?? '700')
+    if (clamped !== String(p.fontWeight ?? '700')) onChange('fontWeight', clamped)
+  }
+
   return (
     <>
       <div className="inspector__field" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
@@ -563,10 +598,15 @@ function TextStyleEditor({ params, onChange, includeTransform = true }) {
         <textarea rows={2} value={p.text ?? ''} spellCheck={false} onChange={(e) => onChange('text', e.target.value)}
           style={{ resize: 'vertical', width: '100%', background: '#0a0a0e', color: '#e8e8ef', border: '1px solid #2a2a35', borderRadius: 3, padding: '4px 6px', fontSize: 12 }} />
       </div>
-      <FieldSelect label="Font" value={p.fontFamily ?? TEXT_FONTS[0].value} options={TEXT_FONTS.map(f => ({ label: f.label, value: f.value }))} onChange={(v) => onChange('fontFamily', v)} />
+      <FontPicker value={fontValue} onChange={handleFontChange} />
       <FieldNum label="Size" value={p.fontSize} def={96} min={8} max={400} step={1} onChange={(v) => onChange('fontSize', v)} />
-      <FieldSelect label="Weight" value={String(p.fontWeight ?? '700')} options={WEIGHTS.map(([label, value]) => ({ label, value }))} onChange={(v) => onChange('fontWeight', v)} />
+      <FieldSelect label="Weight" value={weightValue} options={weightOptions} onChange={(v) => onChange('fontWeight', v)} />
       <FieldCheck label="Italic" value={p.italic} onChange={(v) => onChange('italic', v)} />
+      {p.italic && !font.italicCss && !font.system && (
+        <div className="inspector__hint">
+          {font.label} has no italic cut — this is a synthesized slant.
+        </div>
+      )}
       <FieldColor label="Color" value={p.color} def="#ffffff" onChange={(v) => onChange('color', v)} />
       <FieldSelect label="Align" value={p.align ?? 'center'} options={[{ label: 'Left', value: 'left' }, { label: 'Center', value: 'center' }, { label: 'Right', value: 'right' }]} onChange={(v) => onChange('align', v)} />
       <FieldNum label="Position X" value={p.posX} def={0.5} min={0} max={1} step={0.01} onChange={(v) => onChange('posX', v)} />
@@ -1186,14 +1226,43 @@ function TrackInspector({ trackId }) {
   const tracks = useTimelineStore(s => s.tracks)
   const updateTrack = useTimelineStore(s => s.updateTrack)
   const removeTrack = useTimelineStore(s => s.removeTrack)
+  const moveTrackBy = useTimelineStore(s => s.moveTrackBy)
   const track = tracks.find(t => t.id === trackId)
   if (!track) return <div className="inspector__empty">No track selected</div>
+
+  // `tracks` is bottom-to-top, so the LAST entry is the front-most layer (and
+  // the top row in the Timeline panel). Stated in words here because "layer 3
+  // of 4" on its own doesn't say which end is the front.
+  const index = tracks.findIndex(t => t.id === trackId)
+  const isFront = index === tracks.length - 1
+  const isBack = index === 0
+  const layerNote = tracks.length < 2
+    ? 'only layer'
+    : isFront ? 'front-most' : isBack ? 'back-most' : `${tracks.length - 1 - index} layer(s) in front`
 
   return (
     <div className="inspector__section">
       <div className="inspector__section-header">Track: {track.name}</div>
       <div className="inspector__field"><label className="inspector__label">Name</label><input className="inspector__input" type="text" value={track.name} onChange={(e) => updateTrack(trackId, { name: e.target.value })} /></div>
       <div className="inspector__field"><label className="inspector__label">Type</label><span className="inspector__value">{track.type}</span></div>
+      <div className="inspector__field">
+        <label className="inspector__label">Layer</label>
+        <div className="inspector__slider">
+          <button
+            className="inspector__btn inspector__btn--icon"
+            onClick={() => moveTrackBy(trackId, +1)}
+            disabled={isFront}
+            title="Move one layer forward (↑)"
+          >▲</button>
+          <button
+            className="inspector__btn inspector__btn--icon"
+            onClick={() => moveTrackBy(trackId, -1)}
+            disabled={isBack}
+            title="Move one layer back (↓)"
+          >▼</button>
+          <span className="inspector__slider-value">{index + 1} / {tracks.length} — {layerNote}</span>
+        </div>
+      </div>
       <div className="inspector__field"><label className="inspector__label">Opacity</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={track.opacity} onChange={(e) => updateTrack(trackId, { opacity: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(track.opacity * 100).toFixed(0)}%</span></div></div>
       <div className="inspector__field"><label className="inspector__label">Blend Mode</label><BlendModeSelect value={track.blendMode || 'Normal'} onChange={(v) => updateTrack(trackId, { blendMode: v })} /></div>
       <button className="inspector__btn" onClick={() => removeTrack(trackId)} style={{ marginTop: 12, color: 'var(--status-error)' }}>Delete Track</button>

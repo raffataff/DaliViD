@@ -10,7 +10,7 @@ import './NodeCard.css'
 export const NODE_COLORS = {
   'CLIP_SOURCE': '#44cc88', 'CLIP_OUTPUT': '#ff6644', 'VIDEO_INPUT': '#44cc88',
   'IMAGE_INPUT': '#44cc88', 'TEXT_INPUT': '#ffcc44', 'SHAPE_INPUT': '#ff5588', 'LETTERBOX': '#8899aa',
-  'TRANSFORM': '#8899aa',
+  'TRANSFORM': '#8899aa', 'ARRAY': '#8899aa',
   'CAMERA_INPUT': '#44aaff', 'SCREEN_INPUT': '#44aaff', 'AUDIO_INPUT': '#ff00aa', 'AUDIO_SPLITTER': '#cc44ff',
   'AUDIO_VISUALIZER': '#ff00aa', 'OUTPUT': '#ff6644', 'EDGE_DETECTION': '#ff8844',
   'COLOR_INVERSION': '#ff44cc', 'GLITCH': '#ff3344', 'FEEDBACK': '#aa44ff',

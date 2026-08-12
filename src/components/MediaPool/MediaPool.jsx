@@ -13,6 +13,7 @@ import { parseParams, getDefaultParams } from '../../utils/paramParser'
 import { addToast } from '../common/Toast'
 import ContextMenu from '../common/ContextMenu'
 import TransitionsTab from './TransitionsTab'
+import FontsTab from './FontsTab'
 import {
   startScreenCapture, startRecording, stopRecording, stopRecordingIfActive,
   openRecordingSink, isRecording, getRecordingInfo, mp4Supported, tsStamp,
@@ -23,6 +24,7 @@ const TABS = [
   { id: 'videos', label: 'Videos' },
   { id: 'images', label: 'Images' },
   { id: 'text', label: 'Text' },
+  { id: 'fonts', label: 'Fonts' },
   { id: 'shapes', label: 'Shapes' },
   { id: 'cameras', label: 'Cameras' },
   { id: 'screens', label: 'Screen' },
@@ -1028,6 +1030,9 @@ export default function MediaPool() {
             </div>
           </>
         )}
+
+        {/* ── Fonts Tab ── */}
+        {activeTab === 'fonts' && <FontsTab />}
 
         {/* ── Shapes Tab ── */}
         {activeTab === 'shapes' && (
