@@ -131,6 +131,12 @@ export function selectIndex(value, options, fallback = 0) {
  * Sine wave). A config may carry `showIf: { param, equals }` or
  * `showIf: { param, notEquals }`; `equals` accepts a single value or an array.
  *
+ * **`showIf` may also be an ARRAY of clauses, which are ANDed.** A GLSL shader
+ * declares one `@showif` line per clause and `paramParser` accumulates them, so
+ * a control can depend on two other params at once — `ARRAY`'s Spacing Y is
+ * both "Grid mode only" and "Centered anchor only". A single clause stays a
+ * plain object and takes exactly the path it always did.
+ *
  * Select params compare by LABEL (`equals: 'Square'`) but may be *stored* as an
  * index, so the stored value is normalised through the referenced config's
  * option list first — the same both-shapes tolerance as `selectIndex`.
@@ -148,26 +154,32 @@ export function selectIndex(value, options, fallback = 0) {
  */
 export function isParamVisible(config, params = {}, allConfigs = [], alwaysShow = null) {
   const rule = config?.showIf
-  if (!rule || !rule.param) return true
+  if (!rule) return true
   if (alwaysShow && alwaysShow.has(config.uniformName)) return true
 
-  const ref = allConfigs.find(c => c.uniformName === rule.param)
-  const raw = params[rule.param] ?? ref?.default
+  const test = (r) => {
+    if (!r || !r.param) return true
 
-  // Normalise to something comparable with the rule's operand.
-  let actual = raw
-  if (ref?.type === 'select' && Array.isArray(ref.options)) {
-    actual = ref.options[selectIndex(raw, ref.options, 0)]
-  } else if (ref?.type === 'checkbox') {
-    actual = !!raw
+    const ref = allConfigs.find(c => c.uniformName === r.param)
+    const raw = params[r.param] ?? ref?.default
+
+    // Normalise to something comparable with the rule's operand.
+    let actual = raw
+    if (ref?.type === 'select' && Array.isArray(ref.options)) {
+      actual = ref.options[selectIndex(raw, ref.options, 0)]
+    } else if (ref?.type === 'checkbox') {
+      actual = !!raw
+    }
+
+    if ('notEquals' in r) {
+      const list = Array.isArray(r.notEquals) ? r.notEquals : [r.notEquals]
+      return !list.includes(actual)
+    }
+    const list = Array.isArray(r.equals) ? r.equals : [r.equals]
+    return list.includes(actual)
   }
 
-  if ('notEquals' in rule) {
-    const list = Array.isArray(rule.notEquals) ? rule.notEquals : [rule.notEquals]
-    return !list.includes(actual)
-  }
-  const list = Array.isArray(rule.equals) ? rule.equals : [rule.equals]
-  return list.includes(actual)
+  return Array.isArray(rule) ? rule.every(test) : test(rule)
 }
 
 /** Convenience wrapper: the visible subset of a node's param configs. */

@@ -52,9 +52,17 @@ export function parseParams(source) {
     }
 
     // Check for @showif directive — conditional visibility for this control.
+    // Repeated lines ACCUMULATE and are ANDed (see isParamVisible): a control
+    // can legitimately depend on two other params at once. A single directive
+    // stays a plain object, so the common case is untouched.
     const showIfMatch = line.match(/\/\/\s*@showif\s+(.+)/)
     if (showIfMatch) {
-      pendingShowIf = parseShowIfDirective(showIfMatch[1])
+      const rule = parseShowIfDirective(showIfMatch[1])
+      if (rule) {
+        if (!pendingShowIf) pendingShowIf = rule
+        else if (Array.isArray(pendingShowIf)) pendingShowIf.push(rule)
+        else pendingShowIf = [pendingShowIf, rule]
+      }
       continue
     }
 

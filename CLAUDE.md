@@ -390,9 +390,38 @@ then failed the build from inside rolldown with `'node:util' does not provide an
 
 - **`ARRAY`** (Utility category) repeats the incoming frame as N copies in a **Grid**, a cascading
   **Chain**, or a **Radial** ring/spiral. Plain effect node, so `DEFAULT_EFFECT_DEF` gives it
-  `hasParamInputs` and every one of its 24 numeric controls gets a float socket free — a `RAMP`
+  `hasParamInputs` and every one of its 26 numeric controls gets a float socket free — a `RAMP`
   into Count, an `LFO` into Array Angle, a splitter band into Radius, keyframes on any of them.
-- **Grid does not loop over copies, and that is the whole design.** A grid is a lattice, so the
+- **`Anchor` is orthogonal to Mode, and `Keep Original` is a PROMISE.** `Centered` lays the array
+  out around the array centre and auto-fits it to the frame — the mosaic / video-wall job.
+  **`Keep Original` is the Blender array modifier: copy 0 is the input frame, byte for byte, and
+  copies 1..N−1 cascade away from it** — place something where you want it, repeat *from* there.
+  Three things follow from that promise and all three are load-bearing:
+  - **Keep Original does not fold Array Angle or Center into the query.** Centered rotates and
+    re-centres the query once, which is cheap and correct there — but doing it under Keep Original
+    would drag the original along with the array. Instead the query passes through untouched, each
+    copy's *displacement* is rotated by `dRot`, and the centre is handed to `arAccum` as the pivot
+    copies scale and rotate **about**. Copy 0 (displacement 0, Size 1, Copy Angle 0) then
+    inverse-maps to `v_uv` regardless of where the centre is or how far the array is turned.
+  - **`arAccum` writes the unrotated / unit-scale case out separately, and that is not a
+    micro-optimisation.** Subtracting the pivot and adding it back is not bit-exact in float, and
+    copy 0 takes exactly that branch — the readback measured a 1/255 drift on the original's edge
+    pixels before the split. Identical arithmetic under Centered, where the pivot is zero.
+  - **Keep Original steps by signed absolute `Offset X/Y`, not by `Spacing`.** At Size 1 a copy IS
+    the whole frame, so "multiples of the copy size" would put every copy off screen; and an array
+    has to be able to go left, up, or **nowhere on an axis**, none of which a positive multiple can
+    express. Units are frame-edge (±1 = half a frame) with **+Y up**, matching Center X/Y and
+    TRANSFORM's Pan — hence the default Offset Y of −0.35, which builds down-right like reading
+    order. `Size` 0 = Auto means **1.0** here rather than a fit ratio, for the same reason.
+  - **Both jitters skip copy 0 under this anchor** (a scattered original is the thing the anchor
+    exists to prevent), but **Bass Size / Beat Punch deliberately still reach it** — those modulate
+    the whole array on purpose, and one static copy among pulsing ones reads as a bug.
+  - **Keep Original walks the bounded loop in every mode, including Grid.** A zero offset on an
+    axis is both the common case there (a plain horizontal repeat) and precisely what a lattice
+    inverse-map cannot invert. Copies are capped at `AR_MAX_I`, and `cols`/`rows` are clamped to fit
+    that budget exactly so the tail fade can never attach to a row that never renders. The right
+    trade: this anchor is for a handful of copies, not a 40×40 wall — which is what Centered is for.
+- **Centered Grid does not loop over copies, and that is the whole design.** A grid is a lattice, so the
   copies that can cover a pixel are found by inverse-mapping the pixel to its own cell and then
   visiting only the neighbours whose footprint can still reach it. Cost is therefore **independent
   of the count**: 3×3 and 40×40 both cost one fetch per pixel at the default spacing (measured:
@@ -422,8 +451,9 @@ then failed the build from inside rolldown with `'node:util' does not provide an
   slider still drags in whole copies, but a float socket (LFO / RAMP / audio band / keyframe)
   writes any value and the fractional part **fades the last copy in** instead of popping it. An
   audio-driven Count is unusable without that, and it is free — `tailC`/`tailR` are one clamp each.
-- **`Size` 0 means Auto Fit** (`1 / max(count, rows)`), so dropping the node in and setting Count
-  3 / Rows 3 gives an exact mosaic with no arithmetic. Chosen over a separate Fit checkbox because
+- **`Size` 0 means Auto** — `1 / max(count, rows)` under Centered, so dropping the node in and
+  setting Count 3 / Rows 3 gives an exact mosaic with no arithmetic; **1.0** under Keep Original,
+  because copy 0 has to be the input at its own size. Chosen over a separate Fit checkbox because
   the sentinel lives at the bottom of the slider's own travel, where nobody lands by accident.
 - **Everything accumulates PREMULTIPLIED and converts back to straight at the end**, for BLUR's
   reason: a transparent copy carries undefined colour, and blending it straight drags that colour
@@ -440,9 +470,10 @@ then failed the build from inside rolldown with `'node:util' does not provide an
   == the frame HEIGHT on both axes, `v_uv.y` UP, rotation counter-clockwise-positive, position
   params ±1 at the frame edges.
 - **Known limits, all deliberate:** copies are sampled from a canvas-resolution FBO, so `Size` > 1
-  upscales exactly as `TRANSFORM`'s zoom does; heavy overlap past the 5×5 grid cap drops far
-  copies, which is exact for `Over` and approximate for `Add`/`Screen`; and `Spacing Y` is unused
-  in Chain (the chain's direction is `Array Angle`, its step is `Spacing X`).
+  upscales exactly as `TRANSFORM`'s zoom does; heavy overlap past the 5×5 Centered-grid cap drops
+  far copies, which is exact for `Over` and approximate for `Add`/`Screen`; `Spacing Y` is unused
+  in Centered Chain (its direction is `Array Angle`, its step is `Spacing X` — Keep Original's
+  chain takes a full 2D `Offset` instead); and Keep Original tops out at `AR_MAX_I` copies.
 
 ## `@showif` — conditional visibility for GLSL `@param`s
 
@@ -450,6 +481,10 @@ then failed the build from inside rolldown with `'node:util' does not provide an
   `@param` the way `@audiobind` is, into the **existing** `{ param, equals }` / `{ param, notEquals }`
   shape. `NodeCard` and `Inspector` already run every config list through `visibleDataParams`, so
   nothing else had to change — this was the backlog item, and the plumbing was already there.
+- **Repeated `@showif` lines accumulate and are ANDed.** `isParamVisible` now accepts an ARRAY of
+  clauses as well as a single one; a lone directive still produces a plain object, so every
+  `dataNodeParams` entry takes byte-identical code. `ARRAY`'s Spacing Y needs both clauses — it is
+  meaningless outside Grid *and* outside the Centered anchor — and one rule could not say that.
 - Comparison follows `isParamVisible`: **selects by label** (it normalises a stored index through
   the referenced config's option list first), checkboxes by boolean — hence `true`/`false` are
   coerced. A numeric operand is emitted in **both** string and number form, since a select label
@@ -463,22 +498,76 @@ then failed the build from inside rolldown with `'node:util' does not provide an
 
 ## Recently completed
 
-- **`ARRAY` node + `@showif` for shader params (2026-08-12).** See the two sections above.
+- **`FEEDBACK` gained a `Decay` param (2026-08-14).** Shader-only change — one uniform plus its
+  `@param` in `shaderRegistry.js`. Everything downstream is derived, so the Inspector slider,
+  keyframing, the float modulation socket (`u_fb_decay`, via `hasParamInputs`) and serialization
+  all came for free; nothing else was touched.
+  - **Decay is a clamped STEP of the history toward the live frame, not a gain on it.** A gain is
+    the obvious implementation and it is algebraically just Feedback again —
+    `mix(curr, prev * g, f) == mix(curr, prev, f * g)` with the live term dimmed — so it would have
+    been a second slider doing the first one's job, whose only distinguishable effect is the
+    picture going dark. `prev - clamp(prev - curr, -d, d)` is what Feedback genuinely cannot
+    express: the loop's own relaxation is geometric, so a faint trail *approaches* the live frame
+    forever (that is the burn-in at Feedback 0.95+), while a constant step **reaches it exactly, in
+    finite time**. Aiming the step at `curr` rather than at black is what keeps it from crushing
+    the picture — only the part of the history that DIFFERS from the live frame is eaten.
+  - **The `(1 - u_feedback)` scale is load-bearing and its rationale is not the obvious one.**
+    It is not there to stop the picture darkening (the step formulation already can't). It is
+    there so the two sliders COMPOSE: measured, a raw constant step kills every trail at
+    10 / 11 / 11 frames for Feedback 0.7 / 0.85 / 0.95 — i.e. touching Decay makes Feedback stop
+    meaning anything — where the scaled step gives 13 / 18 / 30, so Feedback still sets the length
+    and Decay shortens it.
+  - **Neutral at 0, and the default is 0, deliberately.** `clamp(delta, -0.0, 0.0)` is exactly
+    `0.0`, so `hist` is `prev` *bit-for-bit*. A FEEDBACK node saved before this param existed
+    carries no `u_fb_decay`, `uploadUniforms` skips it, and GLSL's implicit 0.0 then reproduces the
+    old picture exactly instead of silently un-trailing every existing project. Verified byte-exact
+    below, not assumed. Do not "improve" the default off zero.
+  - **Fixed in passing: the node faded itself in from 85% transparent.** The ping-pong starts
+    cleared, so `mix(curr.a, prev.a, f)` began at `1 - f` and crawled up — and *never arrived*,
+    because the FBO's own quantisation stalls the geometric approach: opaque footage settled at
+    **0.988 alpha in RGBA8 / 0.9985 in RGBA16F, permanently**. `outCol.a = max(outCol.a, curr.a)`
+    makes it exact from frame 1. A trail may only ADD coverage, never eat the live frame's matte.
+  - **Verified on real WebGL2, `scripts/verify-feedback.mjs`** — the harness CLAUDE.md said was
+    worth rebuilding, now kept rather than thrown away (Playwright + SwiftShader; **not** wired
+    into `npm run lint`, playwright is deliberately not a dep). 35 assertions, both FBO formats
+    `FBOManager` can pick, all passing: Decay 0 **byte-identical to the pre-change shader in RGB**
+    at frames 1/2/5/30/60 at default *and* non-default Zoom/Rotate; a still frame bit-identical to
+    a passthrough at Decay 0.05 / 0.25 / 0.5 / 1.0 after 240 passes; a trail reaching the live
+    frame exactly at frames 27 / 22 / 15 / 12 for Decay 0.02 / 0.05 / 0.2 / 0.5 and provably never
+    within 600 at Decay 0; opaque footage exactly opaque from frame 1; a vanished blob leaving
+    **exactly zero** residual coverage with Decay vs a stuck 4/255 ghost without it. Cost 0.992x
+    over 300 passes, i.e. flat — three ALU ops on a bandwidth-bound pass.
+  - Still open (needs a GPU and real footage): whether Decay's useful range is really the whole
+    0–1 slider or crowds into the bottom third in practice, and whether the treble audio driver's
+    0.15 coefficient is the right strength for burning trails off on transients.
+
+- **`ARRAY` node, its `Keep Original` anchor, and `@showif` for shader params (2026-08-12).** See
+  the two sections above.
   **Both static checks AND a real WebGL2 run were done in-session this time.** `smoke:shaders`
   passes at 65 shaders + 35 transitions; ESLint over the whole tree is 0 errors / 1 pre-existing
   warning (`NODE_COLORS` in `NodeCard.jsx`). The runtime check was a throwaway Playwright +
-  headless-Chromium/SwiftShader harness that compiled the shader and asserted 15 behaviours —
-  worth repeating for the next GLSL change, since none of these are visible to the static test:
-  identity (1×1 at Size 1 reproduces the source to ±1.5/255), the 3×3 auto-fit mosaic sampling
-  each cell centre at source (0.5, 0.5), full-frame coverage, linear mapping inside a cell, a
-  source alpha ramp surviving inside each copy to ±0.5/255, straight colour restored after the
-  premultiplied blend, fractional Count fading the tail copy to exactly half alpha, Chain and
-  Radial both drawing (Radial landing 4 copies on the compass points), Mirror flipping alternate
-  cells, Stacking changing which overlapping copy wins, Add accumulating in the overlap, Original
-  filling behind, and the flat Grid cost curve quoted above.
+  headless-Chromium/SwiftShader harness that compiled the shader and asserted 24 behaviours —
+  **worth rebuilding for the next GLSL change**, since none of these are visible to the static
+  test. It is ~200 lines: launch `/opt/pw-browsers/chromium-1194/chrome-linux/chrome` with
+  `--use-gl=swiftshader --enable-unsafe-swiftshader`, compile `injectAudioDrivers(getShaderSource(…))`
+  against the repo's own fullscreen-quad VS, upload a source texture whose R/G channels ENCODE its
+  own uv so any output pixel says exactly where it came from, then `readPixels` and assert.
+  - **Geometry:** identity (1×1 at Size 1 reproduces the source to ±1.5/255), the 3×3 auto-fit
+    mosaic sampling each cell centre at source (0.5, 0.5), full-frame coverage, linear mapping
+    inside a cell, Mirror flipping alternate cells, Radial landing 4 copies on the compass points.
+  - **Alpha:** a source alpha ramp surviving inside each copy to ±0.5/255, and straight colour
+    restored after the premultiplied blend (this is the halo bug, caught numerically).
+  - **Blending:** Stacking changing which overlapping copy wins, Add accumulating in the overlap,
+    Source Under filling behind, fractional Count fading the tail copy to exactly half alpha.
+  - **The anchor's promise, against a transparent blob source:** a 1×1 Keep Original array is
+    byte-identical to a Centered identity; **Center X/Y and Array Angle at extreme values leave it
+    byte-identical too** (this is the one that found the pivot round-off — it read 1/255 before
+    `arAccum` grew its exact branch); jitter at maximum leaves it byte-identical; and Grid / Chain
+    / Radial each place copy 0 on the original with the rest cascading off it.
+  - **Cost:** Grid 3×3 vs 40×40 at 28.6ms vs 29.3ms, i.e. flat.
   - Still open (needs a real GPU and real footage): how the Smooth prefilter holds up at 30+
     copies on live video, whether the 5×5 neighbourhood cap is ever visible with `Add`, and
-    whether 24 float sockets makes the card unwieldy in practice.
+    whether 26 float sockets makes the card unwieldy in practice.
 
 - **The font picker wouldn't stay open, and exported text was stair-stepped (2026-08-12).**
   Reported as two bugs. They were four, and each headline one had a cause that looks nothing like
