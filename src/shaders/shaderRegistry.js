@@ -589,6 +589,8 @@ void main() {
 `)
 
 // ── Feedback Loop ──
+// Declaring u_prev_frame is what earns this node its own ping-pong FBO pair (the
+// isFeedback branch in executeGraphDAG) — its output IS its history.
 registerShader('FEEDBACK', `#version 300 es
 precision highp float;
 in vec2 v_uv;
@@ -597,6 +599,8 @@ uniform sampler2D u_prev_frame;
 uniform float u_time;
 // @param name="Feedback" min=0.0 max=0.99 default=0.85 step=0.01
 uniform float u_feedback;
+// @param name="Decay" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_fb_decay;
 // @param name="Zoom" min=0.99 max=1.05 default=1.005 step=0.001
 uniform float u_fb_zoom;
 // @param name="Rotate" min=-0.1 max=0.1 default=0.0 step=0.001
@@ -613,7 +617,60 @@ void main() {
   uv += 0.5;
   vec4 prev = texture(u_prev_frame, uv);
   vec4 curr = texture(u_texture, v_uv);
-  fragColor = mix(curr, prev, u_feedback);
+
+  // ── Decay ──
+  // How fast a trail gives up and rejoins the live frame. Implemented as a fixed
+  // per-pass STEP of the history toward the live frame, clamped so it can never
+  // overshoot past it — deliberately not a gain on the history.
+  //
+  // A gain is the obvious implementation and it is the wrong one, because it is
+  // algebraically just Feedback again: mix(curr, prev * g, f) == mix(curr, prev,
+  // f * g) with the live term dimmed. A Decay slider built that way duplicates
+  // the slider above it, and the only effect you could actually tell apart is
+  // the picture going dark.
+  //
+  // A clamped step is the thing Feedback genuinely cannot express. The loop's
+  // own relaxation is geometric, so a faint trail approaches the live frame
+  // without ever reaching it — that is the burnt-in residue that never quite
+  // leaves at Feedback 0.95+. A constant step reaches it EXACTLY, in finite
+  // time. And because the step aims at curr rather than at black, it only ever
+  // eats the part of the history that DIFFERS from the live frame: a still frame
+  // comes through untouched at any Decay, so this cannot crush the picture.
+  //
+  // Scaled by (1 - u_feedback) — the loop's own per-pass relaxation — so the two
+  // sliders COMPOSE instead of fighting. A raw constant step takes roughly
+  // amplitude / step passes to finish whatever Feedback is set to, so Decay 0.1
+  // would cut every trail at ~10 frames whether Feedback said 0.7 or 0.95, and
+  // Feedback would stop meaning anything the moment you touched Decay (measured:
+  // 10 / 11 / 11 frames at Feedback 0.7 / 0.85 / 0.95). With the scale, Feedback
+  // still sets the length and Decay shortens it proportionally — 13 / 18 / 30
+  // frames across the same three. Read it as "cut the trail this much shorter
+  // than Feedback alone would": 0 is the old never-ending trail, 1 is about five
+  // frames of smear.
+  //
+  // Neutral at 0, which is also the default, and that is load-bearing:
+  // clamp(delta, -0.0, 0.0) is exactly 0.0, so hist is prev BIT-FOR-BIT. A
+  // FEEDBACK node saved before this param existed carries no u_fb_decay,
+  // uploadUniforms skips it, and GLSL's implicit 0.0 then renders the old
+  // picture exactly rather than a node that quietly stopped trailing. Do not
+  // "improve" the default off zero.
+  //
+  // Audio driver (0 until wired): treble burns the trails off.
+  float decay = (u_fb_decay + u_treble * 0.15) * (1.0 - u_feedback);
+  vec4 delta = prev - curr;
+  vec4 hist = prev - clamp(delta, -decay, decay);
+
+  vec4 outCol = mix(curr, hist, u_feedback);
+  // Trails may only ADD coverage, never eat into the live frame's own matte.
+  // Decay steps the history's ALPHA too — it has to, or an alpha source leaves a
+  // still-covering ghost after its colour has caught up — and where the source
+  // is transparent curr.a is 0, so that trail decays to exactly nothing. This
+  // floor also fixes a pre-existing wart unrelated to Decay: the history FBO is
+  // cleared to alpha 0, so on the node's first frame the unfloored mix rendered
+  // the whole node 85% transparent and faded it in over ~30 frames, every time
+  // the graph recompiled or the canvas resized.
+  outCol.a = max(outCol.a, curr.a);
+  fragColor = outCol;
 }
 `)
 
@@ -1060,6 +1117,25 @@ void main() {
 //    writes any value, and the fractional part FADES the last copy in instead of
 //    popping it. An audio-driven Count is unusable without that.
 //
+// 4. ANCHOR IS ORTHOGONAL TO MODE, AND "KEEP ORIGINAL" IS A PROMISE.
+//    Centered lays the array out around the array centre and auto-fits it to
+//    the frame — the mosaic / video-wall job. Keep Original is the Blender array
+//    modifier: COPY 0 IS THE INPUT FRAME, BIT-EXACT, and copies 1..N-1 cascade
+//    away from it, so you can place something where you want it and repeat FROM
+//    there. That promise is why Keep Original does not rotate the query by Array
+//    Angle (it rotates each copy's DISPLACEMENT instead) and adds the pivot back
+//    after the inverse map: with a displacement of 0, Size 1 and Copy Angle 0,
+//    copy 0's transform is the identity whatever Center and Array Angle are set
+//    to. Rotating the query would drag the original along with the array.
+//    Keep Original also uses SIGNED absolute offsets rather than Spacing: with
+//    Size 1 a copy IS the whole frame, so "multiples of the copy size" would put
+//    every copy off screen, and an array needs to be able to go left, up, or
+//    nowhere on an axis — none of which a positive multiple can express.
+//    It walks the bounded loop in every mode, because a zero offset on an axis
+//    is both COMMON there (a plain horizontal repeat) and exactly the case a
+//    lattice inverse-map cannot invert. Copies are capped at AR_MAX_I, which is
+//    the right trade: this anchor is for a handful of copies, not a 40x40 wall.
+//
 // Conventions are TRANSFORM's and SHAPE_INPUT's: aspect-corrected frame units
 // where 1.0 == the frame HEIGHT on both axes, v_uv.y UP, rotation
 // counter-clockwise-positive on screen, and position params +-1 at the frame
@@ -1075,19 +1151,31 @@ uniform float u_audio_bands[8];   // always-live FFT bands
 uniform float u_beat;             // always-live beat trigger
 // @param name="Mode" min=0 max=2 default=0 step=1 type=select options="Grid,Chain,Radial"
 uniform int u_ar_mode;
+// @param name="Anchor" min=0 max=1 default=0 step=1 type=select options="Centered,Keep Original"
+uniform int u_ar_anchor;
 // @param name="Count" min=1 max=64 default=3 step=1
 uniform float u_ar_count;
 // @showif u_ar_mode != Chain
 // @param name="Rows / Rings" min=1 max=64 default=3 step=1
 uniform float u_ar_rows;
-// @param name="Size (0=Auto Fit)" min=0.0 max=4.0 default=0.0 step=0.005
+// @param name="Size (0=Auto)" min=0.0 max=4.0 default=0.0 step=0.005
 uniform float u_ar_size;
 // @showif u_ar_mode != Radial
+// @showif u_ar_anchor == Centered
 // @param name="Spacing X" min=0.05 max=4.0 default=1.0 step=0.005
 uniform float u_ar_gap_x;
 // @showif u_ar_mode == Grid
+// @showif u_ar_anchor == Centered
 // @param name="Spacing Y" min=0.05 max=4.0 default=1.0 step=0.005
 uniform float u_ar_gap_y;
+// @showif u_ar_mode != Radial
+// @showif u_ar_anchor == Keep Original
+// @param name="Offset X" min=-2.0 max=2.0 default=0.35 step=0.005
+uniform float u_ar_off_x;
+// @showif u_ar_mode != Radial
+// @showif u_ar_anchor == Keep Original
+// @param name="Offset Y" min=-2.0 max=2.0 default=-0.35 step=0.005
+uniform float u_ar_off_y;
 // @showif u_ar_mode == Radial
 // @param name="Radius" min=0.0 max=2.0 default=0.35 step=0.005
 uniform float u_ar_radius;
@@ -1131,7 +1219,7 @@ uniform int u_ar_blend;
 uniform int u_ar_order;
 // @param name="Filtering" min=0 max=1 default=1 step=1 type=select options="Fast,Smooth"
 uniform int u_ar_filter;
-// @param name="Original" min=0.0 max=1.0 default=0.0 step=0.01
+// @param name="Source Under" min=0.0 max=1.0 default=0.0 step=0.01
 uniform float u_ar_orig;
 // @param name="Bass Size" min=0.0 max=1.0 default=0.0 step=0.01
 uniform float u_ar_bass;
@@ -1197,10 +1285,23 @@ vec4 arFetch(vec2 luv, vec2 fp) {
 // Evaluate one copy at query point q (array space) and composite it into the
 // premultiplied accumulator. Returns true once Over has saturated, which is the
 // caller's signal to stop walking.
+//
+// pivot is what the copy scales and rotates ABOUT, added back after the inverse
+// map. It is zero under the Centered anchor (the query was already re-centred),
+// and the array centre under Keep Original — which is what makes copy 0 there a
+// bit-exact pass-through no matter where the centre is put.
 bool arAccum(inout vec4 acc, vec2 q, vec2 pos, float scl, float rotA,
-             float op, float hue, vec2 flip, float aspect) {
+             float op, float hue, vec2 flip, vec2 pivot, float aspect) {
   float s = max(scl, 1e-4);
-  vec2 lp = arQRot(rotA) * (q - pos) / s;
+  // Scale and rotate about the pivot — but write the unrotated, unit-scale case
+  // out separately, because it is the one that has to be EXACT. Subtracting the
+  // pivot and adding it back is not bit-exact in float, and Keep Original's
+  // copy 0 takes this branch: a 1/255 drift on the pixels of an untouched
+  // original is small but it is not "untouched". Identical arithmetic under the
+  // Centered anchor, where the pivot is zero.
+  vec2 lp = (rotA == 0.0 && s == 1.0)
+          ? q - pos
+          : arQRot(rotA) * ((q - pivot) - pos) / s + pivot;
   vec2 luv = vec2(lp.x / aspect, lp.y) + 0.5;
   if (flip.x < 0.0) luv.x = 1.0 - luv.x;
   if (flip.y < 0.0) luv.y = 1.0 - luv.y;
@@ -1231,11 +1332,14 @@ bool arAccum(inout vec4 acc, vec2 q, vec2 pos, float scl, float rotA,
 
 // Where copy k of a CHAIN lands, relative to the first copy. See note 2 above:
 // this is the closed form of sum(j = 0 .. k-1) of scaleStep^j * R(spin*j) * step.
-vec2 arChain(float k, float lenX, float st, float spin, bool degen, vec2 den) {
-  if (degen) return vec2(lenX * k, 0.0);
+// The final multiply is complex, so the step may point anywhere — which is what
+// lets Keep Original drive the chain with a signed 2D offset.
+vec2 arChain(float k, vec2 stepV, float st, float spin, bool degen, vec2 den) {
+  if (degen) return stepV * k;
   float sk = clamp(pow(st, k), 0.0, 1e6);
   vec2 zk = sk * vec2(cos(spin * k), sin(spin * k));
-  return lenX * arCDiv(vec2(1.0, 0.0) - zk, den);
+  vec2 geo = arCDiv(vec2(1.0, 0.0) - zk, den);
+  return vec2(stepV.x * geo.x - stepV.y * geo.y, stepV.x * geo.y + stepV.y * geo.x);
 }
 
 void main() {
@@ -1246,23 +1350,41 @@ void main() {
   float pulse = 1.0 + u_audio_bands[1] * u_ar_bass * 1.2 + u_beat * u_ar_punch * 0.5;
 
   int mode = clamp(u_ar_mode, 0, 2);
+  bool keep = (u_ar_anchor == 1);
+  // Grid is the only mode with a lattice to invert, and Keep Original's offsets
+  // are free-form (signed, and routinely zero on one axis), so everything else
+  // takes the bounded loop — see note 4.
+  bool lattice = (mode == 0 && !keep);
+
   float fcount = clamp(u_ar_count, 1.0, 64.0);
   float frows  = (mode == 1) ? 1.0 : clamp(u_ar_rows, 1.0, 64.0);
   int cols = int(ceil(fcount - 1e-4));
   int rows = int(ceil(frows - 1e-4));
+  // The loop paths visit copies by a single flat index, so the grid they see has
+  // to fit the budget exactly — otherwise the tail fade would be attached to a
+  // row that never renders.
+  if (!lattice) {
+    cols = min(cols, AR_MAX_I);
+    rows = min(rows, max(1, AR_MAX_I / cols));
+  }
   // The fractional tail (see note 3) — 1.0 on a whole number, otherwise the
   // opacity of the copy currently fading in at the end of the run.
   float tailC = clamp(fcount - float(cols - 1), 0.0, 1.0);
   float tailR = clamp(frows - float(rows - 1), 0.0, 1.0);
 
-  // Auto size: the largest copy that still tiles the frame at this count, so
-  // dropping the node in and setting Count / Rows gives an exact mosaic with no
-  // arithmetic. Explicit Size wins the moment it leaves 0.
-  float autoS = 1.0 / float(max(max(cols, rows), 1));
+  // Auto size: Centered picks the largest copy that still tiles the frame at
+  // this count, so setting Count / Rows gives an exact mosaic with no
+  // arithmetic. Keep Original picks 1.0 — copy 0 has to be the input frame at
+  // its own size, which IS the promise. Explicit Size wins either way.
+  float autoS = keep ? 1.0 : 1.0 / float(max(max(cols, rows), 1));
   float baseS = max((u_ar_size <= 0.0005 ? autoS : u_ar_size) * pulse, 1e-4);
 
   vec2 cell  = vec2(baseS * aspect, baseS);
   vec2 pitch = cell * vec2(max(u_ar_gap_x, 0.02), max(u_ar_gap_y, 0.02));
+  // Keep Original's step: signed, absolute, in frame-edge units like Center X/Y
+  // and TRANSFORM's Pan, with +Y UP. Nothing is derived from the copy size here
+  // — see note 4 for why that would be useless at Size 1.
+  vec2 off = vec2(u_ar_off_x * 0.5 * aspect, u_ar_off_y * 0.5);
 
   float rotB = u_ar_rot * AR_D2R;
   // Audio driver (0 until wired): mids twist the cascade.
@@ -1272,10 +1394,20 @@ void main() {
   // Audio driver (0 until wired): loudness scatters the copies.
   float jit  = max(u_ar_jit_pos + u_rms * 0.5, 0.0);
 
-  // Array space: undo the array's own rotation and centre ONCE, so every copy is
-  // then a plain translate / rotate / scale of the query point.
   vec2 centre = vec2(u_ar_cx * 0.5 * aspect, u_ar_cy * 0.5);
-  vec2 q = arQRot(u_ar_angle * AR_D2R) * (p - centre);
+  float angR = u_ar_angle * AR_D2R;
+  // Centered folds the array's rotation and centre into the QUERY once, so every
+  // copy is then a plain translate / rotate / scale of it.
+  //
+  // Keep Original cannot do that: rotating the query rotates the original too,
+  // and so does re-centring it. It passes the query through UNTOUCHED, rotates
+  // each copy's DISPLACEMENT with dRot instead, and hands arAccum the centre as
+  // the pivot copies scale and rotate about — so copy 0 (displacement 0, Size 1,
+  // Copy Angle 0) inverse-maps to v_uv exactly, whatever those two are set to.
+  vec2 q = keep ? p : arQRot(angR) * (p - centre);
+  float ca = cos(angR), sa = sin(angR);
+  mat2 dRot = keep ? mat2(ca, sa, -sa, ca) : mat2(1.0, 0.0, 0.0, 1.0);
+  vec2 pivot = keep ? centre : vec2(0.0);
 
   vec4 acc = vec4(0.0);
   // Walk front to back so Over can stop early. Only Over is order-dependent;
@@ -1283,7 +1415,7 @@ void main() {
   bool desc = (u_ar_order == 0);
   bool done = false;
 
-  if (mode == 0) {
+  if (lattice) {
     // ── GRID — inverse-mapped lattice, no per-copy loop.
     // Cell coordinate of this pixel. y counts DOWN so row 0 is the top row.
     vec2 g = vec2(q.x, -q.y) / max(pitch, vec2(1e-4))
@@ -1340,22 +1472,29 @@ void main() {
         if (u_ar_mirror == 1 || u_ar_mirror == 3) flip.x = mod(float(ix), 2.0) < 0.5 ? 1.0 : -1.0;
         if (u_ar_mirror == 2 || u_ar_mirror == 3) flip.y = mod(float(iy), 2.0) < 0.5 ? 1.0 : -1.0;
 
-        if (arAccum(acc, q, pos, scl, rotB + spin * k, op, u_ar_hue * k, flip, aspect)) {
+        if (arAccum(acc, q, pos, scl, rotB + spin * k, op, u_ar_hue * k, flip, pivot, aspect)) {
           done = true;
           break;
         }
       }
     }
   } else {
-    // ── CHAIN / RADIAL — bounded loop, front to back, early out.
+    // ── CHAIN / RADIAL / Keep-Original GRID — bounded loop, front to back,
+    //    early out. Positions are built relative to COPY 0, so under Keep
+    //    Original index 0 has displacement exactly zero.
     int n = clamp(cols * rows, 1, AR_MAX_I);
     vec2 zc = st * vec2(cos(spin), sin(spin));
     vec2 den = vec2(1.0, 0.0) - zc;
     bool degen = dot(den, den) < 1e-6;
-    // Centre the chain on the array centre rather than growing off one end.
-    vec2 mid = 0.5 * arChain(float(n - 1), pitch.x, st, spin, degen, den);
+    vec2 chStep = keep ? off : vec2(pitch.x, 0.0);
+    // Centered grows the chain from the array centre; Keep Original grows it
+    // from the original, which is the whole point of the anchor.
+    vec2 mid = keep ? vec2(0.0) : 0.5 * arChain(float(n - 1), chStep, st, spin, degen, den);
     bool full = u_ar_arc >= 359.5;
     float arcR = u_ar_arc * AR_D2R;
+    // Ring seat of copy 0, subtracted under Keep Original so the ring hangs off
+    // the original instead of sliding it onto the ring.
+    vec2 ring0 = keep ? vec2(max(u_ar_radius, 0.0), 0.0) : vec2(0.0);
 
     for (int i = 0; i < AR_MAX_I; i++) {
       if (i >= n || done) break;
@@ -1365,8 +1504,13 @@ void main() {
       vec2 pos;
       float faceRot = 0.0;
       float tail = 1.0;
-      if (mode == 1) {
-        pos = arChain(k, pitch.x, st, spin, degen, den) - mid;
+      if (mode == 0) {
+        int iy = idx / cols;
+        int ix = idx - iy * cols;
+        pos = vec2(float(ix) * off.x, float(iy) * off.y);
+        tail = (ix == cols - 1 ? tailC : 1.0) * (iy == rows - 1 ? tailR : 1.0);
+      } else if (mode == 1) {
+        pos = arChain(k, chStep, st, spin, degen, den) - mid;
         tail = (idx == n - 1) ? tailC : 1.0;
       } else {
         // Radius / Turn is the radius gained per FULL turn, so a 360 arc with
@@ -1378,15 +1522,25 @@ void main() {
         float turn = float(ring) + float(j) / float(cols);
         float a = full ? arcR * turn : arcR * (float(j) / dn);
         float rad = max(u_ar_radius + u_ar_radius_step * turn, 0.0);
-        pos = rad * vec2(cos(a), sin(a));
+        pos = rad * vec2(cos(a), sin(a)) - ring0;
         faceRot = u_ar_orient ? a : 0.0;
         tail = (j == cols - 1 ? tailC : 1.0) * (ring == rows - 1 ? tailR : 1.0);
       }
+      // Array Angle turns the LAYOUT, not the original — dRot is the identity
+      // under Centered, where the query was rotated instead.
+      pos = dRot * pos;
+
+      // Both jitters are LAYOUT, so under Keep Original they skip copy 0: a
+      // scattered original is exactly the thing that anchor exists to prevent.
+      // Bass Size / Beat Punch deliberately still reach it — those modulate the
+      // whole array on purpose, and one static copy among pulsing ones reads as
+      // a bug rather than as an anchor.
+      float jg = (keep && idx == 0) ? 0.0 : 1.0;
       pos += (vec2(arHash(vec2(k, u_ar_seed + 1.0)),
-                   arHash(vec2(k, u_ar_seed + 7.0))) - 0.5) * jit * cell;
+                   arHash(vec2(k, u_ar_seed + 7.0))) - 0.5) * jit * jg * cell;
 
       float scl = baseS * clamp(pow(st, k), 1e-4, 64.0)
-                * (1.0 + (arHash(vec2(k, u_ar_seed + 13.0)) - 0.5) * u_ar_jit_size);
+                * (1.0 + (arHash(vec2(k, u_ar_seed + 13.0)) - 0.5) * u_ar_jit_size * jg);
       float op = pow(fade, k) * tail;
 
       vec2 flip = vec2(1.0);
@@ -1394,7 +1548,7 @@ void main() {
       if (u_ar_mirror == 1 || u_ar_mirror == 3) flip.x = par;
       if (u_ar_mirror == 2 || u_ar_mirror == 3) flip.y = par;
 
-      if (arAccum(acc, q, pos, scl, rotB + spin * k + faceRot, op, u_ar_hue * k, flip, aspect)) {
+      if (arAccum(acc, q, pos, scl, rotB + spin * k + faceRot, op, u_ar_hue * k, flip, pivot, aspect)) {
         done = true;
       }
     }

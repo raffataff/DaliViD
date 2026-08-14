@@ -1,10 +1,16 @@
 import { useState, useRef } from 'react'
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
+import {
+  Muxer, ArrayBufferTarget,
+  FileSystemWritableFileStreamTarget,
+} from 'mp4-muxer'
 // WebM is the only container the browser will encode with an alpha channel:
 // H.264 has no alpha at all, and MP4/HEVC-with-alpha is a Safari decode-only
 // story. Same author and API shape as mp4-muxer above, so the two paths stay
 // symmetrical. (Both are superseded by `mediabunny` — see CLAUDE.md backlog.)
-import { Muxer as WebMMuxer, ArrayBufferTarget as WebMArrayBufferTarget } from 'webm-muxer'
+import {
+  Muxer as WebMMuxer, ArrayBufferTarget as WebMArrayBufferTarget,
+  FileSystemWritableFileStreamTarget as WebMFileStreamTarget,
+} from 'webm-muxer'
 import useAppStore from '../../store/useAppStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import useAudioStore from '../../store/useAudioStore'
@@ -18,6 +24,7 @@ import {
 } from '../../utils/clipTransitions'
 import { ensureFontsReady } from '../../utils/fontRegistry'
 import { collectUsedFontValues } from '../../utils/fontUsage'
+import { clearTexts } from '../../gl/textRegistry'
 import './ExportModal.css'
 
 /**
@@ -453,6 +460,116 @@ const CODECS = [
 ]
 
 /**
+ * Drop the decoded-frame caches inflated by the frame-by-frame seeking of a
+ * WebCodecs export, in every file-backed <video> element. Chromium retains
+ * decoded media around seek positions for the lifetime of an element and only
+ * frees it when the media pipeline is torn down. `load()` with no src does
+ * exactly that, and restoring the source immediately keeps the element usable.
+ * The element itself is deliberately NOT replaced: its AudioEngine
+ * MediaElementSourceNode and the renderer `_fileUrl` bookkeeping would be left
+ * dangling, and every fresh element would add another source node to the audio
+ * graph.
+ */
+function resetMediaDecodeCaches(renderer) {
+  if (!renderer?._videoElements) return
+  for (const [clipId, el] of renderer._videoElements) {
+    // Camera/screen clips are live MediaStreams the export never seeks, and
+    // audio clips were decoded offline (not through these elements), so skip
+    // both.
+    if (!(el instanceof HTMLVideoElement) || el._cameraStream || !el._fileUrl) continue
+    try {
+      if (!el.paused) el.pause()
+      el.removeAttribute('src')
+      el.load()
+      // `preload` is a hint about what to buffer BEFORE playback starts; once
+      // playing, the element buffers ahead regardless. Elements are created
+      // 'auto', which on a blob URL means Chromium happily pulls the whole file
+      // back into the media cache the instant the src is restored — i.e. it
+      // would undo this reset for every clip at once. 'metadata' keeps the
+      // reclaim, and costs nothing during playback.
+      el.preload = 'metadata'
+      el.src = el._fileUrl
+      // Frame stamps describe the torn-down media; clear them so the render
+      // loop re-seeks and re-uploads once the fresh load is ready.
+      delete el._lastSetSourceTime
+      delete el._lastUploadedTime
+      // Paused preview: nothing will drive a redraw, so the canvas would keep
+      // showing the pre-reset texture until the user next scrubs. Repaint once
+      // the reloaded element can be sampled again.
+      el.addEventListener('loadeddata', () => {
+        try { if (!renderer.isPlaying) renderer._renderFrame() } catch { /* context may be gone */ }
+      }, { once: true })
+    } catch (e) {
+      console.warn('[Export] Could not reset media cache for clip', clipId, e?.message)
+    }
+  }
+}
+
+/**
+ * Drop every cached text raster after an export, so the next frame re-draws
+ * them at preview size.
+ *
+ * `Renderer.renderTextNode` rasterizes into a 2D canvas at 2× the render
+ * resolution and uploads that as a texture — at 4K that is a 7680×4320 canvas
+ * (~132 MB of backing store) plus an equally large GPU texture, for EVERY text
+ * node and text clip. `textRegistry` keys its cache on a signature that includes
+ * the size, so an export-sized raster is correctly superseded… the next time
+ * that text source renders. A text clip the playhead is no longer over never
+ * renders again, so its export-sized pair — canvas and texture both — survives
+ * the export indefinitely. Every other GPU allocation shrinks back with
+ * `setResolution`'s `resizeAll`; this is the one that doesn't.
+ *
+ * Call AFTER setResolution has restored the preview size and BEFORE the restore
+ * render, so the re-raster happens immediately and at the right dimensions.
+ */
+function releaseTextRasters(renderer) {
+  clearTexts()
+  const manager = renderer?.textures
+  if (!manager?.textures) return
+  for (const id of [...manager.textures.keys()]) {
+    // `txt_<sourceId>` is renderTextNode's naming; leave clip_/img_ alone (image
+    // textures are uploaded at the image's own size, not the render size).
+    if (id.startsWith('txt_')) manager.delete(id)
+  }
+}
+
+/**
+ * Ask the user where to save the export and open a writable stream to it.
+ *
+ * This is what keeps a long export inside the memory budget. Muxing into an
+ * `ArrayBufferTarget` holds the entire file in RAM, and `finalize()` holds it
+ * about three times over at once — the per-sample chunk data, the writer's
+ * power-of-two backing buffer, and the `.slice()` copy handed to
+ * `target.buffer` — on top of a `Blob` copy immediately after. A 600 MB export
+ * therefore needs well over 2 GB of contiguous allocations in one moment, which
+ * is exactly the "RangeError: Array buffer allocation failed" thrown out of
+ * `new ArrayBuffer`. Streaming to the file instead caps the muxer at one 16 MiB
+ * chunk, whatever the length of the video.
+ *
+ * MUST be called before anything is awaited: `showSaveFilePicker` requires
+ * transient user activation, which expires a few seconds after the click, long
+ * before the font wait and the audio mixdown are done.
+ *
+ * @returns {Promise<{handle: FileSystemFileHandle, stream: FileSystemWritableFileStream, name: string} | null>}
+ *   `null` when the browser has no File System Access API (caller falls back to
+ *   the in-memory + download path). Throws `AbortError` if the user dismisses
+ *   the picker, which means "don't export".
+ */
+async function openExportFileStream(suggestedName, ext) {
+  if (typeof window.showSaveFilePicker !== 'function') return null
+  const isWebM = ext === 'webm'
+  const handle = await window.showSaveFilePicker({
+    suggestedName: `${suggestedName}.${ext}`,
+    types: [{
+      description: isWebM ? 'WebM video' : 'MP4 video',
+      accept: isWebM ? { 'video/webm': ['.webm'] } : { 'video/mp4': ['.mp4'] },
+    }],
+  })
+  const stream = await handle.createWritable()
+  return { handle, stream, name: handle.name || `${suggestedName}.${ext}` }
+}
+
+/**
  * Export Modal — frame/video export with codec, resolution, quality settings.
  */
 export default function ExportModal() {
@@ -604,6 +721,35 @@ export default function ExportModal() {
       return
     }
 
+    // Checked here rather than inside the WebCodecs branch below so we never
+    // open a Save dialog for an export this browser cannot start.
+    if (codecInfo.webCodecs && (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined')) {
+      addToast({ message: 'WebCodecs API (VideoEncoder) is not supported in this browser. Please use a Chromium-based browser.', type: 'error' })
+      return
+    }
+
+    // ── Destination, decided first ──
+    // Technically first because showSaveFilePicker() needs transient user
+    // activation, which is gone by the time the fonts and the audio mixdown have
+    // been awaited. Also the better order to ask in: picking the destination up
+    // front beats being interrupted by a dialog once the render has finished.
+    const projName = useAppStore.getState().projectName || 'Untitled Project'
+    const baseName = `${projName.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}`
+    const fileExt = codecInfo.alpha ? 'webm' : 'mp4'
+    let fileTarget = null
+    if (codecInfo.webCodecs) {
+      try {
+        fileTarget = await openExportFileStream(baseName, fileExt)
+      } catch (e) {
+        // Dismissing a Save dialog means "don't export" — not "export somewhere
+        // else". Anything else (permission denied, picker unsupported in this
+        // context) falls through to the in-memory download path.
+        if (e?.name === 'AbortError') return
+        console.warn('[Export] Save picker unavailable, falling back to an in-memory export:', e?.message)
+        fileTarget = null
+      }
+    }
+
     setIsExporting(true)
     setProgress(0)
     exportActiveRef.current = true
@@ -619,16 +765,16 @@ export default function ExportModal() {
     renderer.previewTapEnabled = false
 
     if (codecInfo.webCodecs) {
-      if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') {
-        addToast({ message: 'WebCodecs API (VideoEncoder) is not supported in this browser. Please use a Chromium-based browser.', type: 'error' })
-        renderer.previewTapEnabled = true
-        setIsExporting(false)
-        return
-      }
-
       const originalWidth = renderer.width
       const originalHeight = renderer.height
       const wasPlaying = useAppStore.getState().isPlaying
+
+      // Declared outside the try so the finally below can always close it. A
+      // WebCodecs encoder left unclosed holds its internal buffers and the last
+      // frames it produced until GC, which is part of why memory stays elevated
+      // after an export. Remains null on the paths that return before it is
+      // created.
+      let encoder = null
 
       try {
         if (wasPlaying) {
@@ -719,13 +865,33 @@ export default function ExportModal() {
         }
         const hasAudio = !!audioBuffer
 
+        // Needed before the muxer now (it sizes the fast-start reservation), not
+        // just by the frame loop.
+        const totalFrames = Math.ceil(exportDuration * exportFps)
+
+        // Upper bound on the number of encoded audio packets. AAC-LC emits one
+        // per 1024 frames and Chrome's Opus one per 960 (20 ms); dividing by 480
+        // means a shorter packet size can never overrun the reservation. Over-
+        // reserving is written out as a `free` box and costs a few hundred KB;
+        // under-reserving throws mid-export, so the slack is deliberate.
+        const expectedAudioChunks = hasAudio
+          ? Math.ceil(audioBuffer.length / 480) + 64
+          : 0
+
         // Initialize Muxer — declare the audio track up front when present.
         // `alpha: true` on the WebM video track is what makes the muxer write the
         // encoder's side-data alpha plane into the file; without it the encoder
         // still produces alpha and the container silently drops it.
+        //
+        // Target: the file the user picked when there is one, so encoded data
+        // goes to disk as it is produced and the muxer never holds more than a
+        // chunk. `ArrayBufferTarget` (no File System Access API) is the fallback
+        // and keeps the whole file in memory — see openExportFileStream.
         let muxer = codecInfo.alpha
           ? new WebMMuxer({
-            target: new WebMArrayBufferTarget(),
+            target: fileTarget
+              ? new WebMFileStreamTarget(fileTarget.stream)
+              : new WebMArrayBufferTarget(),
             video: {
               codec: 'V_VP9',
               width: exportWidth,
@@ -742,7 +908,9 @@ export default function ExportModal() {
             } : {}),
           })
           : new Muxer({
-            target: new ArrayBufferTarget(),
+            target: fileTarget
+              ? new FileSystemWritableFileStreamTarget(fileTarget.stream)
+              : new ArrayBufferTarget(),
             video: {
               codec: 'avc',
               width: exportWidth,
@@ -755,11 +923,20 @@ export default function ExportModal() {
                 sampleRate: audioBuffer.sampleRate,
               },
             } : {}),
-            fastStart: 'in-memory',
+            // Was 'in-memory', which retains every encoded sample until
+            // finalize() and then copies the lot — the single largest allocation
+            // in an export and the direct cause of "Array buffer allocation
+            // failed". The object form reserves space for the moov box up front
+            // instead, so samples are written out (and their buffers dropped) as
+            // they arrive, for the same fast-start result.
+            fastStart: {
+              expectedVideoChunks: totalFrames + 16,
+              ...(hasAudio ? { expectedAudioChunks } : {}),
+            },
           })
 
         // Setup VideoEncoder
-        let encoder = new VideoEncoder({
+        encoder = new VideoEncoder({
           output: (chunk, meta) => {
             muxer.addVideoChunk(chunk, meta)
           },
@@ -785,8 +962,6 @@ export default function ExportModal() {
         // accumulator un-premultiplied on its way to the drawing buffer (which
         // is `premultipliedAlpha: false`, so it wants straight colour).
         renderer._presentAlpha = !!codecInfo.alpha
-
-        const totalFrames = Math.ceil(exportDuration * exportFps)
 
         // Pre-compute per-frame audio reactivity so audio-driven visuals animate in
         // the export (playback is paused, so the live analyser can't drive them).
@@ -939,26 +1114,51 @@ export default function ExportModal() {
             }
           }
 
+          // Full-PCM mixdown: ~90 MB for four minutes of 48 kHz stereo, and dead
+          // the moment it has been encoded. Release it BEFORE finalize(), which
+          // is the peak-allocation moment of the whole export.
+          audioBuffer = null
+
           muxer.finalize()
 
-          const ext = codecInfo.alpha ? 'webm' : 'mp4'
-          const { buffer } = muxer.target
-          const blob = new Blob([buffer], { type: codecInfo.alpha ? 'video/webm' : 'video/mp4' })
-          const url = URL.createObjectURL(blob)
+          const mimeType = codecInfo.alpha ? 'video/webm' : 'video/mp4'
+          const alphaNote = 'Exported a transparent WebM (VP9 + alpha). Chrome and Firefox show the transparency; Safari does not.'
 
-          const link = document.createElement('a')
-          const projName = useAppStore.getState().projectName || 'Untitled Project'
-          link.download = `${projName.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}.${ext}`
-          link.href = url
-          link.click()
+          if (fileTarget) {
+            // Already on disk — close the stream to commit it. Nothing to
+            // download, and nothing file-sized left in memory.
+            const savedName = fileTarget.name
+            await fileTarget.stream.close()
+            fileTarget = null
+            addToast({
+              message: codecInfo.alpha
+                ? `Saved ${savedName}. Transparency is preserved — Chrome, Edge and Firefox show it; Safari does not.`
+                : `Saved ${savedName}.`,
+              type: 'success',
+            })
+          } else {
+            const { buffer } = muxer.target
+            const blob = new Blob([buffer], { type: mimeType })
+            // The Blob now owns its own copy. Drop the muxer's before creating
+            // the object URL so the file is not alive twice at once.
+            muxer.target.buffer = null
+            muxer = null
 
-          URL.revokeObjectURL(url)
-          addToast({
-            message: codecInfo.alpha
-              ? 'Exported a transparent WebM (VP9 + alpha). Chrome and Firefox show the transparency; Safari does not.'
-              : 'Video exported successfully as seekable MP4!',
-            type: 'success',
-          })
+            const url = URL.createObjectURL(blob)
+            const link = document.createElement('a')
+            link.download = `${baseName}.${fileExt}`
+            link.href = url
+            link.click()
+            // Deferred: revoking in the same task can race the download start in
+            // some Chromium builds, and the Blob is the last file-sized thing
+            // held in memory — this is the call that actually frees it.
+            setTimeout(() => URL.revokeObjectURL(url), 60000)
+
+            addToast({
+              message: codecInfo.alpha ? alphaNote : 'Video exported successfully as seekable MP4!',
+              type: 'success',
+            })
+          }
           setExportModalOpen(false)
         } else {
           addToast({ message: 'Export cancelled.', type: 'info' })
@@ -977,6 +1177,29 @@ export default function ExportModal() {
         useAudioStore.getState().resetToSilence()
         try { getAudioEngine().startAnalysis(() => useAudioStore.getState()) } catch { /* ok */ }
 
+        // A cancelled or failed export leaves the picked file open and locked
+        // (Chromium writes through a swap file, so the destination is still
+        // whatever it was). abort() discards the partial write and releases it.
+        // On the success path fileTarget was already closed and nulled above.
+        if (fileTarget) {
+          try { await fileTarget.stream.abort() } catch { /* already closed */ }
+          fileTarget = null
+        }
+
+        // The export loop sought every active <video> element frame-by-frame,
+        // which inflates the per-element decoded-media cache that Chromium keeps
+        // around seek positions, often by hundreds of MB, and the browser does
+        // not release that on its own. Tear the pipeline down and reload in place
+        // so the element (and its AudioEngine source node) survives with a small,
+        // fresh cache. Runs BEFORE the restore below so the elements are already
+        // reloading when playback resumes, rather than being yanked out from
+        // under a just-resumed render loop.
+        try {
+          resetMediaDecodeCaches(renderer)
+        } catch (e) {
+          console.warn('[Export] Media cache reset failed:', e?.message)
+        }
+
         // Restore original settings. Guard every GL-touching call: if the context
         // was lost mid-export, setResolution/_renderFrame would throw and leave the
         // modal stuck in the exporting state.
@@ -985,6 +1208,10 @@ export default function ExportModal() {
         if (!contextLost) {
           try {
             renderer.setResolution(originalWidth, originalHeight)
+            // resizeAll has just shrunk every FBO back; the text rasters are the
+            // one thing it cannot reach, so they are dropped here and re-drawn
+            // at preview size by the render on the next line.
+            releaseTextRasters(renderer)
             renderer._renderFrame()
             if (wasPlaying) {
               useAppStore.getState().play()
@@ -998,13 +1225,27 @@ export default function ExportModal() {
           addToast({ message: 'Export crashed: the GPU ran out of memory. Try a lower resolution or frame rate.', type: 'error' })
         }
 
+        // Close the WebCodecs encoder. flush() alone leaves it holding its
+        // internal buffers and the last frames it produced; close() is the one
+        // call that releases them deterministically. Guarded because a cancelled
+        // export can leave it in any state and close() throws on an already-
+        // closed encoder.
+        try {
+          if (encoder && encoder.state !== 'closed') encoder.close()
+        } catch (e) {
+          console.warn('[Export] VideoEncoder close failed:', e?.message)
+        }
+
         setIsExporting(false)
         exportActiveRef.current = false
       }
     } else {
       // Fallback to legacy WebM MediaRecorder export
+      // Declared here so the catch below can stop the capture tracks if the
+      // recorder dies before onstop fires.
+      let stream = null
       try {
-        const stream = canvas.captureStream(exportFps)
+        stream = canvas.captureStream(exportFps)
         const mimeType = codec === 'webm-vp9' ? 'video/webm;codecs=vp9' :
                           codec === 'webm-vp8' ? 'video/webm;codecs=vp8' :
                           'video/webm'
@@ -1020,6 +1261,11 @@ export default function ExportModal() {
         }
 
         recorder.onstop = () => {
+          // MediaRecorder.stop() does not stop tracks of a stream it was handed;
+          // canvas.captureStream keeps sampling the canvas and holding frame
+          // buffers until the tracks are stopped explicitly.
+          stream.getTracks().forEach(t => t.stop())
+
           const blob = new Blob(chunks, { type: 'video/webm' })
           const url = URL.createObjectURL(blob)
           const link = document.createElement('a')
@@ -1063,6 +1309,9 @@ export default function ExportModal() {
       } catch (err) {
         console.error('WebM Export failed:', err)
         addToast({ message: `Export failed: ${err.message}`, type: 'error' })
+        // If recording had already started, stop its capture tracks;
+        // MediaRecorder.stop() never stops tracks of a stream it was handed.
+        try { stream?.getTracks().forEach(t => t.stop()) } catch { /* ok */ }
         renderer.previewTapEnabled = true
         setIsExporting(false)
       }
