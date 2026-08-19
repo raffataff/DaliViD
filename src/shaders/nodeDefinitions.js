@@ -119,10 +119,16 @@ const NODE_DEFS = {
     ],
     hasParamInputs: false,
   },
+  // AUDIO_VISUALIZER draws from the always-live audio TEXTURES (u_audio_tex /
+  // u_audio_hist — see gl/audioTexture.js), so it reacts with nothing wired.
+  // `audio_drivers` is here so a splitter band can be layered ON TOP of that:
+  // the gated drivers are 0.0 until connected and only ever add, which is what
+  // lets one stem (a kick bus, a vocal) push the picture harder than the mix.
   AUDIO_VISUALIZER: {
     inputs: [
       { id: 'input', type: 'texture', name: 'Input' },
       { id: 'audio_in', type: 'audio', name: 'Audio In' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
     ],
     outputs: [
       { id: 'output', type: 'texture', name: 'Output' },

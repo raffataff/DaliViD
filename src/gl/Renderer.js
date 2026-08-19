@@ -10,6 +10,7 @@ import { FBOManager } from './FBOManager.js'
 import { BLEND_MODES_GLSL, getBlendModeIndex } from './BlendModes.glsl.js'
 import { compileGraph, executeChain, executeTransitionCompound, getActiveClip, getActiveClips, getClipSourceTime, resolveFloatConnections, buildNodeMap, normalizeParams } from './clipGraphManager.js'
 import { getAudioEngine } from '../audio/AudioEngine.js'
+import { updateAudioTextures, disposeAudioTextures } from './audioTexture.js'
 import { getCameraStream, removeCameraStream } from './cameraRegistry.js'
 import { ensureNodeImage, removeNodeImage } from './imageRegistry.js'
 import { ensureText, removeText } from './textRegistry.js'
@@ -1093,6 +1094,13 @@ export class Renderer {
     }
     this.lastFrameTime = now
 
+    // Publish this frame's high-resolution audio (log spectrum, waveform, peak
+    // hold and a 128-frame spectrum history) to the shared GPU textures. Once
+    // per frame, before any pass runs, so every node in every graph sees the
+    // same instant of sound. Cheap and unconditional: two small texSubImage2D
+    // calls, no per-pass cost for shaders that don't sample them.
+    const audioTex = updateAudioTextures(gl, getAudioEngine(), this.frameCount)
+
     // Standard uniform state
     const standardState = {
       resolution: [this.width, this.height],
@@ -1106,6 +1114,9 @@ export class Renderer {
       audioTreble: audioState.treble || 0,
       beat: audioState.beat || 0,
       beatCount: audioState.beatCount || 0,
+      // Ring-buffer cursor for u_audio_hist (see gl/audioTexture.js).
+      audioHead: audioTex.head,
+      audioRows: audioTex.rows,
     }
 
     // Clear the screen. A timeline with clips clears to BLACK, because black is
@@ -2732,6 +2743,7 @@ export class Renderer {
     // only by source, so leaving stale programs behind would risk returning
     // programs from a dead context after a remount.
     clearProgramCache(this.gl)
+    disposeAudioTextures(this.gl)
     this.compiledChains.clear()
     this.masterChain = null
     // Intentionally omitting loseContext() as it causes GPU process crashes

@@ -89,11 +89,74 @@ then failed the build from inside rolldown with `'node:util' does not provide an
   downstream — they do **not** run an effect shader pass. (`VIDEO`/`CAMERA` pass the composited
   timeline frame; `IMAGE`/`TEXT`/`SHAPE` render their own pixels in a pre-pass — see below.)
 - **Two-tier audio model:**
-  - Always-live (uploaded by `uploadStandardUniforms`): `u_audio_bands[8]`, `u_audio_rms`, `u_beat`.
+  - Always-live (uploaded by `uploadStandardUniforms`): `u_audio_bands[8]`, `u_audio_rms`, `u_beat`,
+    plus the HIGH-RESOLUTION audio textures below.
   - **Gated** drivers: `u_bass`, `u_mid`, `u_treble`, `u_sub_bass`, `u_low_mid`, `u_high_mid`,
     `u_presence`, `u_rms` are `0.0` unless the `AUDIO_SPLITTER`'s matching band output is wired
     into a node's `audio_drivers` socket. They're auto-declared into effect shaders via
     `injectAudioDrivers`, so shaders use them with no `uniform` line.
+- **High-resolution audio textures (`src/gl/audioTexture.js`)** — the thing that makes drawn-audio
+  possible at all. Eight band scalars can *drive* an effect but cannot *draw* one, which is why the
+  old bar visualiser looked like a 1998 equaliser. Once per frame `Renderer.render()` calls
+  `updateAudioTextures(gl, getAudioEngine(), frameCount)` and publishes:
+  - `uniform sampler2D u_audio_tex` — 512 x 4, R8. Row 0 (v=0.125) LOG spectrum 20 Hz -> 20 kHz
+    (log because music is log: a linear FFT spends half its width above 6 kHz where nothing is);
+    row 1 (v=0.375) linear spectrum; row 2 (v=0.625) waveform, 0.5 = silence, **zero-crossing
+    triggered** so a scope locks instead of skating; row 3 (v=0.875) peak hold (fast up, ~0.6 s fall).
+  - `uniform sampler2D u_audio_hist` — 512 x 128, R8. A ring buffer of row 0, one row per rendered
+    frame (~2.1 s at 60 fps). `u_audio_head` is the newest row, `u_audio_rows` the ring size:
+    `row = mod(u_audio_head - age * (rows - 1), rows)`. Consumers must fade the oldest ~20% of
+    `age` — that is what hides the ring's wrap seam.
+  - Binding is OPT-IN per shader: `uploadStandardUniforms` only binds when the program actually
+    declares one of the samplers, on RESERVED units **7 and 8** (0 = input, 1 = prev frame, 2+ =
+    extra texture sockets), and restores the active unit to `TEXTURE0`. Cost is two small
+    `texSubImage2D` calls per frame, independent of resolution; shaders that don't sample them pay
+    nothing.
+  - Log-bin mapping is cached per (sampleRate, fftSize). Under ~200 Hz several columns share one
+    bin, so those columns INTERPOLATE (no staircase); higher up many bins share a column, so those
+    take the **peak**, not the mean — a mean averages transients away and is why smeared bars look
+    dead.
+- **`AUDIO_VISUALIZER` is built on those textures.** Ten modes (`Bars, Radial, Scope, Waterfall,
+  Tunnel, Nebula, Rings, Terrain, Particles, Prism`); the four time-axis ones read `u_audio_hist`
+  and simply could not exist on the old 8-band data. Notes for anyone editing it:
+  - It declares `u_prev_frame`, which is what makes `executeGraphDAG` hand it a ping-pong pair —
+    that pair IS the trail buffer. Trails subtract the warped background back out of the previous
+    output (`prev.rgb - texture(u_texture, tuv).rgb * u_bg_dim`) so a static backdrop leaves no
+    smear and only the graphics trail. Naive feedback ghosts the video; this doesn't.
+  - Every mode reads through `band()` / `bandPeak()` / `waveAt()` / `histAt()`, so one set of
+    dynamics controls (gate, gain, curve, frequency window, spectral smoothing) applies uniformly.
+    Add modes by adding an `else if` on `u_mode`, never by sampling the textures directly.
+  - Controls are gated with `@showif` (`u_mode == Bars,Radial` style lists, and an
+    `Advanced Controls` checkbox). NodeCard renders a row per *visible* param but builds SOCKETS
+    from the full list, so hiding a control never strands a wire.
+  - `Terrain` is a projected ground plane (ONE history fetch per pixel), not a per-row loop, and
+    `Particles` is cell-hashed (9 neighbours, constant cost). Both were written that way on purpose
+    — the loop versions are where audio visualisers usually lose their frame rate.
+  - **Perf rules that are load-bearing — do not undo them when adding modes:**
+    1. *One texture fetch per audio lookup.* Spectral smoothing blends toward the CPU-blurred rows
+       4/5, it does NOT run a kernel in the shader. A five-tap `band()` inside a 24-iteration loop
+       is 120 fetches per pixel.
+    2. *Reject before you fetch.* `Rings` and `Particles` do a conservative distance test first and
+       `continue`; their bounds are exact because `dyn()` clamps a band to 4. Particle POSITION is
+       deliberately fetch-free (the swirl rides `energy`, not a per-particle band) so that reject is
+       possible at all.
+    3. *One `pal()` per pixel.* Highlights (tips, caps, hubs, blooms) are `mix(c, vec3(1.0), k)` of
+       the base colour, not fresh palette evaluations. `Radial` used to call `pal()` five times per
+       pixel with no early-out and measured ~3x the cost of the whole mode after this change alone.
+    4. *No `sin()` hashes.* `hash11/21/22` are the multiply-fract forms; the noise modes call them
+       dozens of times per pixel.
+    5. *Uniform-only work is hoisted* into `gInvFloor` / `gLinearCurve` in `main()`, and `pow()` is
+       skipped entirely when Response Curve is 1.0.
+  - **`Render Scale` (Full / Half / Quarter) is the universal lever.** The node is fill-rate bound,
+    so Half is close to a 4x saving. `nodeFBOScale` handles it, and the feedback branch scales its
+    ping-pong PAIR together — both buffers at one size means the history is read 1:1 and resampled
+    exactly once on the way out, which is why scaling a feedback node is safe here. The shader
+    derives its true texel size from the same param (`rscale`) so edge antialiasing stays correct.
+  - Legacy uniform names were preserved through the rewrite (`u_mode`, `u_opacity`, `u_color_hue`,
+    `u_saturation`, `u_scale`, `u_glow`, `u_trail`, `u_decay`, `u_bg_dim`, `u_smooth`,
+    `u_thickness`, `u_mirror_x/y`, `u_rot_speed`, `u_bass_impact`, `u_beat_flash`), so saved
+    projects keep their settings. `u_particle_count` was dropped in favour of the shared `u_count`;
+    a stale saved value is simply ignored (no matching location).
 - `NON_EFFECT_TYPES` in `Renderer.js` gates whether a graph "has effects". The self-drawing sources
   (`IMAGE_INPUT`, `TEXT_INPUT`, `SHAPE_INPUT`) are deliberately **not** in it, so an image-, text-
   or shape-only master graph still renders. (`TEXT_INPUT` used to be listed, which silently killed
