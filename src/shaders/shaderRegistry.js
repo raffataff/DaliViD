@@ -1931,412 +1931,749 @@ void main() {
 `)
 
 // ── Audio Visualizer ──
+// Rewritten to draw from the HIGH-RESOLUTION audio textures (gl/audioTexture.js)
+// instead of the 8-value u_audio_bands array. That single change is what the
+// modes below are built on: 512 log-spaced spectrum samples, the real waveform,
+// a peak-hold row, and 128 frames of spectrum HISTORY — so time-axis modes
+// (Waterfall, Tunnel, Terrain) exist at all, and bars stop looking like a
+// 90s equaliser. u_prev_frame is declared, which is what makes the executor
+// give this node a ping-pong pair, i.e. the trails.
+//
+// Legacy uniform names are kept wherever the meaning survived (u_mode,
+// u_opacity, u_color_hue, u_saturation, u_scale, u_glow, u_trail, u_decay,
+// u_bg_dim, u_smooth, u_thickness, u_mirror_x/y, u_rot_speed, u_bass_impact,
+// u_beat_flash), so a saved project keeps its settings across the upgrade.
 registerShader('AUDIO_VISUALIZER', `#version 300 es
 precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec2 u_resolution;
 uniform float u_time;
-uniform float u_audio_bands[8];
+
+// ── High-resolution audio (gl/audioTexture.js) ──────────────────────────────
+// u_audio_tex is 512 x 4: row 0 = LOG spectrum (20 Hz -> 20 kHz), row 1 = linear
+// spectrum, row 2 = waveform (0.5 = silence, zero-crossing triggered), row 3 =
+// peak hold. u_audio_hist is a 512 x 128 ring buffer of row 0 — one row per
+// rendered frame — which is what makes waterfalls, tunnels and terrain possible
+// at all: they are pictures of the last ~2 seconds, not of this instant.
+uniform sampler2D u_audio_tex;
+uniform sampler2D u_audio_hist;
+uniform float u_audio_head;   // newest row in the ring
+uniform float u_audio_rows;   // ring size (128)
 uniform float u_audio_rms;
 uniform float u_beat;
-// @param name="Mode" min=0 max=7 default=0 step=1 type=select options="Bars,Radial Bars,Wave,Spectrum Circle,Particles,Hex Mirror,Pulse Grid,Strobe Mix"
+// Feedback buffer — declaring it is what makes the executor hand this node a
+// ping-pong FBO pair, which is where the trails come from.
+uniform sampler2D u_prev_frame;
+
+// ── Core ────────────────────────────────────────────────────────────────────
+// @param name="Mode" min=0 max=9 default=0 step=1 type=select options="Bars,Radial,Scope,Waterfall,Tunnel,Nebula,Rings,Terrain,Particles,Prism"
 uniform int u_mode;
-// @param name="Opacity" min=0.0 max=1.0 default=0.85 step=0.01
+// @param name="Composite" min=0 max=3 default=1 step=1 type=select options="Over,Add,Screen,Solo"
+uniform int u_style;
+// @param name="Opacity" min=0.0 max=1.0 default=0.95 step=0.01
 uniform float u_opacity;
-// @param name="Color Hue" min=0.0 max=1.0 default=0.55 step=0.01
-uniform float u_color_hue;
-// @param name="Color Saturation" min=0.0 max=1.0 default=0.85 step=0.01
-uniform float u_saturation;
-// @param name="Scale" min=0.1 max=5.0 default=1.0 step=0.05
-uniform float u_scale;
-// @param name="Decay" min=0.0 max=0.99 default=0.3 step=0.01
-uniform float u_decay;
-// @param name="Glow Intensity" min=0.0 max=2.0 default=0.6 step=0.05
-uniform float u_glow;
-// @param name="Trail Length" min=0.0 max=1.0 default=0.0 step=0.01
-uniform float u_trail;
-// @param name="Background Dim" min=0.0 max=1.0 default=0.3 step=0.01
+// @param name="Intensity" min=0.0 max=3.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Background Dim" min=0.0 max=1.0 default=0.25 step=0.01
 uniform float u_bg_dim;
-// @param name="Smoothing" min=0.0 max=0.95 default=0.5 step=0.05
-uniform float u_smooth;
-// @param name="Line Thickness" min=0.001 max=0.1 default=0.015 step=0.001
-uniform float u_thickness;
-// @param name="Mirror X" min=0 max=1 default=0 step=1 type=checkbox
-uniform int u_mirror_x;
-// @param name="Mirror Y" min=0 max=1 default=0 step=1 type=checkbox
-uniform int u_mirror_y;
-// @param name="Rotation Speed" min=0.0 max=5.0 default=0.0 step=0.1
-uniform float u_rot_speed;
+// The perf dial. A visualiser is fill-rate bound — every mode costs the same
+// per PIXEL — so rendering at half resolution is close to a 4x saving, and on
+// glow-heavy generative content it is very hard to see. The executor allocates
+// this node's buffers at the matching size (nodeFBOScale in clipGraphManager).
+// @param name="Render Scale" min=0 max=2 default=0 step=1 type=select options="Full,Half,Quarter"
+uniform int u_render_scale;
+
+// ── Colour ──────────────────────────────────────────────────────────────────
+// @param name="Palette" min=0 max=9 default=1 step=1 type=select options="Custom,Spectrum,Inferno,Viridis,Magma,Ice,Neon,Sunset,Mono,Fire"
+uniform int u_palette;
+// @showif u_palette == Custom
+// @param name="Colour A" type=color default=#00e5ff
+uniform vec3 u_color_a;
+// @showif u_palette == Custom
+// @param name="Colour B" type=color default=#ff00aa
+uniform vec3 u_color_b;
+// @showif u_palette == Custom
+// @param name="Colour C" type=color default=#ffe66d
+uniform vec3 u_color_c;
+// @param name="Hue Shift" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_color_hue;
+// @param name="Saturation" min=0.0 max=2.0 default=1.0 step=0.01
+uniform float u_saturation;
+// @param name="Glow" min=0.0 max=3.0 default=0.8 step=0.05
+uniform float u_glow;
+
+// ── Reactivity ──────────────────────────────────────────────────────────────
+// @param name="Audio Gain" min=0.1 max=4.0 default=1.3 step=0.05
+uniform float u_react_gain;
 // @param name="Bass Impact" min=0.0 max=3.0 default=1.0 step=0.05
 uniform float u_bass_impact;
-// @param name="Beat Flash" min=0.0 max=1.0 default=0.3 step=0.01
+// @param name="Beat Punch" min=0.0 max=1.0 default=0.3 step=0.01
 uniform float u_beat_flash;
-// @param name="Particle Count" min=8 max=128 default=32 step=1
-uniform int u_particle_count;
+
+// ── Layout ──────────────────────────────────────────────────────────────────
+// @param name="Scale" min=0.1 max=4.0 default=1.0 step=0.01
+uniform float u_scale;
+// @param name="Trails" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_trail;
+
+// ── Per-mode controls (hidden unless their mode is selected) ────────────────
+// @showif u_mode == Bars,Radial,Rings,Terrain,Particles
+// @param name="Count" min=3 max=256 default=64 step=1
+uniform int u_count;
+// @showif u_mode == Bars,Radial
+// @param name="Gap" min=0.0 max=0.95 default=0.3 step=0.01
+uniform float u_gap;
+// @showif u_mode == Bars
+// @param name="Align" min=0 max=2 default=0 step=1 type=select options="Bottom,Centre,Top"
+uniform int u_align;
+// @showif u_mode == Bars,Radial
+// @param name="Peak Caps" min=0 max=1 default=1 step=1 type=checkbox
+uniform int u_peak_hold;
+// @showif u_mode == Bars
+// @param name="Reflection" min=0.0 max=1.0 default=0.3 step=0.01
+uniform float u_reflect;
+// @showif u_mode == Radial,Tunnel,Terrain,Prism,Scope
+// @param name="Inner Radius / Horizon" min=0.0 max=0.9 default=0.25 step=0.01
+uniform float u_inner;
+// @showif u_mode == Scope
+// @param name="Scope Style" min=0 max=3 default=0 step=1 type=select options="Line,Dual,Ring,Filled"
+uniform int u_wave_mode;
+// @showif u_mode == Scope
+// @param name="Wave Amount" min=0.0 max=2.0 default=0.8 step=0.01
+uniform float u_wave_amp;
+// @showif u_mode == Scope,Rings,Particles,Prism
+// @param name="Thickness" min=0.001 max=0.2 default=0.02 step=0.001
+uniform float u_thickness;
+// @showif u_mode == Waterfall,Tunnel,Terrain
+// @param name="Time Span" min=0.05 max=2.0 default=1.0 step=0.01
+uniform float u_depth;
+// @showif u_mode == Waterfall
+// @param name="Direction" min=0 max=3 default=0 step=1 type=select options="Up,Down,Left,Right"
+uniform int u_dir;
+// @showif u_mode == Tunnel,Nebula,Particles,Prism
+// @param name="Warp" min=-2.0 max=2.0 default=0.5 step=0.01
+uniform float u_warp;
+// @showif u_mode == Tunnel,Nebula,Rings,Terrain,Particles
+// @param name="Flow Speed" min=-3.0 max=3.0 default=0.5 step=0.01
+uniform float u_flow;
+// @showif u_mode == Nebula
+// @param name="Detail" min=1 max=6 default=4 step=1
+uniform int u_detail;
+
+// ── Advanced ────────────────────────────────────────────────────────────────
+// @param name="Advanced Controls" min=0 max=1 default=0 step=1 type=checkbox
+uniform int u_advanced;
+// @showif u_advanced == true
+// @param name="Noise Gate" min=0.0 max=0.5 default=0.02 step=0.005
+uniform float u_floor;
+// @showif u_advanced == true
+// @param name="Response Curve" min=0.3 max=3.0 default=1.0 step=0.05
+uniform float u_curve;
+// @showif u_advanced == true
+// @param name="Spectral Smoothing" min=0.0 max=1.0 default=0.25 step=0.01
+uniform float u_smooth;
+// @showif u_advanced == true
+// @param name="Freq Range Low" min=0.0 max=0.9 default=0.0 step=0.01
+uniform float u_freq_lo;
+// @showif u_advanced == true
+// @param name="Freq Range High" min=0.1 max=1.0 default=0.95 step=0.01
+uniform float u_freq_hi;
+// @showif u_advanced == true
+// @param name="Colour Spread" min=0.0 max=1.0 default=0.5 step=0.01
+uniform float u_grad;
+// @showif u_advanced == true
+// @param name="Position X" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_pos_x;
+// @showif u_advanced == true
+// @param name="Position Y" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_pos_y;
+// @showif u_advanced == true
+// @param name="Rotation" min=-180.0 max=180.0 default=0.0 step=1.0
+uniform float u_rotation;
+// @showif u_advanced == true
+// @param name="Rotation Speed" min=-5.0 max=5.0 default=0.0 step=0.05
+uniform float u_rot_speed;
+// @showif u_advanced == true
+// @param name="Mirror X" min=0 max=1 default=0 step=1 type=checkbox
+uniform int u_mirror_x;
+// @showif u_advanced == true
+// @param name="Mirror Y" min=0 max=1 default=0 step=1 type=checkbox
+uniform int u_mirror_y;
+// @showif u_advanced == true
+// @param name="Kaleidoscope" min=1 max=16 default=1 step=1
+uniform int u_symmetry;
+// @showif u_advanced == true
+// @param name="Trail Decay" min=0.0 max=0.999 default=0.94 step=0.001
+uniform float u_decay;
+// @showif u_advanced == true
+// @param name="Trail Zoom" min=-0.06 max=0.06 default=0.0 step=0.001
+uniform float u_trail_zoom;
+// @showif u_advanced == true
+// @param name="Trail Spin" min=-0.1 max=0.1 default=0.0 step=0.001
+uniform float u_trail_spin;
+// @showif u_advanced == true
+// @param name="Vignette" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_vignette;
+
 out vec4 fragColor;
 
+#define TAU 6.28318530718
+
+// ─── small utilities ────────────────────────────────────────────────────────
+mat2 rot2(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+// Sin-free hashes (Dave Hoskins). The classic fract(sin(...)) form costs a
+// transcendental per call, and the noise/particle modes call it dozens of times
+// per pixel — this is ~6 ALU ops instead, with better distribution.
+float hash11(float n) {
+  float p = fract(n * 0.1031);
+  p *= p + 33.33;
+  return fract(p * (p + p));
+}
+float hash21(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+vec2 hash22(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.xx + p3.yz) * p3.zy);
+}
+vec3 rgb2hsv(vec3 c) {
+  vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+  vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+  float d = q.x - min(q.w, q.y);
+  return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + 1e-10)), d / (q.x + 1e-10), q.x);
+}
 vec3 hsv2rgb(vec3 c) {
-  vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
   vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
   return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
 }
-
-// Attempt a better pseudo-random
-float hash(float n) { return fract(sin(n) * 43758.5453123); }
-float hash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-
-// Smooth band value with manual smoothing factor
-float sband(int i, float sm) {
-  return mix(u_audio_bands[i], u_audio_bands[i] * (1.0 + sm * 0.5), sm);
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i), b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0)), d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+// Fixed inter-octave rotation, precomputed: rot2(0.5) inside the loop made the
+// compiler emit a cos/sin per octave on some drivers.
+const mat2 FBM_ROT = mat2(0.87758256, -0.47942554, 0.47942554, 0.87758256);
+float fbm(vec2 p, int oct) {
+  float v = 0.0, amp = 0.55;
+  for (int i = 0; i < 6; i++) {
+    if (i >= oct) break;
+    v += amp * vnoise(p);
+    p = FBM_ROT * p * 2.03;
+    amp *= 0.5;
+  }
+  return v;
 }
 
-// Trail/echo value
-float trail(int i, float t) {
-  return mix(u_audio_bands[i], u_audio_bands[i] * (1.0 - t), t);
+// ─── palettes ───────────────────────────────────────────────────────────────
+// Four-stop ramps rather than cosine approximations: the named palettes are
+// recognisable precisely because of where their stops sit, and a ramp costs
+// three mixes — nothing next to a texture fetch.
+vec3 ramp4(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
+  t = clamp(t, 0.0, 1.0) * 3.0;
+  vec3 r = mix(a, b, clamp(t, 0.0, 1.0));
+  r = mix(r, c, clamp(t - 1.0, 0.0, 1.0));
+  return mix(r, d, clamp(t - 2.0, 0.0, 1.0));
+}
+vec3 paletteRaw(float t) {
+  if (u_palette == 0) return ramp4(t, u_color_a * 0.15, u_color_a, u_color_b, u_color_c);
+  if (u_palette == 1) return 0.55 + 0.45 * cos(TAU * (fract(t) + vec3(0.0, 0.33, 0.67)));
+  if (u_palette == 2) return ramp4(t, vec3(0.00, 0.00, 0.02), vec3(0.47, 0.11, 0.43), vec3(0.93, 0.41, 0.15), vec3(0.99, 1.00, 0.64));
+  if (u_palette == 3) return ramp4(t, vec3(0.27, 0.00, 0.33), vec3(0.19, 0.41, 0.56), vec3(0.21, 0.72, 0.47), vec3(0.99, 0.91, 0.14));
+  if (u_palette == 4) return ramp4(t, vec3(0.00, 0.00, 0.02), vec3(0.44, 0.13, 0.43), vec3(0.95, 0.38, 0.36), vec3(0.99, 0.99, 0.75));
+  if (u_palette == 5) return ramp4(t, vec3(0.00, 0.03, 0.10), vec3(0.07, 0.31, 0.55), vec3(0.31, 0.76, 0.97), vec3(0.91, 0.98, 1.00));
+  if (u_palette == 6) return ramp4(t, vec3(0.07, 0.00, 0.18), vec3(0.48, 0.18, 0.97), vec3(0.95, 0.03, 0.64), vec3(0.00, 0.96, 0.83));
+  if (u_palette == 7) return ramp4(t, vec3(0.10, 0.04, 0.18), vec3(0.85, 0.31, 0.44), vec3(1.00, 0.62, 0.27), vec3(1.00, 0.91, 0.63));
+  if (u_palette == 8) return ramp4(t, vec3(0.02), vec3(0.28), vec3(0.72), vec3(1.00));
+  return ramp4(t, vec3(0.02, 0.00, 0.04), vec3(0.70, 0.13, 0.04), vec3(1.00, 0.54, 0.00), vec3(1.00, 0.95, 0.69));
+}
+vec3 pal(float t) {
+  vec3 c = paletteRaw(t);
+  if (u_color_hue > 0.001) {
+    vec3 h = rgb2hsv(c);
+    h.x = fract(h.x + u_color_hue);
+    c = hsv2rgb(h);
+  }
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  return max(vec3(0.0), mix(vec3(l), c, u_saturation));
+}
+
+// ─── audio access ───────────────────────────────────────────────────────────
+// Everything reads through these four so one set of dynamics controls (gate,
+// gain, curve, frequency window, smoothing) applies identically to every mode.
+// The wired Audio-Driver sockets are 0.0 until connected, so they ADD on top
+// without changing the default look.
+// Row centres in the 512x8 audio texture (see gl/audioTexture.js).
+const float AR_LOG   = 0.0625;  // log spectrum
+const float AR_WAVE  = 0.3125;  // waveform
+const float AR_PEAK  = 0.4375;  // peak hold
+const float AR_LOGS  = 0.5625;  // log spectrum, pre-blurred on the CPU
+const float AR_PEAKS = 0.6875;  // peak hold, pre-blurred
+
+// Set once in main() so the per-fetch dynamics stay branch-light: these depend
+// only on uniforms, but a driver will not always hoist them out of a loop body.
+float gInvFloor = 1.0;
+bool gLinearCurve = true;
+
+float dyn(float v) {
+  v = max(0.0, v - u_floor) * gInvFloor;
+  if (!gLinearCurve) v = pow(v, u_curve);
+  return min(v * u_react_gain, 4.0);
+}
+float band(float t) {
+  float fx = mix(u_freq_lo, u_freq_hi, clamp(t, 0.0, 1.0));
+  float v = texture(u_audio_tex, vec2(fx, AR_LOG)).r;
+  // Smoothing is a blend toward the pre-blurred row: ONE extra fetch, versus
+  // the four-tap kernel this used to run on every single lookup.
+  if (u_smooth > 0.001) v = mix(v, texture(u_audio_tex, vec2(fx, AR_LOGS)).r, u_smooth);
+  return dyn(v);
+}
+float bandPeak(float t) {
+  float fx = mix(u_freq_lo, u_freq_hi, clamp(t, 0.0, 1.0));
+  float v = texture(u_audio_tex, vec2(fx, u_smooth > 0.001 ? AR_PEAKS : AR_PEAK)).r;
+  return dyn(v);
+}
+float waveAt(float x) { return texture(u_audio_tex, vec2(fract(x), AR_WAVE)).r * 2.0 - 1.0; }
+// age: 0 = this frame, 1 = the oldest frame still in the ring (~2 s at 60 fps).
+float histAt(float t, float age) {
+  float fx = mix(u_freq_lo, u_freq_hi, clamp(t, 0.0, 1.0));
+  float rows = max(2.0, u_audio_rows);
+  float row = mod(u_audio_head - clamp(age, 0.0, 1.0) * (rows - 1.0) + rows * 2.0, rows);
+  return dyn(texture(u_audio_hist, vec2(fx, (row + 0.5) / rows)).r);
 }
 
 void main() {
+  gInvFloor = 1.0 / max(1e-3, 1.0 - u_floor);
+  gLinearCurve = abs(u_curve - 1.0) < 0.005;
+
   vec4 bg = texture(u_texture, v_uv);
-  vec2 uv = v_uv;
-  vec2 center = vec2(0.5);
-  float t = u_time;
+  float aspect = u_resolution.x / max(1.0, u_resolution.y);
+  // u_resolution is the canvas, but a scaled pass renders into a smaller buffer.
+  // Deriving the real texel size here keeps edge antialiasing honest at Half /
+  // Quarter instead of leaving every line a quarter of a pixel wide.
+  float rscale = u_render_scale == 0 ? 1.0 : (u_render_scale == 1 ? 0.5 : 0.25);
+  float px = 1.0 / max(1.0, u_resolution.y * rscale);
+
+  // Wired Audio-Driver sockets (0.0 until connected) fold into the same energies
+  // the spectrum drives, so a splitter can push a specific stem's bass into the
+  // picture on top of whatever the master mix is doing.
+  float drvLow = u_sub_bass + u_bass;
+  float drvHi = u_high_mid + u_presence + u_treble;
+  float punch = u_beat * u_beat_flash;
+  float bassE = (band(0.06) + drvLow) * u_bass_impact;
+  float energy = max(u_audio_rms, u_rms);
+
+  // ── shared coordinate space ──
+  // p: centred, square (y in -0.5..0.5), transformed. f: the same space back as
+  // 0..1 frame coordinates, so bar/waterfall modes inherit every transform.
+  vec2 p = v_uv - 0.5;
+  p.x *= aspect;
+  p -= vec2(u_pos_x * aspect, u_pos_y) * 0.5;
+  p = rot2(radians(u_rotation) + u_time * u_rot_speed * 0.35) * p;
+  p /= max(0.05, u_scale);
+  if (u_symmetry > 1) {
+    float seg = TAU / float(u_symmetry);
+    float a = mod(atan(p.y, p.x) + TAU * 4.0, seg);
+    a = abs(a - seg * 0.5);
+    p = vec2(cos(a), sin(a)) * length(p);
+  }
+  if (u_mirror_x == 1) p.x = abs(p.x);
+  if (u_mirror_y == 1) p.y = abs(p.y);
+  vec2 f = vec2(p.x / aspect, p.y) + 0.5;
+
   vec3 col = vec3(0.0);
-  float alpha = 0.0;
+  float cov = 0.0;
+  float glow = u_glow;
 
-  // Apply rotation around center
-  float angle = u_rot_speed * t * 0.1;
-  float ca = cos(angle), sa = sin(angle);
-  vec2 ruv = uv - center;
-  ruv = vec2(ca * ruv.x - sa * ruv.y, sa * ruv.x + ca * ruv.y) + center;
-  vec2 duv = (u_mirror_x == 1) ? vec2(abs(ruv.x - 0.5) + 0.5, ruv.y) : ruv;
-  if (u_mirror_y == 1) duv = vec2(duv.x, abs(duv.y - 0.5) + 0.5);
-
-  float bass = u_audio_bands[0] * 0.4 + u_audio_bands[1] * 0.6;
-  float smoothed_bass = mix(bass, bass * 1.8, u_smooth);
-  float flash = u_beat * u_beat_flash;
-
-  // ──── MODE 0: Frequency Bars (Enhanced) ────
+  // ──────────────────────────────────────────────── 0: BARS
   if (u_mode == 0) {
-    float bands = 8.0;
-    float barW = 1.0 / bands;
-    float idx = clamp(floor(duv.x * bands), 0.0, 7.0);
-    int band = int(idx);
-    float barH = sband(band, u_smooth) * u_scale * (1.0 + u_bass_impact * 0.5);
-    float relY = duv.y / max(barH, 0.001);
+    float n = float(u_count);
+    float cellF = f.x * n;
+    float t = (floor(cellF) + 0.5) / n;
+    float h = band(t) * (1.0 + punch * 0.5) * 0.8;
+    float hw = (1.0 - u_gap) * 0.5;
+    float aaX = px * n * 0.6;
+    float bar = smoothstep(hw + aaX, hw - aaX, abs(fract(cellF) - 0.5));
+    bar *= step(0.0, f.x) * step(f.x, 1.0);
 
-    if (duv.y < barH) {
-      float hue = u_color_hue + idx * 0.125 + flash * 0.05;
-      float sat = u_saturation * (0.8 + 0.2 * (1.0 - relY));
-      float bri = 0.6 + 0.4 * (1.0 - relY) + flash;
-      float trailAlpha = u_trail * (1.0 - relY);
-      col = hsv2rgb(vec3(hue - idx * 0.02, sat, bri));
-      alpha = u_opacity * (1.0 - relY * 0.3);
+    float base = u_align == 0 ? 0.06 : (u_align == 1 ? 0.5 : 0.94);
+    float dir = u_align == 2 ? -1.0 : 1.0;
+    float y = (f.y - base) * dir;
+    float ay = u_align == 1 ? abs(y) : y;
+    float hh = u_align == 1 ? h * 0.5 : h;
 
-      // Glow below bar top
-      float glowDist = (barH - duv.y) / barH;
-      col += hsv2rgb(vec3(hue, 0.6, 1.0)) * u_glow * 0.15 * glowDist;
+    float body = bar * step(0.0, ay) * smoothstep(hh + px, hh - px, ay);
+    float norm = clamp(ay / max(hh, 1e-3), 0.0, 1.0);
+    // ONE palette evaluation per pixel. The tip, the cap and the floor bloom are
+    // all near-white variants of this colour, so deriving them with a mix is
+    // both cheaper and more coherent than four independent pal() calls — and
+    // pal() is the single most-executed function in the shader.
+    vec3 c = pal(mix(t, norm, u_grad));
+    vec3 hot = mix(c, vec3(1.0), 0.45);
+    col += c * body * (0.75 + 0.55 * (1.0 - norm));
+    cov = max(cov, body);
+
+    // Tip glow: a bar's top edge is the part the eye tracks, so it gets its own
+    // falloff rather than relying on a whole-frame bloom.
+    if (glow > 0.001) {
+      float tip = exp(-abs(ay - hh) * 90.0) * bar * glow;
+      col += hot * tip * 0.9;
+      cov = max(cov, tip * 0.5);
     }
 
-    // Trailing echo bars
-    if (u_trail > 0.01) {
-      float trailH = trail(band, u_decay) * u_scale;
-      if (duv.y < trailH && duv.y >= barH) {
-        float th = duv.y / trailH;
-        col += hsv2rgb(vec3(u_color_hue + idx * 0.125, u_saturation * 0.6, 0.5)) * u_trail * (1.0 - th);
-        alpha = max(alpha, u_trail * 0.4 * (1.0 - th));
-      }
+    // Falling peak caps, straight off the peak-hold row of the audio texture.
+    if (u_peak_hold == 1) {
+      float pkv = bandPeak(t) * 0.8 * (u_align == 1 ? 0.5 : 1.0);
+      float cap = smoothstep(px * 3.0, 0.0, abs(ay - pkv)) * bar * step(0.0, ay);
+      col += mix(c, vec3(1.0), 0.55) * cap * 1.4;
+      cov = max(cov, cap);
     }
 
-    // Baseline glow
-    float baseGlow = exp(-duv.y * 20.0) * 0.05;
-    col += hsv2rgb(vec3(u_color_hue, 0.8, 1.0)) * baseGlow * u_glow * (bass * 0.5 + 0.5);
+    // Reflection below the baseline — the cheap trick that reads as "polished".
+    if (u_reflect > 0.001 && u_align != 1) {
+      float ry = -y;
+      float rbody = bar * step(0.0, ry) * smoothstep(hh + px, hh - px, ry);
+      float fade = u_reflect * (1.0 - clamp(ry / max(hh, 1e-3), 0.0, 1.0)) * 0.6;
+      col += c * rbody * fade;
+      cov = max(cov, rbody * fade);
+    }
+
+    // Floor bloom, pumped by bass.
+    if (glow > 0.001) {
+      float floorGlow = exp(-abs(f.y - base) * 26.0) * (0.15 + bassE * 0.35) * glow;
+      col += hot * floorGlow;
+      cov = max(cov, floorGlow * 0.6);
+    }
   }
 
-  // ──── MODE 1: Radial Bars (Enhanced) ────
+  // ──────────────────────────────────────────────── 1: RADIAL
   else if (u_mode == 1) {
-    vec2 d = duv - center;
-    float dist = length(d);
-    float a = atan(d.y, d.x);
-    float normA = (a + 3.14159265) / 6.2831853;
-    int band = int(floor(normA * 8.0));
-    band = clamp(band, 0, 7);
+    float r = length(p);
+    float a = atan(p.y, p.x);
+    float na = fract(a / TAU + 0.5);
+    float n = float(u_count);
+    float cellF = na * n;
+    float t = (floor(cellF) + 0.5) / n;
+    float h = band(t) * 0.55 * (1.0 + punch * 0.5);
+    float r0 = max(0.04, u_inner);
+    float rr = r - r0;
 
-    float bandVal = sband(band, u_smooth) * u_scale;
-    float innerR = 0.08;
-    float outerR = innerR + bandVal * 0.42 * (1.0 + u_bass_impact * 0.3);
-    float pulseR = outerR + flash * 0.04;
+    float hw = (1.0 - u_gap) * 0.5;
+    float aaA = px * n / max(0.05, TAU * r) * 0.6;
+    float ang = smoothstep(hw + aaA, hw - aaA, abs(fract(cellF) - 0.5));
+    float body = ang * step(0.0, rr) * smoothstep(h + px, h - px, rr);
+    float norm = clamp(rr / max(h, 1e-3), 0.0, 1.0);
+    // One palette evaluation, reused for the tip, cap, hub and waveform ring —
+    // this mode ran pal() five times per pixel over the whole frame, with no
+    // early-out anywhere, which made it the most expensive of the ten.
+    vec3 c = pal(mix(t, norm, u_grad));
+    vec3 hot = mix(c, vec3(1.0), 0.45);
+    col += c * body * (0.8 + 0.5 * (1.0 - norm));
+    cov = max(cov, body);
 
-    if (dist > innerR && dist < pulseR) {
-      float hue = u_color_hue + float(band) * 0.125 + flash * 0.03;
-      float f = smoothstep(pulseR, outerR, dist);
-      float sat = u_saturation * (0.7 + 0.3 * f);
-      col = hsv2rgb(vec3(hue, sat, 0.9 + 0.1 * f));
-      alpha = u_opacity * f;
-
-      // Glow at tip
-      float tipGlow = smoothstep(outerR + 0.03, outerR, dist) * u_glow;
-      col += hsv2rgb(vec3(hue, 0.5, 1.0)) * tipGlow * 0.4;
+    if (glow > 0.001) {
+      float tip = exp(-abs(rr - h) * 90.0) * ang * step(0.0, rr) * glow;
+      col += hot * tip * 0.9;
+      cov = max(cov, tip * 0.5);
     }
 
-    // Inner ring pulse
-    float ringDist = abs(dist - innerR - flash * 0.02);
-    float ringGlow = exp(-ringDist * 80.0) * 0.5;
-    col += hsv2rgb(vec3(u_color_hue + t * 0.02, 0.9, 1.0)) * ringGlow * u_glow;
-
-    // Outer glow
-    if (dist > innerR) {
-      float outerGlow = exp(-(dist - outerR) * 15.0) * 0.08;
-      col += hsv2rgb(vec3(u_color_hue + 0.1, 0.7, 1.0)) * outerGlow * u_glow;
+    if (u_peak_hold == 1) {
+      float pkv = bandPeak(t) * 0.55;
+      float cap = smoothstep(px * 3.0, 0.0, abs(rr - pkv)) * ang * step(0.0, rr);
+      col += mix(c, vec3(1.0), 0.55) * cap * 1.4;
+      cov = max(cov, cap);
     }
 
-    // Trail
-    if (u_trail > 0.01 && dist > pulseR) {
-      float trailR = innerR + trail(band, u_decay) * u_scale * 0.42;
-      if (dist < trailR) {
-        float tf = smoothstep(trailR, trailR - 0.02, dist);
-        col += hsv2rgb(vec3(u_color_hue + float(band) * 0.125, u_saturation * 0.5, 0.7)) * tf * u_trail  * 0.5;
-        alpha = max(alpha, tf * u_trail * 0.3);
-      }
+    // Inner ring + hub only exist near the centre, so gate the whole block on
+    // radius: for most of the frame this skips a texture fetch and two exps.
+    if (r < r0 * 1.35) {
+      // The raw waveform wrapped around the hub — something continuous for the
+      // eye to read against the discrete bars.
+      float wr = r0 * (0.78 + 0.06 * waveAt(na) * (1.0 + energy * 2.0));
+      float ring = smoothstep(u_thickness * 0.5 + px, 0.0, abs(r - wr));
+      col += hot * ring * (0.8 + punch);
+      cov = max(cov, ring);
+
+      float hub = exp(-r * (9.0 / max(0.05, r0))) * (0.25 + punch * 1.2) * glow;
+      col += c * hub;
+      cov = max(cov, hub * 0.7);
     }
   }
 
-  // ──── MODE 2: Waveform (Enhanced multi-layer) ────
+  // ──────────────────────────────────────────────── 2: SCOPE
   else if (u_mode == 2) {
-    float wave1 = 0.5;
-    float wave2 = 0.5;
-    for (int i = 0; i < 8; i++) {
-      float phase = float(i + 1) * 6.28318 * duv.x + t * (1.5 + float(i) * 0.3);
-      float amp = sband(i, u_smooth) * u_scale * 0.06;
-      wave1 += sin(phase) * amp;
-      wave2 += cos(phase * 0.7 + 1.3) * amp * 0.5;
-    }
-
-    // Bass impact bulges the wave
-    wave1 += smoothed_bass * u_bass_impact * 0.03 * sin(duv.x * 3.14159);
-
-    float d1 = abs(duv.y - wave1);
-    float d2 = abs(duv.y - wave2);
-
-    // Multi-layer glow
-    float lineGlow1 = exp(-d1 * 100.0) * u_thickness * 60.0;
-    float lineGlow2 = exp(-d2 * 80.0) * u_thickness * 40.0;
-    float wideGlow1 = exp(-d1 * 20.0) * 0.15;
-    float wideGlow2 = exp(-d2 * 15.0) * 0.1;
-
-    vec3 hue1 = hsv2rgb(vec3(u_color_hue + duv.x * 0.25, u_saturation, 1.0));
-    vec3 hue2 = hsv2rgb(vec3(u_color_hue + duv.x * 0.25 + 0.33, u_saturation * 0.8, 1.0));
-
-    col += hue1 * (lineGlow1 + wideGlow1);
-    col += hue2 * (lineGlow2 + wideGlow2);
-
-    // Trail
-    if (u_trail > 0.01) {
-      for (int j = 1; j < 5; j++) {
-        float offset = float(j) * 0.015;
-        float td = abs(duv.y - (wave1 + offset));
-        float tg = exp(-td * 40.0) * 0.05 * (1.0 - float(j) * 0.2);
-        col += hue1 * tg * u_trail;
+    float th = max(0.0015, u_thickness * 0.5);
+    if (u_wave_mode == 2) {
+      float na = fract(atan(p.y, p.x) / TAU + 0.5);
+      float rr = max(0.04, u_inner) + waveAt(na) * u_wave_amp * 0.22;
+      float d = abs(length(p) - rr);
+      float core = smoothstep(th, th * 0.15, d);
+      col += pal(mix(na, 0.8, u_grad)) * (core + th / (d + th) * glow * 0.5);
+      cov = max(cov, core + th / (d + th) * 0.35);
+    } else if (u_wave_mode == 3) {
+      float w = waveAt(f.x) * u_wave_amp * 0.45;
+      float y0 = 0.5 + w;
+      float fill = step(min(0.5, y0), f.y) * step(f.y, max(0.5, y0));
+      float d = abs(f.y - y0);
+      col += pal(mix(f.x, 1.0 - abs(f.y - 0.5) * 2.0, u_grad)) * (fill * 0.55 + smoothstep(th, 0.0, d) * 1.2);
+      cov = max(cov, fill * 0.8 + smoothstep(th, 0.0, d));
+    } else {
+      float w = waveAt(f.x);
+      float d = abs(f.y - (0.5 + w * u_wave_amp * 0.45));
+      float core = smoothstep(th, th * 0.15, d);
+      float halo = th / (d + th);
+      col += pal(mix(f.x, 0.85, u_grad)) * (core + halo * halo * glow * 0.8);
+      cov = max(cov, core + halo * 0.4);
+      if (u_wave_mode == 1) {
+        // Dual: the spectrum envelope drawn as a second, slower trace. Two
+        // curves reading the same sound at different time scales is what makes
+        // a scope look alive instead of noisy.
+        float e = band(f.x) * u_wave_amp * 0.4;
+        float d2 = abs(f.y - (0.5 - e));
+        float c2 = smoothstep(th, th * 0.2, d2);
+        float h2 = th / (d2 + th);
+        col += pal(mix(f.x + 0.4, 0.3, u_grad)) * (c2 + h2 * h2 * glow * 0.6);
+        cov = max(cov, c2 + h2 * 0.3);
       }
     }
-
-    alpha = clamp((lineGlow1 + lineGlow2 + wideGlow1 + wideGlow2) * 2.0, 0.0, u_opacity);
   }
 
-  // ──── MODE 3: Spectrum Circles (new) ────
+  // ──────────────────────────────────────────────── 3: WATERFALL
   else if (u_mode == 3) {
-    float minR = 0.06;
-    for (int i = 0; i < 8; i++) {
-      float bandVal = sband(i, u_smooth) * u_scale;
-      float radius = minR + float(i) * 0.044 + bandVal * 0.025;
-      float thickness = 0.004 + bandVal * 0.008;
-      float dist = length(duv - center);
-      float ringAlpha = smoothstep(abs(dist - radius), thickness, 0.0);
+    float fx, ft;
+    if (u_dir == 0) { fx = f.x; ft = f.y; }
+    else if (u_dir == 1) { fx = f.x; ft = 1.0 - f.y; }
+    else if (u_dir == 2) { fx = f.y; ft = f.x; }
+    else { fx = f.y; ft = 1.0 - f.x; }
 
-      float hue = u_color_hue + float(i) * 0.125 + flash * 0.04;
-      vec3 ringCol = hsv2rgb(vec3(hue, u_saturation, 0.8 + bandVal * 0.2));
-      col += ringCol * ringAlpha * u_opacity;
-
-      // Glow
-      float glow = exp(-abs(dist - radius) * 30.0) * 0.15 * u_glow;
-      col += hsv2rgb(vec3(hue, 0.5, 1.0)) * glow;
-    }
-
-    // Center pulse
-    float centerPulse = bass * u_bass_impact * 0.03;
-    float cd = length(duv - center);
-    float centerGlow = exp(-cd * 30.0) * (0.3 + centerPulse);
-    col += hsv2rgb(vec3(u_color_hue + t * 0.05, 0.9, 1.0)) * centerGlow * u_glow;
-    alpha = 1.0;
+    float inside = step(0.0, fx) * step(fx, 1.0) * step(0.0, ft) * step(ft, 1.0);
+    float age = clamp(ft / max(0.05, u_depth), 0.0, 1.0);
+    float v = histAt(fx, age);
+    // Fade the oldest rows out: it hides the ring-buffer seam and it is what a
+    // spectrogram should do anyway.
+    float fade = (1.0 - smoothstep(0.75, 1.0, age)) * inside;
+    vec3 c = pal(mix(v * 1.1, fx, u_grad));
+    col += c * v * (0.9 + glow * v) * fade;
+    cov = max(cov, clamp(v * 1.3, 0.0, 1.0) * fade);
   }
 
-  // ──── MODE 4: Particles (new) ────
+  // ──────────────────────────────────────────────── 4: TUNNEL
   else if (u_mode == 4) {
-    int count = u_particle_count;
-    for (int i = 0; i < 128; i++) {
-      if (i >= count) break;
-      float fi = float(i);
-      float bandIdx = mod(fi, 8.0);
-      int bi = int(bandIdx);
-      float bandVal = sband(bi, u_smooth) * u_scale;
+    float r = max(length(p), 1e-4);
+    float r0 = max(0.03, u_inner * 0.5);
+    float a = atan(p.y, p.x);
+    // Twist grows toward the centre, so the corridor appears to spiral away.
+    float na = fract(a / TAU + 0.5 + u_warp * 0.15 / max(r, 0.05) + u_time * u_flow * 0.02);
+    float z = clamp((r - r0) / max(0.05, u_depth * 0.9), 0.0, 1.0);
+    float age = pow(z, 0.65);
+    float v = histAt(na, age);
+    float fade = (1.0 - smoothstep(0.72, 1.0, age)) * smoothstep(r0 * 0.55, r0, r);
+    vec3 c = pal(mix(v * 1.15, na, u_grad));
+    col += c * v * (1.1 + glow * v * 1.4) * fade;
+    cov = max(cov, clamp(v * 1.4, 0.0, 1.0) * fade);
 
-      // Particle position driven by audio
-      float seed = hash(fi);
-      float speed = 0.2 + hash(fi + 100.0) * 0.8;
-      float px = hash(fi + 200.0) + sin(t * speed + fi) * 0.15 * bandVal;
-      float py = hash(fi + 300.0) + cos(t * speed * 0.7 + fi * 1.3) * 0.15 * bandVal;
-      px = fract(px + t * 0.02 * (hash(fi + 400.0) - 0.5));
-      py = fract(py + t * 0.02 * (hash(fi + 500.0) - 0.5));
+    // Mouth of the tunnel — a bass-pumped ring that anchors the perspective.
+    float mouth = exp(-abs(r - r0) * 40.0) * (0.35 + bassE * 0.8) * glow;
+    col += pal(0.05) * mouth;
+    cov = max(cov, mouth * 0.8);
+  }
 
-      float size = (0.005 + bandVal * 0.02) * (0.5 + hash(fi + 600.0) * 0.5);
-      float d = length(duv - vec2(px, py));
-      float particleAlpha = smoothstep(size, size * 0.2, d);
-
-      float hue = u_color_hue + bandIdx * 0.125 + flash * 0.05;
-      vec3 pCol = hsv2rgb(vec3(hue, u_saturation, 0.9 + bandVal * 0.1));
-
-      // Glow
-      float glow = exp(-d * (15.0 / max(size, 0.001))) * 0.3 * u_glow;
-      col += pCol * particleAlpha + hsv2rgb(vec3(hue, 0.4, 1.0)) * glow;
-      alpha = max(alpha, particleAlpha);
+  // ──────────────────────────────────────────────── 5: NEBULA
+  else if (u_mode == 5) {
+    float mid = band(0.4);
+    float hi = band(0.8) + drvHi;
+    float tt = u_time * u_flow * 0.25;
+    vec2 q = p * (2.2 - bassE * 0.5) + vec2(0.0, tt * 0.15);
+    // Two rounds of domain warping. The audio drives the warp AMOUNT rather
+    // than the colour, so the structure itself moves with the music instead of
+    // a static cloud changing hue.
+    vec2 w1 = vec2(fbm(q + tt, u_detail), fbm(q + vec2(5.2, 1.3) - tt, u_detail));
+    // Second warp round only above Detail 3: it is four extra fbm evaluations
+    // (the most expensive thing in the shader) and below that octave count the
+    // structure it adds is not resolvable anyway. Detail is now a real
+    // quality/speed dial rather than just an octave count.
+    vec2 w2 = w1;
+    if (u_detail > 3) {
+      float k = u_warp + bassE * 0.35;
+      w2 = vec2(fbm(q + k * w1 + vec2(1.7, 9.2), u_detail),
+                fbm(q + k * w1 + vec2(8.3, 2.8) + tt * 0.5, u_detail));
     }
+    float v = fbm(q + (u_warp + mid * 0.6) * w2, u_detail);
+    float shape = pow(clamp(v, 0.0, 1.0), 1.6 - hi * 0.4);
+    float fil = length(w2) * 0.5; // filament term — the bright veins
+    vec3 c = pal(mix(shape * 1.4, fil, u_grad));
+    col += c * (shape * 1.6 + pow(fil, 3.0) * glow * 2.0) * (0.6 + energy * 1.6 + punch);
+    cov = max(cov, clamp(shape * 1.7 + pow(fil, 3.0), 0.0, 1.0));
+  }
 
-    // Connect nearby particles with faint lines
-    for (int i = 0; i < 64; i++) {
-      if (i >= count) break;
-      for (int j = i + 1; j < min(i + 4, count); j++) {
-        float fi = float(i), fj = float(j);
-        float bi = mod(fi, 8.0), bj = mod(fj, 8.0);
-        float bv_i = sband(int(bi), u_smooth) * u_scale;
-        float bv_j = sband(int(bj), u_smooth) * u_scale;
-        float px_i = fract(hash(fi + 200.0) + sin(t * 0.3 + fi) * 0.15 * bv_i + t * 0.02 * (hash(fi + 400.0) - 0.5));
-        float py_i = fract(hash(fi + 300.0) + cos(t * 0.21 + fi * 1.3) * 0.15 * bv_i + t * 0.02 * (hash(fi + 500.0) - 0.5));
-        float px_j = fract(hash(fj + 200.0) + sin(t * 0.3 + fj) * 0.15 * bv_j + t * 0.02 * (hash(fj + 400.0) - 0.5));
-        float py_j = fract(hash(fj + 300.0) + cos(t * 0.21 + fj * 1.3) * 0.15 * bv_j + t * 0.02 * (hash(fj + 500.0) - 0.5));
+  // ──────────────────────────────────────────────── 6: RINGS
+  else if (u_mode == 6) {
+    float r = length(p);
+    float na = fract(atan(p.y, p.x) / TAU + 0.5);
+    int n = u_count;
+    for (int i = 0; i < 24; i++) {
+      if (i >= n) break;
+      float fi = float(i);
+      float phase = fract(u_time * u_flow * 0.18 + fi / float(max(n, 1)));
+      float rr = phase * 0.95;
+      // Cheap conservative reject FIRST. A ring is thin, so for most pixels most
+      // rings contribute nothing — and this skips their two texture fetches
+      // entirely. The bound is exact: dyn() clamps a band to 4, so the waveform
+      // offset is at most 0.08 and the widest ring is u_thickness * 3.3.
+      float d0 = abs(r - rr);
+      if (d0 > 0.08 + u_thickness * 3.3) continue;
+      float b = band(fract(fi * 0.137 + 0.05));
+      // Ring thickness tracks its band, so loud bands read as fat bright rings.
+      float w = max(0.002, u_thickness * (0.35 + b * 1.6)) * 0.5;
+      float d = abs(r - rr - waveAt(na + fi * 0.1) * b * 0.02);
+      float ring = smoothstep(w, w * 0.1, d) * (1.0 - phase);
+      col += pal(mix(fi / float(max(n, 1)), b, u_grad)) * ring * (0.9 + b * 1.4);
+      cov = max(cov, ring);
+    }
+    float core = exp(-r * 14.0) * (0.3 + punch * 1.5 + bassE * 0.5) * glow;
+    col += pal(0.12) * core;
+    cov = max(cov, core * 0.8);
+  }
 
-        vec2 a = vec2(px_i, py_i);
-        vec2 b = vec2(px_j, py_j);
-        vec2 ab = b - a;
-        float abLen = length(ab);
-        if (abLen < 0.3) {
-          vec2 duvA = duv - a;
-          float proj = clamp(dot(duvA, ab) / max(abLen * abLen, 0.0001), 0.0, 1.0);
-          float lineD = length(duvA - ab * proj);
-          float lineAlpha = exp(-lineD * 80.0) * 0.15 * min(bv_i, bv_j) * u_scale;
-          float hue = u_color_hue + (bi + bj) * 0.0625;
-          col += hsv2rgb(vec3(hue, u_saturation * 0.6, 1.0)) * lineAlpha;
-        }
+  // ──────────────────────────────────────────────── 7: TERRAIN
+  else if (u_mode == 7) {
+    // A perspective ground plane rather than a per-row loop: one history fetch
+    // per pixel instead of dozens, so it runs at full res on a laptop GPU.
+    float horizon = mix(0.35, 0.9, u_inner);
+    float d = horizon - f.y;
+    if (d > 0.0) {
+      float z = 0.075 / max(1e-4, d);            // depth into the scene
+      float xw = (f.x - 0.5) * z * 0.9;          // world x at that depth
+      float age = clamp(z / max(0.1, u_depth * 8.0), 0.0, 1.0);
+      float v = histAt(clamp(abs(xw), 0.0, 1.0), age);
+      float onPlane = 1.0 - smoothstep(0.85, 1.05, abs(xw));
+      float fog = (1.0 - smoothstep(0.55, 1.0, age)) * onPlane;
+
+      float gz = fract(z * 1.6 - u_time * u_flow * 0.6);
+      float gx = fract(xw * float(u_count) * 0.25 + 0.5);
+      float lz = smoothstep(0.075, 0.0, min(gz, 1.0 - gz)) * clamp(d * 6.0, 0.0, 1.0);
+      float lx = smoothstep(0.06, 0.0, min(gx, 1.0 - gx));
+      float grid = max(lz, lx);
+      vec3 c = pal(mix(v * 1.3, age, u_grad));
+      col += c * (grid * (0.25 + v * 3.0) + v * v * 1.6 * glow) * fog;
+      cov = max(cov, clamp(grid * 0.7 + v * v * 1.4, 0.0, 1.0) * fog);
+    } else {
+      // Sky: a soft bass-driven wash so the horizon has something to sit against.
+      float sky = smoothstep(0.0, 0.45, -d) * (0.05 + bassE * 0.14);
+      col += pal(0.02) * sky;
+      cov = max(cov, sky);
+      float sun = exp(-abs(-d) * 16.0) * (0.25 + punch) * glow;
+      col += pal(0.75) * sun;
+      cov = max(cov, sun * 0.7);
+    }
+  }
+
+  // ──────────────────────────────────────────────── 8: PARTICLES
+  else if (u_mode == 8) {
+    // Cell-hashed particles: 9 neighbours per pixel, constant cost, and the
+    // count slider changes DENSITY rather than a loop bound — which is why this
+    // stays smooth where the old per-particle loop did not.
+    float n = max(2.0, float(u_count) * 0.06);
+    vec2 g = p * n;
+    vec2 gi = floor(g), gf = fract(g);
+    for (int yy = -1; yy <= 1; yy++) {
+      for (int xx = -1; xx <= 1; xx++) {
+        vec2 o = vec2(float(xx), float(yy));
+        vec2 id = gi + o;
+        vec2 h2 = hash22(id);
+        float sp = u_time * u_flow * (0.35 + h2.y * 0.8);
+        vec2 pos = 0.5 + 0.42 * vec2(sin(sp + h2.x * 40.0), cos(sp * 0.83 + h2.y * 31.0));
+        // Swirl rides overall loudness rather than this particle's own band, so
+        // the POSITION costs no texture fetch — which is what lets the distance
+        // reject below run before we sample the spectrum. Eight of the nine
+        // neighbouring cells are usually out of range.
+        pos += u_warp * 0.25 * vec2(cos(sp * 1.7), sin(sp * 1.3)) * (0.3 + energy);
+        float d = length(gf - o - pos);
+        float maxSz = max(0.02, u_thickness * 12.6 * n * 0.8);
+        if (d > maxSz * 3.0) continue;
+        float b = band(fract(h2.x * 1.7 + h2.y * 0.3));
+        float sz = max(0.02, u_thickness * (0.6 + b * 3.0) * n * 0.8);
+        float dot_ = sz / (d + sz);
+        float core = smoothstep(sz * 0.55, sz * 0.1, d);
+        col += pal(mix(h2.x, b * 1.4, u_grad)) * (core * (0.8 + b * 2.0) + pow(dot_, 4.0) * glow);
+        cov = max(cov, clamp(core + pow(dot_, 4.0) * 0.5, 0.0, 1.0));
       }
     }
-
-    alpha = clamp(alpha, 0.0, u_opacity);
   }
 
-  // ──── MODE 5: Hexagonal Mirror (new) ────
-  else if (u_mode == 5) {
-    vec2 p = (duv - center) * 2.0;
-    // Hexagonal coordinates
-    float hexR = length(p);
-    float hexA = atan(p.y, p.x);
-    float hexSize = 0.3 + bass * u_bass_impact * 0.15;
-    float hexIdx = floor(hexA / 1.0472); // 60 degrees
-    float hexFract = fract(hexA / 1.0472);
+  // ──────────────────────────────────────────────── 9: PRISM
+  else {
+    // One radial spectrum sampled three times at slightly different angles —
+    // the RGB channels physically separate, so the edges fringe like a real
+    // prism instead of a hue gradient pretending to.
+    float r = length(p);
+    float na = fract(atan(p.y, p.x) / TAU + 0.5);
+    float r0 = max(0.04, u_inner);
+    float th = max(0.002, u_thickness);
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < 3; i++) {
+      float k = (float(i) - 1.0) * u_warp * 0.03;
+      float t = fract(na + k + r * 0.35);
+      float b = band(t);
+      float rr = r0 + b * 0.42;
+      float d = abs(r - rr);
+      float line = th / (d + th);
+      acc[i] = smoothstep(th, th * 0.2, d) + line * line * glow * 0.7;
+    }
+    vec3 tint = pal(mix(na, 0.7, u_grad));
+    col += acc * mix(vec3(1.0), tint * 1.6, 0.75);
+    cov = max(cov, clamp(dot(acc, vec3(0.4)), 0.0, 1.0));
 
-    // Map to triangular cell
-    vec2 cellUV = vec2(hexFract, hexR / hexSize);
-    cellUV = fract(cellUV * 3.0);
-
-    // Sample audio-reactive color
-    float bandVal = sband(int(mod(hexIdx, 8.0)), u_smooth) * u_scale;
-    float hue = u_color_hue + hexIdx * 0.125 + bandVal * 0.1;
-
-    // Hex edge glow
-    float edgeDist = min(min(hexFract, 1.0 - hexFract), abs(hexR / hexSize - 0.5));
-    float edgeGlow = exp(-edgeDist * 40.0) * 0.4;
-
-    vec3 hexCol = hsv2rgb(vec3(hue, u_saturation, 0.5 + bandVal * 0.5));
-    col = hexCol * (0.3 + bandVal * 0.7) + hsv2rgb(vec3(hue + 0.1, 0.6, 1.0)) * edgeGlow * u_glow;
-
-    // Center burst on beat
-    float burst = flash * exp(-hexR * 3.0) * 0.5;
-    col += hsv2rgb(vec3(u_color_hue + t * 0.1, 0.9, 1.0)) * burst;
-
-    alpha = u_opacity;
+    float hub = exp(-r * (7.0 / max(0.05, r0))) * (0.2 + punch * 1.4) * glow;
+    col += tint * hub;
+    cov = max(cov, hub * 0.7);
   }
 
-  // ──── MODE 6: Pulse Grid (new) ────
-  else if (u_mode == 6) {
-    vec2 gridUV = duv * 8.0;
-    vec2 cellId = floor(gridUV);
-    vec2 cellUV = fract(gridUV);
-    float cellHash = hash2(cellId);
-
-    int band = int(mod(cellId.x + cellId.y * 3.0, 8.0));
-    float bandVal = sband(band, u_smooth) * u_scale;
-
-    // Cell pulse
-    float pulse = bandVal * (1.0 + u_bass_impact * 0.5 * bass);
-    float cellDist = length(cellUV - 0.5);
-    float cellAlpha = smoothstep(0.5, 0.15, cellDist) * pulse;
-
-    float hue = u_color_hue + float(band) * 0.125 + cellHash * 0.05 + flash * 0.03;
-    vec3 cellCol = hsv2rgb(vec3(hue, u_saturation, 0.7 + pulse * 0.3));
-    col += cellCol * cellAlpha;
-
-    // Grid lines
-    float gridLine = min(min(cellUV.x, 1.0 - cellUV.x), min(cellUV.y, 1.0 - cellUV.y));
-    float gridGlow = exp(-gridLine * 30.0) * 0.08 * (0.3 + bandVal * 0.7);
-    col += hsv2rgb(vec3(u_color_hue, 0.5, 1.0)) * gridGlow * u_glow;
-
-    // Beat flash on all cells
-    col += hsv2rgb(vec3(u_color_hue + t * 0.02, 0.9, 1.0)) * flash * 0.15;
-
-    alpha = clamp(u_opacity * (0.3 + pulse * 0.7), 0.0, u_opacity);
+  // ── vignette (on the visualiser layer only) ──
+  if (u_vignette > 0.001) {
+    float vg = 1.0 - u_vignette * smoothstep(0.25, 0.85, length(v_uv - 0.5) * 1.35);
+    col *= vg;
+    cov *= vg;
   }
 
-  // ──── MODE 7: Strobe Mix (new) ────
-  else if (u_mode == 7) {
-    // Strobe on beat
-    float strobe = step(0.7, u_beat) * step(fract(t * 8.0 + hash(floor(t * 4.0)) * 0.5), 0.5);
+  col *= u_intensity;
+  cov = clamp(cov, 0.0, 1.0) * u_opacity;
 
-    // Color cycling
-    float hueShift = u_color_hue + t * 0.1 + u_audio_rms * 0.2;
-    vec3 strobeCol = hsv2rgb(vec3(hueShift, u_saturation, 1.0));
-
-    // Kaleidoscope-like segments
-    vec2 d = duv - center;
-    float a = atan(d.y, d.x);
-    float segments = 6.0;
-    float segA = mod(a * segments / 6.28318 + t * 0.2, 1.0);
-    float segBand = sband(int(floor(segA * 8.0)), u_smooth) * u_scale;
-
-    float dist = length(d);
-    float radialMask = smoothstep(0.5, 0.0, dist);
-
-    col = strobeCol * strobe * radialMask * 0.5;
-    col += hsv2rgb(vec3(hueShift + segA, u_saturation, 0.8)) * segBand * radialMask * u_opacity;
-
-    // Flash on beat
-    col += strobeCol * flash * 0.3;
-
-    alpha = clamp(strobe * 0.5 + segBand * 0.5, 0.0, u_opacity);
+  // ── trails ──
+  // The feedback buffer holds this node's previous OUTPUT, which includes the
+  // background. Subtracting the (warped) background back out recovers the
+  // visualiser layer on its own, so a static backdrop leaves no smear and only
+  // the graphics trail — the thing that always went wrong with naive feedback.
+  if (u_trail > 0.001) {
+    vec2 tuv = v_uv - 0.5;
+    tuv = rot2(u_trail_spin) * tuv * (1.0 - u_trail_zoom) + 0.5;
+    vec4 pv = texture(u_prev_frame, tuv);
+    vec3 ghost = max(vec3(0.0), pv.rgb - texture(u_texture, tuv).rgb * u_bg_dim);
+    ghost *= u_decay * u_trail;
+    col = max(col, ghost);
+    cov = max(cov, clamp(dot(ghost, vec3(0.5)), 0.0, 1.0));
   }
 
-  // ──── Post-processing ────
-  // Background dimming
-  vec3 bgDim = bg.rgb * u_bg_dim;
+  // ── composite ──
+  vec3 base = bg.rgb * u_bg_dim;
+  vec3 outRgb;
+  if (u_style == 0) outRgb = mix(base, col, cov);
+  else if (u_style == 1) outRgb = base + col * cov;
+  else if (u_style == 2) outRgb = 1.0 - (1.0 - clamp(base, 0.0, 1.0)) * (1.0 - clamp(col * cov, 0.0, 1.0));
+  else outRgb = col * cov;
 
-  // Composite
-  vec3 finalCol = mix(bgDim, col + bgDim * (1.0 - alpha), alpha);
-
-  // Beat flash overlay
-  finalCol += vec3(flash * 0.1) * hsv2rgb(vec3(u_color_hue, 0.3, 1.0));
-
-  // Coverage is the union of what came in and what this node drew over it: the
-  // visualiser's own graphics are opaque where alpha is high, but where it drew
-  // nothing the incoming frame's matte must survive. Forcing 1.0 here made a
-  // transparent source opaque and filled its matte with the dimmed backdrop.
-  fragColor = vec4(finalCol, clamp(max(bg.a, alpha), 0.0, 1.0));
+  // Coverage is the union of what arrived and what was drawn: forcing 1.0 here
+  // would fill a transparent source's matte with the dimmed backdrop.
+  float outA = (u_style == 3) ? cov : max(bg.a, cov);
+  fragColor = vec4(clamp(outRgb, 0.0, 8.0), clamp(outA, 0.0, 1.0));
 }
 `)
 

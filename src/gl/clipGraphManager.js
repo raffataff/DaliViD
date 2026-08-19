@@ -51,8 +51,15 @@ const AUDIO_DRIVERS_SOCKET = 'audio_drivers'
 const FBO_SCALE_STEPS = [1.0, 0.5, 0.25]
 
 function nodeFBOScale(node, liveParams) {
-  if (node.type !== 'DEPTH') return 1
-  const idx = Math.round(Number(liveParams?.u_dp_res ?? 1))
+  // Per node type, driven by that node's own resolution param.
+  //   DEPTH             — a data map; half res is invisible downstream.
+  //   AUDIO_VISUALIZER  — fill-rate bound generative graphics, where Half is
+  //                       close to a 4x saving and reads as a slight softness.
+  let idx
+  if (node.type === 'DEPTH') idx = Math.round(Number(liveParams?.u_dp_res ?? 1))
+  else if (node.type === 'AUDIO_VISUALIZER') idx = Math.round(Number(liveParams?.u_render_scale ?? 0))
+  else return 1
+  if (!Number.isFinite(idx)) return 1
   return FBO_SCALE_STEPS[Math.min(FBO_SCALE_STEPS.length - 1, Math.max(0, idx))]
 }
 
@@ -658,17 +665,24 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     let outId
     if (isFeedback) {
       const ppId = `__npp_${scopeId}${node.nodeId}`
+      // A feedback node CAN be scaled, as long as BOTH buffers move together:
+      // the history is then read 1:1 at its own resolution and resampled exactly
+      // once, on the way out. (Mismatched sizes are what would compound
+      // resampling every frame — that is the case the old comment warned about.)
+      const fbScale = nodeFBOScale(node, liveParams)
+      const ppW = Math.max(1, Math.round(renderer.width * fbScale))
+      const ppH = Math.max(1, Math.round(renderer.height * fbScale))
       let pp = fbos.getPingPong(ppId)
-      if (!pp) pp = fbos.createPingPong(ppId, renderer.width, renderer.height)
-      else fbos.resizePingPong(ppId, renderer.width, renderer.height)
+      if (!pp) pp = fbos.createPingPong(ppId, ppW, ppH)
+      else fbos.resizePingPong(ppId, ppW, ppH)
       const prevFrameFBOId = `${ppId}_${pp.current}`
       outId = `${ppId}_${1 - pp.current}`
       renderer.executePass(node, primaryInput, outId, standardState, customParams, prevFrameFBOId, extraTextures)
       pp.swap() // current now points at the buffer we just wrote
     } else {
-      // Data-map nodes (DEPTH) may render at half / quarter res — see nodeFBOScale.
-      // Feedback nodes above are deliberately excluded: their output is their own
-      // history, so a scaled target would compound resampling every frame.
+      // Nodes with a resolution param may render at half / quarter res — see
+      // nodeFBOScale. The feedback branch above scales its ping-pong pair the
+      // same way, keeping both buffers at one size.
       outId = ensureFBO(nFBO(node.nodeId), nodeFBOScale(node, liveParams))
       renderer.executePass(node, primaryInput, outId, standardState, customParams, null, extraTextures)
     }

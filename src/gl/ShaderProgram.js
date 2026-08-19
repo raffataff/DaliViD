@@ -5,6 +5,7 @@
  */
 
 import { md5 } from '../utils/md5.js'
+import { bindAudioTextures, AUDIO_TEX_UNIT, AUDIO_HIST_UNIT, HIST_ROWS } from './audioTexture.js'
 
 // Standard vertex shader for full-screen quad (shared by all effect passes)
 const FULLSCREEN_QUAD_VS = `#version 300 es
@@ -241,6 +242,8 @@ export function uploadStandardUniforms(gl, locations, state) {
     beat = 0,
     beatCount = 0,
     hasSource = 1,
+    audioHead = 0,
+    audioRows = HIST_ROWS,
   } = state
 
   // vec2 u_resolution
@@ -270,6 +273,22 @@ export function uploadStandardUniforms(gl, locations, state) {
   // float u_has_source — 1.0 with a real video source, 0.0 in audio-only mode so
   // generative effects can force their output on when there's no background.
   if (locations.u_has_source) gl.uniform1f(locations.u_has_source, hasSource)
+
+  // ── High-resolution audio textures (see gl/audioTexture.js) ──
+  // Opt-in per shader: nothing is bound unless the program actually declares
+  // one of the samplers, so the 99% of effects that don't care pay nothing.
+  // Units 7/8 are reserved — pass inputs live on 0 (input), 1 (prev frame) and
+  // 2+ (extra texture sockets), so these can never be clobbered mid-pass.
+  const wantsSpec = locations.u_audio_tex != null
+  const wantsHist = locations.u_audio_hist != null
+  if (wantsSpec || wantsHist) {
+    bindAudioTextures(gl) // restores the active unit to TEXTURE0 itself
+    if (wantsSpec) gl.uniform1i(locations.u_audio_tex, AUDIO_TEX_UNIT)
+    if (wantsHist) gl.uniform1i(locations.u_audio_hist, AUDIO_HIST_UNIT)
+  }
+  // Ring-buffer addressing for u_audio_hist: newest row + ring size.
+  if (locations.u_audio_head) gl.uniform1f(locations.u_audio_head, audioHead)
+  if (locations.u_audio_rows) gl.uniform1f(locations.u_audio_rows, audioRows)
 
   // NOTE: the short-name band drivers (u_bass, u_mid, u_treble, u_rms,
   // u_sub_bass, u_low_mid, u_high_mid, u_presence) are NOT uploaded here — they

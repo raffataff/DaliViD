@@ -1,0 +1,1452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DaliVid — Audio Visualizer</title>
+<style>
+  :root {
+    --bg: #0b0c10; --panel: #14161d; --panel2: #1b1e27; --line: #262b36;
+    --txt: #e8ecf4; --dim: #8b93a6; --cyan: #00e5ff; --mag: #ff00aa; --yel: #ffdd00;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--txt);
+    font: 13px/1.45 "Inter", "DM Sans", system-ui, -apple-system, sans-serif; overflow: hidden; }
+  #app { display: flex; height: 100%; }
+  #stage { flex: 1; position: relative; min-width: 0; background: #000; }
+  canvas { width: 100%; height: 100%; display: block; }
+  #hud { position: absolute; left: 14px; top: 12px; display: flex; gap: 8px; align-items: center;
+    font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim);
+    background: rgba(11,12,16,.55); padding: 6px 10px; border-radius: 8px; backdrop-filter: blur(6px); }
+  #hud b { color: var(--cyan); font-weight: 600; }
+  #modes { position: absolute; left: 14px; bottom: 14px; right: 14px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); cursor: pointer;
+    background: rgba(20,22,29,.72); color: var(--dim); font-size: 12px; backdrop-filter: blur(6px);
+    transition: all .12s ease; user-select: none; }
+  .chip:hover { color: var(--txt); border-color: #3a4152; }
+  .chip.on { color: #04070c; background: var(--cyan); border-color: var(--cyan); font-weight: 600; }
+  #panel { width: 320px; background: var(--panel); border-left: 1px solid var(--line);
+    display: flex; flex-direction: column; }
+  #panel header { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
+  #panel h1 { margin: 0; font-size: 14px; letter-spacing: .04em; }
+  #panel h1 span { color: var(--cyan); }
+  #panel p { margin: 4px 0 0; color: var(--dim); font-size: 11px; }
+  #src { display: flex; gap: 6px; padding: 10px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .btn { flex: 1 1 auto; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--txt); cursor: pointer; font-size: 12px; }
+  .btn:hover { border-color: #3a4152; }
+  .btn.on { border-color: var(--cyan); color: var(--cyan); }
+  #controls { flex: 1; overflow-y: auto; padding: 6px 14px 24px; }
+  #controls::-webkit-scrollbar { width: 9px; }
+  #controls::-webkit-scrollbar-thumb { background: #2b303c; border-radius: 6px; }
+  .group { margin: 14px 0 6px; font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--dim); border-bottom: 1px solid var(--line); padding-bottom: 5px; }
+  .row { margin: 9px 0; }
+  .row label { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--dim); margin-bottom: 3px; }
+  .row label b { color: var(--txt); font-weight: 500; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; height: 3px; -webkit-appearance: none; appearance: none;
+    background: #2b303c; border-radius: 3px; outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 13px; height: 13px;
+    border-radius: 50%; background: var(--cyan); cursor: pointer; border: 2px solid #0b0c10; }
+  select, input[type=color] { width: 100%; background: var(--panel2); color: var(--txt);
+    border: 1px solid var(--line); border-radius: 5px; padding: 5px; font-size: 12px; }
+  input[type=color] { height: 26px; padding: 2px; }
+  .check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .check input { accent-color: var(--cyan); }
+  #err { position: absolute; inset: 24px; background: #180b0e; border: 1px solid #5a1420; color: #ff9aa8;
+    padding: 16px; border-radius: 10px; font-family: ui-monospace, monospace; font-size: 12px;
+    white-space: pre-wrap; overflow: auto; display: none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="c"></canvas>
+    <div id="hud"><b id="fps">—</b> fps · <span id="srcname">demo synth</span> · <span id="res"></span></div>
+    <div id="modes"></div>
+    <div id="err"></div>
+  </div>
+  <div id="panel">
+    <header>
+      <h1>Audio Visualizer <span>PRO</span></h1>
+      <p>The exact GLSL from <code>shaderRegistry.js</code>, fed by the same 512-bin log spectrum, waveform and 128-frame history the renderer publishes.</p>
+    </header>
+    <div id="src">
+      <button class="btn on" id="b-synth">Demo synth</button>
+      <button class="btn" id="b-file">Audio file…</button>
+      <button class="btn" id="b-mic">Microphone</button>
+      <button class="btn" id="b-img" style="flex:1 1 100%">Background image… (tests compositing)</button>
+      <button class="btn" id="b-copy" style="flex:1 1 100%">Copy settings as JSON</button>
+    </div>
+    <div id="controls"></div>
+  </div>
+</div>
+<input type="file" id="file" accept="audio/*" hidden>
+<input type="file" id="imgfile" accept="image/*" hidden>
+<script>/* DaliVid — Audio Visualizer preview harness.
+ * Runs the EXACT shader that ships in src/shaders/shaderRegistry.js against the
+ * same audio-texture layout the renderer publishes (src/gl/audioTexture.js), so
+ * what you see here is what the node does in the app.
+ */
+
+// ── audio driver injection (mirrors src/utils/audioDrivers.js) ──────────────
+const AUDIO_DECLARE = ['sub_bass', 'bass', 'low_mid', 'mid', 'high_mid', 'presence', 'treble', 'rms', 'beat']
+function injectAudioDrivers(src) {
+  const decls = []
+  for (const n of AUDIO_DECLARE) {
+    if (!new RegExp(`uniform\\s+(?:lowp\\s+|mediump\\s+|highp\\s+)?float\\s+u_${n}\\b`).test(src)) {
+      decls.push(`uniform float u_${n};`)
+    }
+  }
+  if (!/uniform\s+float\s+u_has_source\b/.test(src)) decls.push('uniform float u_has_source;')
+  if (!decls.length) return src
+  const lines = src.split('\n')
+  let idx = lines.findIndex(l => /\bprecision\b/.test(l))
+  if (idx === -1) idx = 0
+  lines.splice(idx + 1, 0, decls.join('\n'))
+  return lines.join('\n')
+}
+
+// ── @param parsing (mirrors src/utils/paramParser.js) ───────────────────────
+function parseParams(source) {
+  const lines = source.split('\n')
+  const params = []
+  let pending = null, showIf = null
+  const attrRe = /(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([\w.,#-]+))/g
+  for (const raw of lines) {
+    const line = raw.trim()
+    let m = line.match(/\/\/\s*@param\s+(.+)/)
+    if (m) {
+      const attrs = {}
+      let a
+      attrRe.lastIndex = 0
+      while ((a = attrRe.exec(m[1])) !== null) attrs[a[1]] = a[2] || a[3] || a[4]
+      pending = attrs
+      continue
+    }
+    m = line.match(/\/\/\s*@showif\s+(.+)/)
+    if (m) {
+      const r = m[1].match(/^\s*(u_\w+)\s*(==|!=)\s*(.+?)\s*$/)
+      if (r) {
+        const vals = r[3].split(',').map(s => s.trim()).filter(Boolean)
+        const rule = { param: r[1], op: r[2], values: vals }
+        showIf = showIf ? [].concat(showIf, rule) : rule
+      }
+      continue
+    }
+    m = line.match(/uniform\s+(float|int|bool|vec2|vec3|vec4)\s+(u_\w+)\s*;/)
+    if (m && pending) {
+      const [, utype, uname] = m
+      const cfg = { name: pending.name, uniformName: uname, uniformType: utype, min: 0, max: 1, step: 0.01, options: null }
+      cfg.type = pending.type || (utype === 'float' ? 'slider' : utype === 'int' ? 'slider' : utype === 'bool' ? 'checkbox' : utype === 'vec3' ? 'color' : 'slider')
+      if (utype === 'int' && !pending.type) cfg.step = 1
+      if (cfg.type === 'select') cfg.options = (pending.options || '').split(',').map(s => s.trim())
+      if (pending.min !== undefined) cfg.min = parseFloat(pending.min)
+      if (pending.max !== undefined) cfg.max = parseFloat(pending.max)
+      if (pending.step !== undefined) cfg.step = parseFloat(pending.step)
+      if (pending.default !== undefined) {
+        if (cfg.type === 'checkbox') cfg.default = pending.default === 'true' || pending.default === '1'
+        else if (cfg.type === 'color') cfg.default = pending.default.startsWith('#') ? pending.default : '#' + pending.default
+        else if (cfg.type === 'select') cfg.default = parseInt(pending.default, 10) || 0
+        else cfg.default = parseFloat(pending.default)
+      } else {
+        cfg.default = cfg.type === 'checkbox' ? false : cfg.type === 'color' ? '#ffffff' : cfg.min
+      }
+      cfg.showIf = showIf
+      params.push(cfg)
+      pending = null; showIf = null
+    } else if (line.length && !line.startsWith('//')) { pending = null; showIf = null }
+  }
+  return params
+}
+
+function isVisible(cfg, values, configs) {
+  if (!cfg.showIf) return true
+  const rules = Array.isArray(cfg.showIf) ? cfg.showIf : [cfg.showIf]
+  return rules.every(rule => {
+    const other = configs.find(c => c.uniformName === rule.param)
+    let v = values[rule.param]
+    if (other && other.type === 'select') v = other.options[v] ?? String(v)
+    if (typeof v === 'boolean') v = v ? 'true' : 'false'
+    const hit = rule.values.some(x => String(x) === String(v))
+    return rule.op === '!=' ? !hit : hit
+  })
+}
+
+// ── audio analysis → textures (mirrors src/gl/audioTexture.js) ─────────────
+const SPEC_W = 512, SPEC_ROWS = 8, HIST_ROWS = 128
+const BLUR_R = 5
+const LO_HZ = 20, HI_HZ = 20000
+
+function boxBlur(src, dst, tmp) {
+  const w = 2 * BLUR_R + 1
+  let sum = 0
+  for (let i = 0; i <= BLUR_R; i++) sum += src[i]
+  for (let i = BLUR_R + 1; i <= 2 * BLUR_R; i++) sum += src[Math.min(SPEC_W - 1, i)]
+  for (let x = 0; x < SPEC_W; x++) {
+    tmp[x] = sum / w
+    sum += src[Math.min(SPEC_W - 1, x + BLUR_R + 1)] - src[Math.max(0, x - BLUR_R)]
+  }
+  sum = 0
+  for (let i = 0; i <= BLUR_R; i++) sum += tmp[i]
+  for (let i = BLUR_R + 1; i <= 2 * BLUR_R; i++) sum += tmp[Math.min(SPEC_W - 1, i)]
+  for (let x = 0; x < SPEC_W; x++) {
+    dst[x] = sum / w
+    sum += tmp[Math.min(SPEC_W - 1, x + BLUR_R + 1)] - tmp[Math.max(0, x - BLUR_R)]
+  }
+}
+
+class AudioTextures {
+  constructor(gl) {
+    this.gl = gl
+    this.specData = new Uint8Array(SPEC_W * SPEC_ROWS)
+    this.rowData = new Uint8Array(SPEC_W)
+    this.smoothed = new Float32Array(SPEC_W)
+    this.peaks = new Float32Array(SPEC_W)
+    this.blurA = new Float32Array(SPEC_W); this.blurB = new Float32Array(SPEC_W)
+    this.blurC = new Float32Array(SPEC_W); this.blurD = new Float32Array(SPEC_W)
+    this.head = 0
+    this.map = null
+    this.mapKey = ''
+    this.specTex = this._tex(SPEC_W, SPEC_ROWS, gl.CLAMP_TO_EDGE)
+    this.histTex = this._tex(SPEC_W, HIST_ROWS, gl.REPEAT)
+  }
+  _tex(w, h, wrapT) {
+    const gl = this.gl
+    const t = gl.createTexture()
+    gl.bindTexture(gl.TEXTURE_2D, t)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, null)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrapT)
+    return t
+  }
+  _buildMap(binCount, hzPerBin) {
+    const map = new Float32Array(SPEC_W * 3)
+    const ratio = HI_HZ / LO_HZ
+    for (let x = 0; x < SPEC_W; x++) {
+      const f0 = LO_HZ * Math.pow(ratio, x / SPEC_W)
+      const f1 = LO_HZ * Math.pow(ratio, (x + 1) / SPEC_W)
+      const b0 = Math.max(0, Math.min(binCount - 1, Math.floor(f0 / hzPerBin)))
+      const b1 = Math.max(b0 + 1, Math.min(binCount, Math.ceil(f1 / hzPerBin)))
+      map[x * 3] = b0; map[x * 3 + 1] = b1
+      map[x * 3 + 2] = Math.min(binCount - 1.001, Math.sqrt(f0 * f1) / hzPerBin)
+    }
+    return map
+  }
+  update(freq, time, binCount, hzPerBin) {
+    const key = `${binCount}:${hzPerBin.toFixed(4)}`
+    if (this.mapKey !== key) { this.map = this._buildMap(binCount, hzPerBin); this.mapKey = key }
+    const map = this.map, out = this.specData, sm = this.smoothed, pk = this.peaks
+    for (let x = 0; x < SPEC_W; x++) {
+      const b0 = map[x * 3], b1 = map[x * 3 + 1]
+      let v
+      if (b1 - b0 <= 1) {
+        const fb = map[x * 3 + 2], i0 = fb | 0, t = fb - i0
+        v = (freq[i0] * (1 - t) + freq[i0 + 1] * t) / 255
+      } else {
+        let m = 0
+        for (let i = b0; i < b1; i++) if (freq[i] > m) m = freq[i]
+        v = m / 255
+      }
+      const prev = sm[x]
+      sm[x] = v > prev ? prev + (v - prev) * 0.55 : prev + (v - prev) * 0.16
+      const p = pk[x] * 0.972
+      pk[x] = v > p ? v : p
+      out[x] = (sm[x] * 255) | 0
+      out[SPEC_W + x] = freq[Math.min(binCount - 1, (x * binCount / SPEC_W) | 0)]
+      out[SPEC_W * 3 + x] = (pk[x] * 255) | 0
+    }
+    boxBlur(this.smoothed, this.blurA, this.blurB)
+    boxBlur(this.peaks, this.blurC, this.blurD)
+    for (let x = 0; x < SPEC_W; x++) {
+      out[SPEC_W * 4 + x] = (Math.min(1, this.blurA[x]) * 255) | 0
+      out[SPEC_W * 5 + x] = (Math.min(1, this.blurC[x]) * 255) | 0
+    }
+    const half = time.length >> 1
+    let start = 0
+    for (let i = 0; i < half - 1; i++) if (time[i] < 128 && time[i + 1] >= 128) { start = i; break }
+    const step = Math.max(1, Math.floor(half / SPEC_W))
+    for (let x = 0; x < SPEC_W; x++) out[SPEC_W * 2 + x] = time[Math.min(time.length - 1, start + x * step)]
+
+    const gl = this.gl
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+    gl.activeTexture(gl.TEXTURE0 + 7)
+    gl.bindTexture(gl.TEXTURE_2D, this.specTex)
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, SPEC_W, SPEC_ROWS, gl.RED, gl.UNSIGNED_BYTE, out)
+    this.head = (this.head + 1) % HIST_ROWS
+    this.rowData.set(out.subarray(0, SPEC_W))
+    gl.activeTexture(gl.TEXTURE0 + 8)
+    gl.bindTexture(gl.TEXTURE_2D, this.histTex)
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, this.head, SPEC_W, 1, gl.RED, gl.UNSIGNED_BYTE, this.rowData)
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4)
+    gl.activeTexture(gl.TEXTURE0)
+  }
+}
+
+// ── synthetic music: a deterministic spectrum so the page is alive with no
+//    audio device at all (and so headless screenshots are reproducible) ──────
+const SR = 44100, FFT = 2048, BINS = FFT / 2
+function synthAnalysis(t, freq, time) {
+  const hzPerBin = SR / FFT
+  const bpm = 124, beat = t * bpm / 60
+  const kick = Math.exp(-((beat % 1) * 7)) // four-on-the-floor
+  const snare = (Math.floor(beat) % 2 === 1) ? Math.exp(-((beat % 1) * 11)) : 0
+  const hat = Math.exp(-(((beat * 2) % 1) * 26))
+  const chordRoot = 55 * Math.pow(2, [0, 3, 5, 7][Math.floor(beat / 4) % 4] / 12)
+  const notes = [1, 1.5, 2, 2.5, 3, 4, 6, 8].map(m => chordRoot * m)
+  const sweep = 400 + 2600 * (0.5 + 0.5 * Math.sin(t * 0.31))
+  for (let i = 0; i < BINS; i++) {
+    const hz = i * hzPerBin
+    let a = 0
+    a += kick * Math.exp(-Math.pow((hz - 55) / 42, 2)) * 1.15
+    a += kick * Math.exp(-Math.pow((hz - 110) / 70, 2)) * 0.4
+    a += snare * Math.exp(-Math.pow((hz - 950) / 900, 2)) * 0.55
+    a += hat * Math.exp(-Math.pow((hz - 9000) / 5200, 2)) * 0.4
+    for (let n = 0; n < notes.length; n++) {
+      const f = notes[n]
+      a += Math.exp(-Math.pow((hz - f) / (f * 0.045 + 12), 2)) * (0.62 / (1 + n * 0.55)) *
+           (0.65 + 0.35 * Math.sin(t * (1.1 + n * 0.27) + n))
+    }
+    a += Math.exp(-Math.pow((hz - sweep) / 260, 2)) * 0.5
+    a += 0.045 * Math.exp(-hz / 9000) * (0.6 + 0.4 * Math.sin(hz * 0.031 + t * 5))
+    freq[i] = Math.max(0, Math.min(255, a * 235)) | 0
+  }
+  for (let i = 0; i < FFT; i++) {
+    const s = i / SR
+    let v = 0
+    v += Math.sin(2 * Math.PI * chordRoot * s) * (0.42 + kick * 0.5)
+    v += Math.sin(2 * Math.PI * chordRoot * 2.5 * s + 1.1) * 0.2
+    v += Math.sin(2 * Math.PI * sweep * s) * 0.13
+    v += (Math.sin(i * 12.9898) * 43758.5453 % 1) * 0.05 * hat
+    time[i] = Math.max(0, Math.min(255, 128 + v * 92)) | 0
+  }
+  return { beat: kick, hzPerBin }
+}
+
+// ── GL boilerplate ──────────────────────────────────────────────────────────
+const VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 a_position;
+layout(location=1) in vec2 a_texcoord;
+out vec2 v_uv;
+void main(){ v_uv = a_texcoord; gl_Position = vec4(a_position,0.0,1.0); }`
+
+function hexToVec3(hex) {
+  const h = hex.replace('#', '')
+  return [parseInt(h.slice(0, 2), 16) / 255, parseInt(h.slice(2, 4), 16) / 255, parseInt(h.slice(4, 6), 16) / 255]
+}
+
+class Preview {
+  constructor(canvas, source) {
+    this.canvas = canvas
+    this.source = source
+    const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, preserveDrawingBuffer: true })
+    if (!gl) throw new Error('WebGL2 unavailable')
+    this.gl = gl
+    // Match the app's FBO format policy (FBOManager): half-float when the
+    // extension is there (headroom for the additive/glow modes), RGBA8 if not.
+    this.hasHalfFloat = !!gl.getExtension('EXT_color_buffer_half_float') || !!gl.getExtension('EXT_color_buffer_float')
+    gl.getExtension('OES_texture_half_float_linear')
+    this.configs = parseParams(source)
+    this.values = {}
+    for (const c of this.configs) this.values[c.uniformName] = c.default
+    this.audio = new AudioTextures(gl)
+    this.freq = new Uint8Array(BINS)
+    this.time = new Uint8Array(FFT)
+    this.beat = 0
+    this.rms = 0
+    this.analyser = null
+    this.compileError = null
+    this._initQuad()
+    this._initProgram()
+    this._initTargets()
+  }
+  _initQuad() {
+    const gl = this.gl
+    const vao = gl.createVertexArray()
+    gl.bindVertexArray(vao)
+    const buf = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1,
+      -1, 1, 0, 1, 1, -1, 1, 0, 1, 1, 1, 1,
+    ]), gl.STATIC_DRAW)
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0)
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8)
+    this.vao = vao
+  }
+  _compile(type, src) {
+    const gl = this.gl
+    const sh = gl.createShader(type)
+    gl.shaderSource(sh, src)
+    gl.compileShader(sh)
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh)
+      gl.deleteShader(sh)
+      throw new Error(log)
+    }
+    return sh
+  }
+  _initProgram() {
+    const gl = this.gl
+    try {
+      const vs = this._compile(gl.VERTEX_SHADER, VS)
+      const fs = this._compile(gl.FRAGMENT_SHADER, injectAudioDrivers(this.source))
+      const prog = gl.createProgram()
+      gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog)
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog))
+      this.program = prog
+      this.locs = {}
+      this.types = {}
+      const n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS)
+      for (let i = 0; i < n; i++) {
+        const info = gl.getActiveUniform(prog, i)
+        const name = info.name.replace(/\[0\]$/, '')
+        this.locs[name] = gl.getUniformLocation(prog, info.name)
+        this.types[name] = info.type
+      }
+    } catch (e) {
+      this.compileError = String(e.message || e)
+    }
+  }
+  _initTargets() {
+    const gl = this.gl
+    // Ping-pong pair standing in for the executor's feedback FBOs (u_prev_frame).
+    this.pp = [0, 1].map(() => {
+      const tex = gl.createTexture()
+      gl.bindTexture(gl.TEXTURE_2D, tex)
+      gl.texImage2D(gl.TEXTURE_2D, 0, this.hasHalfFloat ? gl.RGBA16F : gl.RGBA8, 2, 2, 0, gl.RGBA,
+        this.hasHalfFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+      const fb = gl.createFramebuffer()
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+      return { tex, fb, w: 0, h: 0 }
+    })
+    this.cur = 0
+    // Stand-in for the node's texture input: transparent black = "audio only".
+    this.inputTex = gl.createTexture()
+    gl.bindTexture(gl.TEXTURE_2D, this.inputTex)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]))
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  }
+  _resizeTargets(w, h) {
+    const gl = this.gl
+    for (const t of this.pp) {
+      if (t.w === w && t.h === h) continue
+      gl.bindTexture(gl.TEXTURE_2D, t.tex)
+      gl.texImage2D(gl.TEXTURE_2D, 0, this.hasHalfFloat ? gl.RGBA16F : gl.RGBA8, w, h, 0, gl.RGBA,
+        this.hasHalfFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null)
+      t.w = w; t.h = h
+    }
+  }
+  setInputImage(img) {
+    const gl = this.gl
+    gl.bindTexture(gl.TEXTURE_2D, this.inputTex)
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img)
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+  }
+  clearInputImage() {
+    const gl = this.gl
+    gl.bindTexture(gl.TEXTURE_2D, this.inputTex)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]))
+  }
+  pullAudio(t) {
+    if (this.analyser) {
+      this.analyser.getByteFrequencyData(this.freq)
+      this.analyser.getByteTimeDomainData(this.time)
+      const bass = (this.freq[2] + this.freq[3] + this.freq[4] + this.freq[5]) / (4 * 255)
+      // Same energy-threshold beat detector as AudioEngine, in miniature.
+      this._be = (this._be || 0) * 0.98 + bass * 0.02
+      const now = performance.now()
+      if (bass > 0.35 && bass > this._be * 1.2 && now - (this._lb || 0) > 150) { this._lb = now; this.beat = 1 }
+      else this.beat *= 0.85
+      let s = 0
+      for (let i = 0; i < this.time.length; i++) { const v = (this.time[i] - 128) / 128; s += v * v }
+      this.rms = Math.sqrt(s / this.time.length)
+      return this.analyser.context.sampleRate / (this.analyser.fftSize)
+    }
+    const r = synthAnalysis(t, this.freq, this.time)
+    this.beat = r.beat
+    this.rms = 0.25 + 0.35 * r.beat
+    return r.hzPerBin
+  }
+  render(t) {
+    const gl = this.gl
+    if (this.compileError) return
+    const w = this.canvas.width, h = this.canvas.height
+    this._resizeTargets(w, h)
+    const hzPerBin = this.pullAudio(t)
+    this.audio.update(this.freq, this.time, this.freq.length, hzPerBin)
+
+    const prev = this.pp[this.cur], target = this.pp[1 - this.cur]
+    gl.useProgram(this.program)
+    gl.bindVertexArray(this.vao)
+
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.inputTex)
+    if (this.locs.u_texture) gl.uniform1i(this.locs.u_texture, 0)
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, prev.tex)
+    if (this.locs.u_prev_frame) gl.uniform1i(this.locs.u_prev_frame, 1)
+    gl.activeTexture(gl.TEXTURE0 + 7); gl.bindTexture(gl.TEXTURE_2D, this.audio.specTex)
+    if (this.locs.u_audio_tex) gl.uniform1i(this.locs.u_audio_tex, 7)
+    gl.activeTexture(gl.TEXTURE0 + 8); gl.bindTexture(gl.TEXTURE_2D, this.audio.histTex)
+    if (this.locs.u_audio_hist) gl.uniform1i(this.locs.u_audio_hist, 8)
+    gl.activeTexture(gl.TEXTURE0)
+
+    const set1f = (n, v) => { if (this.locs[n]) gl.uniform1f(this.locs[n], v) }
+    set1f('u_time', t)
+    if (this.locs.u_resolution) gl.uniform2f(this.locs.u_resolution, w, h)
+    set1f('u_audio_head', this.audio.head)
+    set1f('u_audio_rows', HIST_ROWS)
+    set1f('u_audio_rms', this.rms)
+    set1f('u_beat', this.beat)
+    set1f('u_has_source', 0)
+    for (const n of AUDIO_DECLARE) set1f('u_' + n, n === 'beat' ? this.beat : (this.drivers?.[n] || 0))
+
+    for (const c of this.configs) {
+      const loc = this.locs[c.uniformName]
+      if (!loc) continue
+      const v = this.values[c.uniformName]
+      if (c.type === 'color') { const [r, g, b] = hexToVec3(v); gl.uniform3f(loc, r, g, b) }
+      else if (this.types[c.uniformName] === gl.INT || this.types[c.uniformName] === gl.BOOL) {
+        gl.uniform1i(loc, typeof v === 'boolean' ? (v ? 1 : 0) : (v | 0))
+      } else gl.uniform1f(loc, v)
+    }
+
+    // Pass 1 → the feedback target (this is the node's real output).
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fb)
+    gl.viewport(0, 0, w, h)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.drawArrays(gl.TRIANGLES, 0, 6)
+    this.cur = 1 - this.cur
+
+    // Blit to the canvas.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, w, h)
+    if (!this.blit) this.blit = makeBlit(gl)
+    this.blit(target.tex)
+  }
+}
+
+function makeBlit(gl) {
+  const fs = `#version 300 es
+precision highp float;
+in vec2 v_uv; uniform sampler2D u_tex; out vec4 o;
+void main(){ vec4 c = texture(u_tex, v_uv); o = vec4(c.rgb, 1.0); }`
+  const mk = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s }
+  const p = gl.createProgram()
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS)); gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p)
+  const loc = gl.getUniformLocation(p, 'u_tex')
+  return (tex) => {
+    gl.useProgram(p)
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.uniform1i(loc, 0)
+    gl.drawArrays(gl.TRIANGLES, 0, 6)
+  }
+}
+
+window.DaliVidPreview = { Preview, parseParams, isVisible, HIST_ROWS }
+</script>
+<script>
+const SHADER_SOURCE = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_time;
+
+// ── High-resolution audio (gl/audioTexture.js) ──────────────────────────────
+// u_audio_tex is 512 x 4: row 0 = LOG spectrum (20 Hz -> 20 kHz), row 1 = linear
+// spectrum, row 2 = waveform (0.5 = silence, zero-crossing triggered), row 3 =
+// peak hold. u_audio_hist is a 512 x 128 ring buffer of row 0 — one row per
+// rendered frame — which is what makes waterfalls, tunnels and terrain possible
+// at all: they are pictures of the last ~2 seconds, not of this instant.
+uniform sampler2D u_audio_tex;
+uniform sampler2D u_audio_hist;
+uniform float u_audio_head;   // newest row in the ring
+uniform float u_audio_rows;   // ring size (128)
+uniform float u_audio_rms;
+uniform float u_beat;
+// Feedback buffer — declaring it is what makes the executor hand this node a
+// ping-pong FBO pair, which is where the trails come from.
+uniform sampler2D u_prev_frame;
+
+// ── Core ────────────────────────────────────────────────────────────────────
+// @param name="Mode" min=0 max=9 default=0 step=1 type=select options="Bars,Radial,Scope,Waterfall,Tunnel,Nebula,Rings,Terrain,Particles,Prism"
+uniform int u_mode;
+// @param name="Composite" min=0 max=3 default=1 step=1 type=select options="Over,Add,Screen,Solo"
+uniform int u_style;
+// @param name="Opacity" min=0.0 max=1.0 default=0.95 step=0.01
+uniform float u_opacity;
+// @param name="Intensity" min=0.0 max=3.0 default=1.0 step=0.05
+uniform float u_intensity;
+// @param name="Background Dim" min=0.0 max=1.0 default=0.25 step=0.01
+uniform float u_bg_dim;
+// The perf dial. A visualiser is fill-rate bound — every mode costs the same
+// per PIXEL — so rendering at half resolution is close to a 4x saving, and on
+// glow-heavy generative content it is very hard to see. The executor allocates
+// this node's buffers at the matching size (nodeFBOScale in clipGraphManager).
+// @param name="Render Scale" min=0 max=2 default=0 step=1 type=select options="Full,Half,Quarter"
+uniform int u_render_scale;
+
+// ── Colour ──────────────────────────────────────────────────────────────────
+// @param name="Palette" min=0 max=9 default=1 step=1 type=select options="Custom,Spectrum,Inferno,Viridis,Magma,Ice,Neon,Sunset,Mono,Fire"
+uniform int u_palette;
+// @showif u_palette == Custom
+// @param name="Colour A" type=color default=#00e5ff
+uniform vec3 u_color_a;
+// @showif u_palette == Custom
+// @param name="Colour B" type=color default=#ff00aa
+uniform vec3 u_color_b;
+// @showif u_palette == Custom
+// @param name="Colour C" type=color default=#ffe66d
+uniform vec3 u_color_c;
+// @param name="Hue Shift" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_color_hue;
+// @param name="Saturation" min=0.0 max=2.0 default=1.0 step=0.01
+uniform float u_saturation;
+// @param name="Glow" min=0.0 max=3.0 default=0.8 step=0.05
+uniform float u_glow;
+
+// ── Reactivity ──────────────────────────────────────────────────────────────
+// @param name="Audio Gain" min=0.1 max=4.0 default=1.3 step=0.05
+uniform float u_react_gain;
+// @param name="Bass Impact" min=0.0 max=3.0 default=1.0 step=0.05
+uniform float u_bass_impact;
+// @param name="Beat Punch" min=0.0 max=1.0 default=0.3 step=0.01
+uniform float u_beat_flash;
+
+// ── Layout ──────────────────────────────────────────────────────────────────
+// @param name="Scale" min=0.1 max=4.0 default=1.0 step=0.01
+uniform float u_scale;
+// @param name="Trails" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_trail;
+
+// ── Per-mode controls (hidden unless their mode is selected) ────────────────
+// @showif u_mode == Bars,Radial,Rings,Terrain,Particles
+// @param name="Count" min=3 max=256 default=64 step=1
+uniform int u_count;
+// @showif u_mode == Bars,Radial
+// @param name="Gap" min=0.0 max=0.95 default=0.3 step=0.01
+uniform float u_gap;
+// @showif u_mode == Bars
+// @param name="Align" min=0 max=2 default=0 step=1 type=select options="Bottom,Centre,Top"
+uniform int u_align;
+// @showif u_mode == Bars,Radial
+// @param name="Peak Caps" min=0 max=1 default=1 step=1 type=checkbox
+uniform int u_peak_hold;
+// @showif u_mode == Bars
+// @param name="Reflection" min=0.0 max=1.0 default=0.3 step=0.01
+uniform float u_reflect;
+// @showif u_mode == Radial,Tunnel,Terrain,Prism,Scope
+// @param name="Inner Radius / Horizon" min=0.0 max=0.9 default=0.25 step=0.01
+uniform float u_inner;
+// @showif u_mode == Scope
+// @param name="Scope Style" min=0 max=3 default=0 step=1 type=select options="Line,Dual,Ring,Filled"
+uniform int u_wave_mode;
+// @showif u_mode == Scope
+// @param name="Wave Amount" min=0.0 max=2.0 default=0.8 step=0.01
+uniform float u_wave_amp;
+// @showif u_mode == Scope,Rings,Particles,Prism
+// @param name="Thickness" min=0.001 max=0.2 default=0.02 step=0.001
+uniform float u_thickness;
+// @showif u_mode == Waterfall,Tunnel,Terrain
+// @param name="Time Span" min=0.05 max=2.0 default=1.0 step=0.01
+uniform float u_depth;
+// @showif u_mode == Waterfall
+// @param name="Direction" min=0 max=3 default=0 step=1 type=select options="Up,Down,Left,Right"
+uniform int u_dir;
+// @showif u_mode == Tunnel,Nebula,Particles,Prism
+// @param name="Warp" min=-2.0 max=2.0 default=0.5 step=0.01
+uniform float u_warp;
+// @showif u_mode == Tunnel,Nebula,Rings,Terrain,Particles
+// @param name="Flow Speed" min=-3.0 max=3.0 default=0.5 step=0.01
+uniform float u_flow;
+// @showif u_mode == Nebula
+// @param name="Detail" min=1 max=6 default=4 step=1
+uniform int u_detail;
+
+// ── Advanced ────────────────────────────────────────────────────────────────
+// @param name="Advanced Controls" min=0 max=1 default=0 step=1 type=checkbox
+uniform int u_advanced;
+// @showif u_advanced == true
+// @param name="Noise Gate" min=0.0 max=0.5 default=0.02 step=0.005
+uniform float u_floor;
+// @showif u_advanced == true
+// @param name="Response Curve" min=0.3 max=3.0 default=1.0 step=0.05
+uniform float u_curve;
+// @showif u_advanced == true
+// @param name="Spectral Smoothing" min=0.0 max=1.0 default=0.25 step=0.01
+uniform float u_smooth;
+// @showif u_advanced == true
+// @param name="Freq Range Low" min=0.0 max=0.9 default=0.0 step=0.01
+uniform float u_freq_lo;
+// @showif u_advanced == true
+// @param name="Freq Range High" min=0.1 max=1.0 default=0.95 step=0.01
+uniform float u_freq_hi;
+// @showif u_advanced == true
+// @param name="Colour Spread" min=0.0 max=1.0 default=0.5 step=0.01
+uniform float u_grad;
+// @showif u_advanced == true
+// @param name="Position X" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_pos_x;
+// @showif u_advanced == true
+// @param name="Position Y" min=-1.0 max=1.0 default=0.0 step=0.01
+uniform float u_pos_y;
+// @showif u_advanced == true
+// @param name="Rotation" min=-180.0 max=180.0 default=0.0 step=1.0
+uniform float u_rotation;
+// @showif u_advanced == true
+// @param name="Rotation Speed" min=-5.0 max=5.0 default=0.0 step=0.05
+uniform float u_rot_speed;
+// @showif u_advanced == true
+// @param name="Mirror X" min=0 max=1 default=0 step=1 type=checkbox
+uniform int u_mirror_x;
+// @showif u_advanced == true
+// @param name="Mirror Y" min=0 max=1 default=0 step=1 type=checkbox
+uniform int u_mirror_y;
+// @showif u_advanced == true
+// @param name="Kaleidoscope" min=1 max=16 default=1 step=1
+uniform int u_symmetry;
+// @showif u_advanced == true
+// @param name="Trail Decay" min=0.0 max=0.999 default=0.94 step=0.001
+uniform float u_decay;
+// @showif u_advanced == true
+// @param name="Trail Zoom" min=-0.06 max=0.06 default=0.0 step=0.001
+uniform float u_trail_zoom;
+// @showif u_advanced == true
+// @param name="Trail Spin" min=-0.1 max=0.1 default=0.0 step=0.001
+uniform float u_trail_spin;
+// @showif u_advanced == true
+// @param name="Vignette" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_vignette;
+
+out vec4 fragColor;
+
+#define TAU 6.28318530718
+
+// ─── small utilities ────────────────────────────────────────────────────────
+mat2 rot2(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+// Sin-free hashes (Dave Hoskins). The classic fract(sin(...)) form costs a
+// transcendental per call, and the noise/particle modes call it dozens of times
+// per pixel — this is ~6 ALU ops instead, with better distribution.
+float hash11(float n) {
+  float p = fract(n * 0.1031);
+  p *= p + 33.33;
+  return fract(p * (p + p));
+}
+float hash21(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+vec2 hash22(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.xx + p3.yz) * p3.zy);
+}
+vec3 rgb2hsv(vec3 c) {
+  vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+  vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+  float d = q.x - min(q.w, q.y);
+  return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + 1e-10)), d / (q.x + 1e-10), q.x);
+}
+vec3 hsv2rgb(vec3 c) {
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i), b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0)), d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+// Fixed inter-octave rotation, precomputed: rot2(0.5) inside the loop made the
+// compiler emit a cos/sin per octave on some drivers.
+const mat2 FBM_ROT = mat2(0.87758256, -0.47942554, 0.47942554, 0.87758256);
+float fbm(vec2 p, int oct) {
+  float v = 0.0, amp = 0.55;
+  for (int i = 0; i < 6; i++) {
+    if (i >= oct) break;
+    v += amp * vnoise(p);
+    p = FBM_ROT * p * 2.03;
+    amp *= 0.5;
+  }
+  return v;
+}
+
+// ─── palettes ───────────────────────────────────────────────────────────────
+// Four-stop ramps rather than cosine approximations: the named palettes are
+// recognisable precisely because of where their stops sit, and a ramp costs
+// three mixes — nothing next to a texture fetch.
+vec3 ramp4(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
+  t = clamp(t, 0.0, 1.0) * 3.0;
+  vec3 r = mix(a, b, clamp(t, 0.0, 1.0));
+  r = mix(r, c, clamp(t - 1.0, 0.0, 1.0));
+  return mix(r, d, clamp(t - 2.0, 0.0, 1.0));
+}
+vec3 paletteRaw(float t) {
+  if (u_palette == 0) return ramp4(t, u_color_a * 0.15, u_color_a, u_color_b, u_color_c);
+  if (u_palette == 1) return 0.55 + 0.45 * cos(TAU * (fract(t) + vec3(0.0, 0.33, 0.67)));
+  if (u_palette == 2) return ramp4(t, vec3(0.00, 0.00, 0.02), vec3(0.47, 0.11, 0.43), vec3(0.93, 0.41, 0.15), vec3(0.99, 1.00, 0.64));
+  if (u_palette == 3) return ramp4(t, vec3(0.27, 0.00, 0.33), vec3(0.19, 0.41, 0.56), vec3(0.21, 0.72, 0.47), vec3(0.99, 0.91, 0.14));
+  if (u_palette == 4) return ramp4(t, vec3(0.00, 0.00, 0.02), vec3(0.44, 0.13, 0.43), vec3(0.95, 0.38, 0.36), vec3(0.99, 0.99, 0.75));
+  if (u_palette == 5) return ramp4(t, vec3(0.00, 0.03, 0.10), vec3(0.07, 0.31, 0.55), vec3(0.31, 0.76, 0.97), vec3(0.91, 0.98, 1.00));
+  if (u_palette == 6) return ramp4(t, vec3(0.07, 0.00, 0.18), vec3(0.48, 0.18, 0.97), vec3(0.95, 0.03, 0.64), vec3(0.00, 0.96, 0.83));
+  if (u_palette == 7) return ramp4(t, vec3(0.10, 0.04, 0.18), vec3(0.85, 0.31, 0.44), vec3(1.00, 0.62, 0.27), vec3(1.00, 0.91, 0.63));
+  if (u_palette == 8) return ramp4(t, vec3(0.02), vec3(0.28), vec3(0.72), vec3(1.00));
+  return ramp4(t, vec3(0.02, 0.00, 0.04), vec3(0.70, 0.13, 0.04), vec3(1.00, 0.54, 0.00), vec3(1.00, 0.95, 0.69));
+}
+vec3 pal(float t) {
+  vec3 c = paletteRaw(t);
+  if (u_color_hue > 0.001) {
+    vec3 h = rgb2hsv(c);
+    h.x = fract(h.x + u_color_hue);
+    c = hsv2rgb(h);
+  }
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  return max(vec3(0.0), mix(vec3(l), c, u_saturation));
+}
+
+// ─── audio access ───────────────────────────────────────────────────────────
+// Everything reads through these four so one set of dynamics controls (gate,
+// gain, curve, frequency window, smoothing) applies identically to every mode.
+// The wired Audio-Driver sockets are 0.0 until connected, so they ADD on top
+// without changing the default look.
+// Row centres in the 512x8 audio texture (see gl/audioTexture.js).
+const float AR_LOG   = 0.0625;  // log spectrum
+const float AR_WAVE  = 0.3125;  // waveform
+const float AR_PEAK  = 0.4375;  // peak hold
+const float AR_LOGS  = 0.5625;  // log spectrum, pre-blurred on the CPU
+const float AR_PEAKS = 0.6875;  // peak hold, pre-blurred
+
+// Set once in main() so the per-fetch dynamics stay branch-light: these depend
+// only on uniforms, but a driver will not always hoist them out of a loop body.
+float gInvFloor = 1.0;
+bool gLinearCurve = true;
+
+float dyn(float v) {
+  v = max(0.0, v - u_floor) * gInvFloor;
+  if (!gLinearCurve) v = pow(v, u_curve);
+  return min(v * u_react_gain, 4.0);
+}
+float band(float t) {
+  float fx = mix(u_freq_lo, u_freq_hi, clamp(t, 0.0, 1.0));
+  float v = texture(u_audio_tex, vec2(fx, AR_LOG)).r;
+  // Smoothing is a blend toward the pre-blurred row: ONE extra fetch, versus
+  // the four-tap kernel this used to run on every single lookup.
+  if (u_smooth > 0.001) v = mix(v, texture(u_audio_tex, vec2(fx, AR_LOGS)).r, u_smooth);
+  return dyn(v);
+}
+float bandPeak(float t) {
+  float fx = mix(u_freq_lo, u_freq_hi, clamp(t, 0.0, 1.0));
+  float v = texture(u_audio_tex, vec2(fx, u_smooth > 0.001 ? AR_PEAKS : AR_PEAK)).r;
+  return dyn(v);
+}
+float waveAt(float x) { return texture(u_audio_tex, vec2(fract(x), AR_WAVE)).r * 2.0 - 1.0; }
+// age: 0 = this frame, 1 = the oldest frame still in the ring (~2 s at 60 fps).
+float histAt(float t, float age) {
+  float fx = mix(u_freq_lo, u_freq_hi, clamp(t, 0.0, 1.0));
+  float rows = max(2.0, u_audio_rows);
+  float row = mod(u_audio_head - clamp(age, 0.0, 1.0) * (rows - 1.0) + rows * 2.0, rows);
+  return dyn(texture(u_audio_hist, vec2(fx, (row + 0.5) / rows)).r);
+}
+
+void main() {
+  gInvFloor = 1.0 / max(1e-3, 1.0 - u_floor);
+  gLinearCurve = abs(u_curve - 1.0) < 0.005;
+
+  vec4 bg = texture(u_texture, v_uv);
+  float aspect = u_resolution.x / max(1.0, u_resolution.y);
+  // u_resolution is the canvas, but a scaled pass renders into a smaller buffer.
+  // Deriving the real texel size here keeps edge antialiasing honest at Half /
+  // Quarter instead of leaving every line a quarter of a pixel wide.
+  float rscale = u_render_scale == 0 ? 1.0 : (u_render_scale == 1 ? 0.5 : 0.25);
+  float px = 1.0 / max(1.0, u_resolution.y * rscale);
+
+  // Wired Audio-Driver sockets (0.0 until connected) fold into the same energies
+  // the spectrum drives, so a splitter can push a specific stem's bass into the
+  // picture on top of whatever the master mix is doing.
+  float drvLow = u_sub_bass + u_bass;
+  float drvHi = u_high_mid + u_presence + u_treble;
+  float punch = u_beat * u_beat_flash;
+  float bassE = (band(0.06) + drvLow) * u_bass_impact;
+  float energy = max(u_audio_rms, u_rms);
+
+  // ── shared coordinate space ──
+  // p: centred, square (y in -0.5..0.5), transformed. f: the same space back as
+  // 0..1 frame coordinates, so bar/waterfall modes inherit every transform.
+  vec2 p = v_uv - 0.5;
+  p.x *= aspect;
+  p -= vec2(u_pos_x * aspect, u_pos_y) * 0.5;
+  p = rot2(radians(u_rotation) + u_time * u_rot_speed * 0.35) * p;
+  p /= max(0.05, u_scale);
+  if (u_symmetry > 1) {
+    float seg = TAU / float(u_symmetry);
+    float a = mod(atan(p.y, p.x) + TAU * 4.0, seg);
+    a = abs(a - seg * 0.5);
+    p = vec2(cos(a), sin(a)) * length(p);
+  }
+  if (u_mirror_x == 1) p.x = abs(p.x);
+  if (u_mirror_y == 1) p.y = abs(p.y);
+  vec2 f = vec2(p.x / aspect, p.y) + 0.5;
+
+  vec3 col = vec3(0.0);
+  float cov = 0.0;
+  float glow = u_glow;
+
+  // ──────────────────────────────────────────────── 0: BARS
+  if (u_mode == 0) {
+    float n = float(u_count);
+    float cellF = f.x * n;
+    float t = (floor(cellF) + 0.5) / n;
+    float h = band(t) * (1.0 + punch * 0.5) * 0.8;
+    float hw = (1.0 - u_gap) * 0.5;
+    float aaX = px * n * 0.6;
+    float bar = smoothstep(hw + aaX, hw - aaX, abs(fract(cellF) - 0.5));
+    bar *= step(0.0, f.x) * step(f.x, 1.0);
+
+    float base = u_align == 0 ? 0.06 : (u_align == 1 ? 0.5 : 0.94);
+    float dir = u_align == 2 ? -1.0 : 1.0;
+    float y = (f.y - base) * dir;
+    float ay = u_align == 1 ? abs(y) : y;
+    float hh = u_align == 1 ? h * 0.5 : h;
+
+    float body = bar * step(0.0, ay) * smoothstep(hh + px, hh - px, ay);
+    float norm = clamp(ay / max(hh, 1e-3), 0.0, 1.0);
+    // ONE palette evaluation per pixel. The tip, the cap and the floor bloom are
+    // all near-white variants of this colour, so deriving them with a mix is
+    // both cheaper and more coherent than four independent pal() calls — and
+    // pal() is the single most-executed function in the shader.
+    vec3 c = pal(mix(t, norm, u_grad));
+    vec3 hot = mix(c, vec3(1.0), 0.45);
+    col += c * body * (0.75 + 0.55 * (1.0 - norm));
+    cov = max(cov, body);
+
+    // Tip glow: a bar's top edge is the part the eye tracks, so it gets its own
+    // falloff rather than relying on a whole-frame bloom.
+    if (glow > 0.001) {
+      float tip = exp(-abs(ay - hh) * 90.0) * bar * glow;
+      col += hot * tip * 0.9;
+      cov = max(cov, tip * 0.5);
+    }
+
+    // Falling peak caps, straight off the peak-hold row of the audio texture.
+    if (u_peak_hold == 1) {
+      float pkv = bandPeak(t) * 0.8 * (u_align == 1 ? 0.5 : 1.0);
+      float cap = smoothstep(px * 3.0, 0.0, abs(ay - pkv)) * bar * step(0.0, ay);
+      col += mix(c, vec3(1.0), 0.55) * cap * 1.4;
+      cov = max(cov, cap);
+    }
+
+    // Reflection below the baseline — the cheap trick that reads as "polished".
+    if (u_reflect > 0.001 && u_align != 1) {
+      float ry = -y;
+      float rbody = bar * step(0.0, ry) * smoothstep(hh + px, hh - px, ry);
+      float fade = u_reflect * (1.0 - clamp(ry / max(hh, 1e-3), 0.0, 1.0)) * 0.6;
+      col += c * rbody * fade;
+      cov = max(cov, rbody * fade);
+    }
+
+    // Floor bloom, pumped by bass.
+    if (glow > 0.001) {
+      float floorGlow = exp(-abs(f.y - base) * 26.0) * (0.15 + bassE * 0.35) * glow;
+      col += hot * floorGlow;
+      cov = max(cov, floorGlow * 0.6);
+    }
+  }
+
+  // ──────────────────────────────────────────────── 1: RADIAL
+  else if (u_mode == 1) {
+    float r = length(p);
+    float a = atan(p.y, p.x);
+    float na = fract(a / TAU + 0.5);
+    float n = float(u_count);
+    float cellF = na * n;
+    float t = (floor(cellF) + 0.5) / n;
+    float h = band(t) * 0.55 * (1.0 + punch * 0.5);
+    float r0 = max(0.04, u_inner);
+    float rr = r - r0;
+
+    float hw = (1.0 - u_gap) * 0.5;
+    float aaA = px * n / max(0.05, TAU * r) * 0.6;
+    float ang = smoothstep(hw + aaA, hw - aaA, abs(fract(cellF) - 0.5));
+    float body = ang * step(0.0, rr) * smoothstep(h + px, h - px, rr);
+    float norm = clamp(rr / max(h, 1e-3), 0.0, 1.0);
+    // One palette evaluation, reused for the tip, cap, hub and waveform ring —
+    // this mode ran pal() five times per pixel over the whole frame, with no
+    // early-out anywhere, which made it the most expensive of the ten.
+    vec3 c = pal(mix(t, norm, u_grad));
+    vec3 hot = mix(c, vec3(1.0), 0.45);
+    col += c * body * (0.8 + 0.5 * (1.0 - norm));
+    cov = max(cov, body);
+
+    if (glow > 0.001) {
+      float tip = exp(-abs(rr - h) * 90.0) * ang * step(0.0, rr) * glow;
+      col += hot * tip * 0.9;
+      cov = max(cov, tip * 0.5);
+    }
+
+    if (u_peak_hold == 1) {
+      float pkv = bandPeak(t) * 0.55;
+      float cap = smoothstep(px * 3.0, 0.0, abs(rr - pkv)) * ang * step(0.0, rr);
+      col += mix(c, vec3(1.0), 0.55) * cap * 1.4;
+      cov = max(cov, cap);
+    }
+
+    // Inner ring + hub only exist near the centre, so gate the whole block on
+    // radius: for most of the frame this skips a texture fetch and two exps.
+    if (r < r0 * 1.35) {
+      // The raw waveform wrapped around the hub — something continuous for the
+      // eye to read against the discrete bars.
+      float wr = r0 * (0.78 + 0.06 * waveAt(na) * (1.0 + energy * 2.0));
+      float ring = smoothstep(u_thickness * 0.5 + px, 0.0, abs(r - wr));
+      col += hot * ring * (0.8 + punch);
+      cov = max(cov, ring);
+
+      float hub = exp(-r * (9.0 / max(0.05, r0))) * (0.25 + punch * 1.2) * glow;
+      col += c * hub;
+      cov = max(cov, hub * 0.7);
+    }
+  }
+
+  // ──────────────────────────────────────────────── 2: SCOPE
+  else if (u_mode == 2) {
+    float th = max(0.0015, u_thickness * 0.5);
+    if (u_wave_mode == 2) {
+      float na = fract(atan(p.y, p.x) / TAU + 0.5);
+      float rr = max(0.04, u_inner) + waveAt(na) * u_wave_amp * 0.22;
+      float d = abs(length(p) - rr);
+      float core = smoothstep(th, th * 0.15, d);
+      col += pal(mix(na, 0.8, u_grad)) * (core + th / (d + th) * glow * 0.5);
+      cov = max(cov, core + th / (d + th) * 0.35);
+    } else if (u_wave_mode == 3) {
+      float w = waveAt(f.x) * u_wave_amp * 0.45;
+      float y0 = 0.5 + w;
+      float fill = step(min(0.5, y0), f.y) * step(f.y, max(0.5, y0));
+      float d = abs(f.y - y0);
+      col += pal(mix(f.x, 1.0 - abs(f.y - 0.5) * 2.0, u_grad)) * (fill * 0.55 + smoothstep(th, 0.0, d) * 1.2);
+      cov = max(cov, fill * 0.8 + smoothstep(th, 0.0, d));
+    } else {
+      float w = waveAt(f.x);
+      float d = abs(f.y - (0.5 + w * u_wave_amp * 0.45));
+      float core = smoothstep(th, th * 0.15, d);
+      float halo = th / (d + th);
+      col += pal(mix(f.x, 0.85, u_grad)) * (core + halo * halo * glow * 0.8);
+      cov = max(cov, core + halo * 0.4);
+      if (u_wave_mode == 1) {
+        // Dual: the spectrum envelope drawn as a second, slower trace. Two
+        // curves reading the same sound at different time scales is what makes
+        // a scope look alive instead of noisy.
+        float e = band(f.x) * u_wave_amp * 0.4;
+        float d2 = abs(f.y - (0.5 - e));
+        float c2 = smoothstep(th, th * 0.2, d2);
+        float h2 = th / (d2 + th);
+        col += pal(mix(f.x + 0.4, 0.3, u_grad)) * (c2 + h2 * h2 * glow * 0.6);
+        cov = max(cov, c2 + h2 * 0.3);
+      }
+    }
+  }
+
+  // ──────────────────────────────────────────────── 3: WATERFALL
+  else if (u_mode == 3) {
+    float fx, ft;
+    if (u_dir == 0) { fx = f.x; ft = f.y; }
+    else if (u_dir == 1) { fx = f.x; ft = 1.0 - f.y; }
+    else if (u_dir == 2) { fx = f.y; ft = f.x; }
+    else { fx = f.y; ft = 1.0 - f.x; }
+
+    float inside = step(0.0, fx) * step(fx, 1.0) * step(0.0, ft) * step(ft, 1.0);
+    float age = clamp(ft / max(0.05, u_depth), 0.0, 1.0);
+    float v = histAt(fx, age);
+    // Fade the oldest rows out: it hides the ring-buffer seam and it is what a
+    // spectrogram should do anyway.
+    float fade = (1.0 - smoothstep(0.75, 1.0, age)) * inside;
+    vec3 c = pal(mix(v * 1.1, fx, u_grad));
+    col += c * v * (0.9 + glow * v) * fade;
+    cov = max(cov, clamp(v * 1.3, 0.0, 1.0) * fade);
+  }
+
+  // ──────────────────────────────────────────────── 4: TUNNEL
+  else if (u_mode == 4) {
+    float r = max(length(p), 1e-4);
+    float r0 = max(0.03, u_inner * 0.5);
+    float a = atan(p.y, p.x);
+    // Twist grows toward the centre, so the corridor appears to spiral away.
+    float na = fract(a / TAU + 0.5 + u_warp * 0.15 / max(r, 0.05) + u_time * u_flow * 0.02);
+    float z = clamp((r - r0) / max(0.05, u_depth * 0.9), 0.0, 1.0);
+    float age = pow(z, 0.65);
+    float v = histAt(na, age);
+    float fade = (1.0 - smoothstep(0.72, 1.0, age)) * smoothstep(r0 * 0.55, r0, r);
+    vec3 c = pal(mix(v * 1.15, na, u_grad));
+    col += c * v * (1.1 + glow * v * 1.4) * fade;
+    cov = max(cov, clamp(v * 1.4, 0.0, 1.0) * fade);
+
+    // Mouth of the tunnel — a bass-pumped ring that anchors the perspective.
+    float mouth = exp(-abs(r - r0) * 40.0) * (0.35 + bassE * 0.8) * glow;
+    col += pal(0.05) * mouth;
+    cov = max(cov, mouth * 0.8);
+  }
+
+  // ──────────────────────────────────────────────── 5: NEBULA
+  else if (u_mode == 5) {
+    float mid = band(0.4);
+    float hi = band(0.8) + drvHi;
+    float tt = u_time * u_flow * 0.25;
+    vec2 q = p * (2.2 - bassE * 0.5) + vec2(0.0, tt * 0.15);
+    // Two rounds of domain warping. The audio drives the warp AMOUNT rather
+    // than the colour, so the structure itself moves with the music instead of
+    // a static cloud changing hue.
+    vec2 w1 = vec2(fbm(q + tt, u_detail), fbm(q + vec2(5.2, 1.3) - tt, u_detail));
+    // Second warp round only above Detail 3: it is four extra fbm evaluations
+    // (the most expensive thing in the shader) and below that octave count the
+    // structure it adds is not resolvable anyway. Detail is now a real
+    // quality/speed dial rather than just an octave count.
+    vec2 w2 = w1;
+    if (u_detail > 3) {
+      float k = u_warp + bassE * 0.35;
+      w2 = vec2(fbm(q + k * w1 + vec2(1.7, 9.2), u_detail),
+                fbm(q + k * w1 + vec2(8.3, 2.8) + tt * 0.5, u_detail));
+    }
+    float v = fbm(q + (u_warp + mid * 0.6) * w2, u_detail);
+    float shape = pow(clamp(v, 0.0, 1.0), 1.6 - hi * 0.4);
+    float fil = length(w2) * 0.5; // filament term — the bright veins
+    vec3 c = pal(mix(shape * 1.4, fil, u_grad));
+    col += c * (shape * 1.6 + pow(fil, 3.0) * glow * 2.0) * (0.6 + energy * 1.6 + punch);
+    cov = max(cov, clamp(shape * 1.7 + pow(fil, 3.0), 0.0, 1.0));
+  }
+
+  // ──────────────────────────────────────────────── 6: RINGS
+  else if (u_mode == 6) {
+    float r = length(p);
+    float na = fract(atan(p.y, p.x) / TAU + 0.5);
+    int n = u_count;
+    for (int i = 0; i < 24; i++) {
+      if (i >= n) break;
+      float fi = float(i);
+      float phase = fract(u_time * u_flow * 0.18 + fi / float(max(n, 1)));
+      float rr = phase * 0.95;
+      // Cheap conservative reject FIRST. A ring is thin, so for most pixels most
+      // rings contribute nothing — and this skips their two texture fetches
+      // entirely. The bound is exact: dyn() clamps a band to 4, so the waveform
+      // offset is at most 0.08 and the widest ring is u_thickness * 3.3.
+      float d0 = abs(r - rr);
+      if (d0 > 0.08 + u_thickness * 3.3) continue;
+      float b = band(fract(fi * 0.137 + 0.05));
+      // Ring thickness tracks its band, so loud bands read as fat bright rings.
+      float w = max(0.002, u_thickness * (0.35 + b * 1.6)) * 0.5;
+      float d = abs(r - rr - waveAt(na + fi * 0.1) * b * 0.02);
+      float ring = smoothstep(w, w * 0.1, d) * (1.0 - phase);
+      col += pal(mix(fi / float(max(n, 1)), b, u_grad)) * ring * (0.9 + b * 1.4);
+      cov = max(cov, ring);
+    }
+    float core = exp(-r * 14.0) * (0.3 + punch * 1.5 + bassE * 0.5) * glow;
+    col += pal(0.12) * core;
+    cov = max(cov, core * 0.8);
+  }
+
+  // ──────────────────────────────────────────────── 7: TERRAIN
+  else if (u_mode == 7) {
+    // A perspective ground plane rather than a per-row loop: one history fetch
+    // per pixel instead of dozens, so it runs at full res on a laptop GPU.
+    float horizon = mix(0.35, 0.9, u_inner);
+    float d = horizon - f.y;
+    if (d > 0.0) {
+      float z = 0.075 / max(1e-4, d);            // depth into the scene
+      float xw = (f.x - 0.5) * z * 0.9;          // world x at that depth
+      float age = clamp(z / max(0.1, u_depth * 8.0), 0.0, 1.0);
+      float v = histAt(clamp(abs(xw), 0.0, 1.0), age);
+      float onPlane = 1.0 - smoothstep(0.85, 1.05, abs(xw));
+      float fog = (1.0 - smoothstep(0.55, 1.0, age)) * onPlane;
+
+      float gz = fract(z * 1.6 - u_time * u_flow * 0.6);
+      float gx = fract(xw * float(u_count) * 0.25 + 0.5);
+      float lz = smoothstep(0.075, 0.0, min(gz, 1.0 - gz)) * clamp(d * 6.0, 0.0, 1.0);
+      float lx = smoothstep(0.06, 0.0, min(gx, 1.0 - gx));
+      float grid = max(lz, lx);
+      vec3 c = pal(mix(v * 1.3, age, u_grad));
+      col += c * (grid * (0.25 + v * 3.0) + v * v * 1.6 * glow) * fog;
+      cov = max(cov, clamp(grid * 0.7 + v * v * 1.4, 0.0, 1.0) * fog);
+    } else {
+      // Sky: a soft bass-driven wash so the horizon has something to sit against.
+      float sky = smoothstep(0.0, 0.45, -d) * (0.05 + bassE * 0.14);
+      col += pal(0.02) * sky;
+      cov = max(cov, sky);
+      float sun = exp(-abs(-d) * 16.0) * (0.25 + punch) * glow;
+      col += pal(0.75) * sun;
+      cov = max(cov, sun * 0.7);
+    }
+  }
+
+  // ──────────────────────────────────────────────── 8: PARTICLES
+  else if (u_mode == 8) {
+    // Cell-hashed particles: 9 neighbours per pixel, constant cost, and the
+    // count slider changes DENSITY rather than a loop bound — which is why this
+    // stays smooth where the old per-particle loop did not.
+    float n = max(2.0, float(u_count) * 0.06);
+    vec2 g = p * n;
+    vec2 gi = floor(g), gf = fract(g);
+    for (int yy = -1; yy <= 1; yy++) {
+      for (int xx = -1; xx <= 1; xx++) {
+        vec2 o = vec2(float(xx), float(yy));
+        vec2 id = gi + o;
+        vec2 h2 = hash22(id);
+        float sp = u_time * u_flow * (0.35 + h2.y * 0.8);
+        vec2 pos = 0.5 + 0.42 * vec2(sin(sp + h2.x * 40.0), cos(sp * 0.83 + h2.y * 31.0));
+        // Swirl rides overall loudness rather than this particle's own band, so
+        // the POSITION costs no texture fetch — which is what lets the distance
+        // reject below run before we sample the spectrum. Eight of the nine
+        // neighbouring cells are usually out of range.
+        pos += u_warp * 0.25 * vec2(cos(sp * 1.7), sin(sp * 1.3)) * (0.3 + energy);
+        float d = length(gf - o - pos);
+        float maxSz = max(0.02, u_thickness * 12.6 * n * 0.8);
+        if (d > maxSz * 3.0) continue;
+        float b = band(fract(h2.x * 1.7 + h2.y * 0.3));
+        float sz = max(0.02, u_thickness * (0.6 + b * 3.0) * n * 0.8);
+        float dot_ = sz / (d + sz);
+        float core = smoothstep(sz * 0.55, sz * 0.1, d);
+        col += pal(mix(h2.x, b * 1.4, u_grad)) * (core * (0.8 + b * 2.0) + pow(dot_, 4.0) * glow);
+        cov = max(cov, clamp(core + pow(dot_, 4.0) * 0.5, 0.0, 1.0));
+      }
+    }
+  }
+
+  // ──────────────────────────────────────────────── 9: PRISM
+  else {
+    // One radial spectrum sampled three times at slightly different angles —
+    // the RGB channels physically separate, so the edges fringe like a real
+    // prism instead of a hue gradient pretending to.
+    float r = length(p);
+    float na = fract(atan(p.y, p.x) / TAU + 0.5);
+    float r0 = max(0.04, u_inner);
+    float th = max(0.002, u_thickness);
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < 3; i++) {
+      float k = (float(i) - 1.0) * u_warp * 0.03;
+      float t = fract(na + k + r * 0.35);
+      float b = band(t);
+      float rr = r0 + b * 0.42;
+      float d = abs(r - rr);
+      float line = th / (d + th);
+      acc[i] = smoothstep(th, th * 0.2, d) + line * line * glow * 0.7;
+    }
+    vec3 tint = pal(mix(na, 0.7, u_grad));
+    col += acc * mix(vec3(1.0), tint * 1.6, 0.75);
+    cov = max(cov, clamp(dot(acc, vec3(0.4)), 0.0, 1.0));
+
+    float hub = exp(-r * (7.0 / max(0.05, r0))) * (0.2 + punch * 1.4) * glow;
+    col += tint * hub;
+    cov = max(cov, hub * 0.7);
+  }
+
+  // ── vignette (on the visualiser layer only) ──
+  if (u_vignette > 0.001) {
+    float vg = 1.0 - u_vignette * smoothstep(0.25, 0.85, length(v_uv - 0.5) * 1.35);
+    col *= vg;
+    cov *= vg;
+  }
+
+  col *= u_intensity;
+  cov = clamp(cov, 0.0, 1.0) * u_opacity;
+
+  // ── trails ──
+  // The feedback buffer holds this node's previous OUTPUT, which includes the
+  // background. Subtracting the (warped) background back out recovers the
+  // visualiser layer on its own, so a static backdrop leaves no smear and only
+  // the graphics trail — the thing that always went wrong with naive feedback.
+  if (u_trail > 0.001) {
+    vec2 tuv = v_uv - 0.5;
+    tuv = rot2(u_trail_spin) * tuv * (1.0 - u_trail_zoom) + 0.5;
+    vec4 pv = texture(u_prev_frame, tuv);
+    vec3 ghost = max(vec3(0.0), pv.rgb - texture(u_texture, tuv).rgb * u_bg_dim);
+    ghost *= u_decay * u_trail;
+    col = max(col, ghost);
+    cov = max(cov, clamp(dot(ghost, vec3(0.5)), 0.0, 1.0));
+  }
+
+  // ── composite ──
+  vec3 base = bg.rgb * u_bg_dim;
+  vec3 outRgb;
+  if (u_style == 0) outRgb = mix(base, col, cov);
+  else if (u_style == 1) outRgb = base + col * cov;
+  else if (u_style == 2) outRgb = 1.0 - (1.0 - clamp(base, 0.0, 1.0)) * (1.0 - clamp(col * cov, 0.0, 1.0));
+  else outRgb = col * cov;
+
+  // Coverage is the union of what arrived and what was drawn: forcing 1.0 here
+  // would fill a transparent source's matte with the dimmed backdrop.
+  float outA = (u_style == 3) ? cov : max(bg.a, cov);
+  fragColor = vec4(clamp(outRgb, 0.0, 8.0), clamp(outA, 0.0, 1.0));
+}`;
+const PV = window.DaliVidPreview;
+const qs = new URLSearchParams(location.search);
+const canvas = document.getElementById('c');
+const errBox = document.getElementById('err');
+
+let pv;
+try { pv = new PV.Preview(canvas, SHADER_SOURCE); } catch (e) { showErr(String(e)); }
+if (pv && pv.compileError) showErr(pv.compileError);
+function showErr(msg) { errBox.style.display = 'block'; errBox.textContent = 'GLSL compile failed:\n\n' + msg; window.__COMPILE_ERROR__ = msg; }
+window.__READY__ = !!(pv && !pv.compileError);
+window.__pv = pv;
+
+// ── group the controls by the section headers in the shader source ──
+const groups = (() => {
+  const out = {}; let cur = 'Controls';
+  for (const line of SHADER_SOURCE.split('\n')) {
+    const h = line.match(/^\/\/\s*─+\s*(.+?)\s*─+\s*$/);
+    if (h) { cur = h[1]; continue; }
+    const u = line.match(/uniform\s+\w+\s+(u_\w+)\s*;/);
+    if (u) out[u[1]] = cur;
+  }
+  return out;
+})();
+
+const MODES = (pv?.configs.find(c => c.uniformName === 'u_mode')?.options) || [];
+const modesEl = document.getElementById('modes');
+MODES.forEach((m, i) => {
+  const b = document.createElement('div');
+  b.className = 'chip' + (i === 0 ? ' on' : ''); b.textContent = m;
+  b.onclick = () => { pv.values.u_mode = i; syncChips(); build(); };
+  modesEl.appendChild(b);
+});
+function syncChips() { [...modesEl.children].forEach((c, i) => c.classList.toggle('on', i === pv.values.u_mode)); }
+
+const controls = document.getElementById('controls');
+function build() {
+  if (!pv) return;
+  controls.innerHTML = '';
+  let lastGroup = null;
+  for (const c of pv.configs) {
+    if (!PV.isVisible(c, pv.values, pv.configs)) continue;
+    const g = groups[c.uniformName] || 'Controls';
+    if (g !== lastGroup) {
+      const h = document.createElement('div'); h.className = 'group'; h.textContent = g;
+      controls.appendChild(h); lastGroup = g;
+    }
+    const row = document.createElement('div'); row.className = 'row';
+    const v = pv.values[c.uniformName];
+    if (c.type === 'select') {
+      row.innerHTML = `<label>${c.name}</label>`;
+      const sel = document.createElement('select');
+      c.options.forEach((o, i) => { const op = document.createElement('option'); op.value = i; op.textContent = o; sel.appendChild(op); });
+      sel.value = v;
+      sel.onchange = () => { pv.values[c.uniformName] = +sel.value; if (c.uniformName === 'u_mode') syncChips(); build(); };
+      row.appendChild(sel);
+    } else if (c.type === 'checkbox') {
+      const lab = document.createElement('label'); lab.className = 'check';
+      const inp = document.createElement('input'); inp.type = 'checkbox'; inp.checked = !!v;
+      inp.onchange = () => { pv.values[c.uniformName] = inp.checked; build(); };
+      lab.appendChild(inp); lab.appendChild(document.createTextNode(c.name));
+      row.appendChild(lab);
+    } else if (c.type === 'color') {
+      row.innerHTML = `<label>${c.name}</label>`;
+      const inp = document.createElement('input'); inp.type = 'color'; inp.value = v;
+      inp.oninput = () => { pv.values[c.uniformName] = inp.value; };
+      row.appendChild(inp);
+    } else {
+      const dec = c.step >= 1 ? 0 : (c.step >= 0.01 ? 2 : 3);
+      row.innerHTML = `<label>${c.name}<b>${(+v).toFixed(dec)}</b></label>`;
+      const inp = document.createElement('input');
+      inp.type = 'range'; inp.min = c.min; inp.max = c.max; inp.step = c.step; inp.value = v;
+      inp.oninput = () => {
+        pv.values[c.uniformName] = +inp.value;
+        row.querySelector('b').textContent = (+inp.value).toFixed(dec);
+      };
+      row.appendChild(inp);
+    }
+    controls.appendChild(row);
+  }
+}
+build();
+
+// ── audio sources ──
+const srcname = document.getElementById('srcname');
+function setSrcBtn(id) { ['b-synth', 'b-file', 'b-mic'].forEach(b => document.getElementById(b).classList.toggle('on', b === id)); }
+document.getElementById('b-synth').onclick = () => { pv.analyser = null; setSrcBtn('b-synth'); srcname.textContent = 'demo synth'; };
+document.getElementById('b-file').onclick = () => document.getElementById('file').click();
+document.getElementById('file').onchange = async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const el = new Audio(URL.createObjectURL(f)); el.loop = true; el.crossOrigin = 'anonymous';
+  const node = ctx.createMediaElementSource(el);
+  const an = ctx.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0.8;
+  an.minDecibels = -90; an.maxDecibels = -10;
+  node.connect(an); node.connect(ctx.destination);
+  await ctx.resume(); el.play();
+  pv.analyser = an; pv.freq = new Uint8Array(an.frequencyBinCount); pv.time = new Uint8Array(an.fftSize);
+  setSrcBtn('b-file'); srcname.textContent = f.name;
+};
+document.getElementById('b-mic').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const an = ctx.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0.8;
+    an.minDecibels = -90; an.maxDecibels = -10;
+    ctx.createMediaStreamSource(stream).connect(an);
+    await ctx.resume();
+    pv.analyser = an; pv.freq = new Uint8Array(an.frequencyBinCount); pv.time = new Uint8Array(an.fftSize);
+    setSrcBtn('b-mic'); srcname.textContent = 'microphone';
+  } catch (e) { alert('Microphone unavailable: ' + e.message); }
+};
+document.getElementById('b-img').onclick = () => document.getElementById('imgfile').click();
+document.getElementById('imgfile').onchange = (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image();
+  img.onload = () => pv.setInputImage(img);
+  img.src = URL.createObjectURL(f);
+};
+document.getElementById('b-copy').onclick = () => {
+  navigator.clipboard?.writeText(JSON.stringify(pv.values, null, 2));
+  const b = document.getElementById('b-copy'); const t = b.textContent;
+  b.textContent = 'Copied ✓'; setTimeout(() => b.textContent = t, 1200);
+};
+
+// ── loop ──
+const fpsEl = document.getElementById('fps'), resEl = document.getElementById('res');
+let frames = 0, lastFps = performance.now();
+function resize() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  resEl.textContent = w + '×' + h;
+}
+window.addEventListener('resize', resize);
+
+if (qs.has('mode')) { pv.values.u_mode = +qs.get('mode'); syncChips(); build(); }
+for (const [k, v] of qs) if (k.startsWith('u_')) { pv.values[k] = isNaN(+v) ? (v === 'true') : +v; }
+if (qs.get('panel') === '0') { document.getElementById('panel').style.display = 'none'; document.getElementById('modes').style.display = 'none'; }
+
+if (qs.has('shot')) {
+  // Deterministic capture path: advance a fixed number of synthetic frames so
+  // the history ring is full, then stop. Used by the headless smoke render.
+  resize();
+  const n = +(qs.get('shot') || 150);
+  for (let i = 0; i < n; i++) pv.render(i / 60);
+  window.__SHOT_DONE__ = true;
+} else {
+  const t0 = performance.now();
+  (function loop() {
+    resize();
+    pv.render((performance.now() - t0) / 1000);
+    frames++;
+    const now = performance.now();
+    if (now - lastFps > 500) { fpsEl.textContent = Math.round(frames * 1000 / (now - lastFps)); frames = 0; lastFps = now; }
+    requestAnimationFrame(loop);
+  })();
+}
+</script>
+</body>
+</html>
