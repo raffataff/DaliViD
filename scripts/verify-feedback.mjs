@@ -469,8 +469,11 @@ function runTests(args) {
 
 // ── driver ───────────────────────────────────────────────────────────────────
 
+// A CI image or sandbox may ship its own Chromium rather than playwright's
+// download; point PLAYWRIGHT_CHROMIUM_PATH at that binary to use it.
 const browser = await chromium.launch({
-  args: ['--use-gl=swiftshader', '--enable-unsafe-swiftshader', '--use-angle=swiftshader'],
+  executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined,
+  args: ['--use-gl=swiftshader', '--enable-unsafe-swiftshader', '--use-angle=swiftshader', '--no-sandbox'],
 })
 const page = await browser.newPage()
 page.on('console', m => { if (m.type() === 'error') console.error('  page:', m.text()) })

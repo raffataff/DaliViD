@@ -725,7 +725,7 @@ export default function Timeline({ collapsed, onToggleCollapse }) {
     let filename, params
     if (clipType === 'image') {
       filename = payload.imageName || payload.name || 'Image'
-      params = makeImageClipParams({ imageSrc: payload.imageSrc || null, imageName: filename })
+      params = makeImageClipParams({ imageSrc: payload.imageSrc || null, imageRefId: payload.imageRefId || null, imageName: filename })
     } else if (clipType === 'shape') {
       filename = payload.name || 'Shape'
       params = makeShapeClipParams(payload.params || {})

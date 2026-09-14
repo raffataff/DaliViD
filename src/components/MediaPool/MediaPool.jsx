@@ -3,6 +3,9 @@ import useTimelineStore from '../../store/useTimelineStore'
 import useGraphStore from '../../store/useGraphStore'
 import useAudioStore from '../../store/useAudioStore'
 import useAppStore from '../../store/useAppStore'
+import useMediaStore, { COPY_PROMPT_THRESHOLD_BYTES } from '../../store/useMediaStore'
+import { VaultQuotaError } from '../../storage/index.js'
+import { relinkClipsToRef } from '../../utils/projectMedia'
 import { COMPOUND_PRESETS } from '../../shaders/compoundPresets'
 import { setCameraStream, getCameraStream, removeCameraStream } from '../../gl/cameraRegistry'
 import { getAudioEngine } from '../../audio/AudioEngine'
@@ -14,6 +17,7 @@ import { addToast } from '../common/Toast'
 import ContextMenu from '../common/ContextMenu'
 import TransitionsTab from './TransitionsTab'
 import FontsTab from './FontsTab'
+import StorageTab from './StorageTab'
 import {
   startScreenCapture, startRecording, stopRecording, stopRecordingIfActive,
   openRecordingSink, isRecording, getRecordingInfo, mp4Supported, tsStamp,
@@ -32,6 +36,7 @@ const TABS = [
   { id: 'effects', label: 'Effects' },
   { id: 'transitions', label: 'Transitions' },
   { id: 'scopes', label: 'Scopes' },
+  { id: 'storage', label: 'Storage' },
 ]
 
 // Clip ids already warned about a large in-memory recording (module-level so we
@@ -40,10 +45,17 @@ const _memWarned = new Set()
 
 export default function MediaPool() {
   const [activeTab, setActiveTab] = useState('videos')
-  const [importedVideos, setImportedVideos] = useState([])
-  const [importedAudio, setImportedAudio] = useState([])
-  const [importedImages, setImportedImages] = useState([])
+  // The pool used to be three `useState` arrays here. That is precisely why
+  // media did not survive a reload — the entries died with the component and the
+  // bytes died with their blob: URLs. They are now MediaRefs in `useMediaStore`,
+  // backed by the vault and serialised into the project's `media.refs`.
+  const mediaRefs = useMediaStore(s => s.refs)
+  const mediaUrls = useMediaStore(s => s.urls)
+  const mediaStatus = useMediaStore(s => s.status)
   const [cameras, setCameras] = useState([])
+  // Set while a large import waits on the user's copy decision:
+  // { files, totalBytes, kind, resolve }.
+  const [copyPrompt, setCopyPrompt] = useState(null)
   // Screen-capture options (apply to the NEXT capture) + recording UI state.
   const [screenQuality, setScreenQuality] = useState(1080) // 0 = native
   const [optimizeForText, setOptimizeForText] = useState(false)
@@ -64,12 +76,37 @@ export default function MediaPool() {
   const removeClipGraph = useGraphStore(s => s.removeClipGraph)
   const addNode = useGraphStore(s => s.addNode)
   const removeNode = useGraphStore(s => s.removeNode)
+  const removeRef = useMediaStore(s => s.removeRef)
   // Watched so the Images tab can rebuild its cards from a loaded project's
   // IMAGE_INPUT nodes (master + per-clip graphs, recursing compounds).
   const masterGraph = useGraphStore(s => s.masterGraph)
   const clipGraphs = useGraphStore(s => s.clipGraphs)
   const micEnabled = useAudioStore(s => s.micEnabled)
   const toggleMic = useAudioStore(s => s.toggleMic)
+
+  /**
+   * Pool entries for one kind of media, from the persisted refs.
+   *
+   * These survive a reload, which the old `useState` arrays could not. `meta`
+   * carries the duration/size probed at import, so a restored pool renders real
+   * labels without spinning up a media element per card just to read a number.
+   * A ref with no URL is one whose blob is not in the vault — the card stays and
+   * reports offline rather than silently vanishing along with the user's record
+   * of what the clip was.
+   */
+  const refEntries = useCallback((kind) => mediaRefs
+    .filter(r => r.kind === kind)
+    .map(r => ({
+      id: r.id,
+      refId: r.id,
+      filename: r.filename,
+      fileUrl: mediaUrls[r.id] || null,
+      fileType: kind,
+      size: r.bytes,
+      offline: mediaStatus[r.id] === 'missing',
+      sessionOnly: !!r.sessionOnly,
+      ...(r.meta || {}),
+    })), [mediaRefs, mediaUrls, mediaStatus])
 
   // Derive media pool entries from timeline clips so loaded projects show their media
   const videoEntries = useMemo(() => {
@@ -87,11 +124,14 @@ export default function MediaPool() {
         size: c.metadata?.size || 0,
         fromClip: true,
       }))
-    // Merge: imported videos take precedence (they have fresh blob URLs), then clip-derived entries
-    const importedIds = new Set(importedVideos.map(v => v.filename))
+    // Refs take precedence (they carry a resolvable URL and real metadata); the
+    // clip-derived entries remain as the fallback for a v1 project whose media
+    // has not been re-imported yet.
+    const imported = refEntries('video')
+    const importedIds = new Set(imported.map(v => v.filename))
     const clipOnly = fromClips.filter(c => !importedIds.has(c.filename))
-    return [...importedVideos, ...clipOnly]
-  }, [clips, importedVideos])
+    return [...imported, ...clipOnly]
+  }, [clips, refEntries])
 
   const audioEntries = useMemo(() => {
     const fromClips = clips
@@ -105,10 +145,11 @@ export default function MediaPool() {
         size: c.metadata?.size || 0,
         fromClip: true,
       }))
-    const importedIds = new Set(importedAudio.map(a => a.filename))
+    const imported = refEntries('audio')
+    const importedIds = new Set(imported.map(a => a.filename))
     const clipOnly = fromClips.filter(c => !importedIds.has(c.filename))
-    return [...importedAudio, ...clipOnly]
-  }, [clips, importedAudio])
+    return [...imported, ...clipOnly]
+  }, [clips, refEntries])
 
   // Rebuild the Images tab from anywhere the project embeds an image data URL:
   // freshly-imported pool images, image CLIPS on the timeline, and IMAGE_INPUT
@@ -118,9 +159,13 @@ export default function MediaPool() {
   const imageEntries = useMemo(() => {
     const bySrc = new Map()
 
-    // Freshly-imported images win — they carry accurate width/height/size.
-    for (const img of importedImages) {
-      if (img.dataUrl) bySrc.set(img.dataUrl, img)
+    // Vault-backed images win — they carry accurate width/height/size AND they
+    // survive a reload. `dataUrl` is now whatever URL the image currently
+    // resolves to (an object URL from the vault); the field keeps its name
+    // because every consumer below already reads it and neither knows nor cares
+    // where the bytes came from.
+    for (const img of refEntries('image')) {
+      if (img.fileUrl) bySrc.set(img.fileUrl, { ...img, dataUrl: img.fileUrl })
     }
 
     const addDerived = (src, name, width, height) => {
@@ -156,7 +201,50 @@ export default function MediaPool() {
     for (const g of Object.values(clipGraphs || {})) scanNodes(g.nodes)
 
     return Array.from(bySrc.values())
-  }, [importedImages, clips, masterGraph, clipGraphs])
+  }, [refEntries, clips, masterGraph, clipGraphs])
+
+  /**
+   * Decide, once per import, whether these files get copied into the vault.
+   *
+   * Below the threshold we copy silently — that is the case where "it just works
+   * after a reload" is obviously worth a few hundred MB. Above it we ask,
+   * because starting a multi-gigabyte duplication on someone's behalf is not a
+   * decision this app gets to make for them.
+   *
+   * @returns {Promise<'copy'|'session'|'cancel'>}
+   */
+  const decideCopyMode = useCallback((files, kind) => {
+    const totalBytes = files.reduce((n, f) => n + (f.size || 0), 0)
+    if (totalBytes <= COPY_PROMPT_THRESHOLD_BYTES) return Promise.resolve('copy')
+    return new Promise(resolve => {
+      setCopyPrompt({ files, totalBytes, kind, resolve })
+    })
+  }, [])
+
+  /**
+   * Ingest one file and report failures in terms the user can act on.
+   *
+   * Storage exhaustion is the one that must never be swallowed: a silent import
+   * failure leaves a pool entry that looks fine until the next reload, which is
+   * the worst possible time to discover the bytes were never written.
+   */
+  const ingestOrWarn = useCallback(async (file, opts) => {
+    try {
+      return await useMediaStore.getState().ingestFile(file, opts)
+    } catch (err) {
+      if (err instanceof VaultQuotaError) {
+        addToast({
+          message: `Out of browser storage — "${file.name}" was not saved. Free space in Media Pool → Storage, or import it for this session only.`,
+          type: 'error',
+          duration: 12000,
+        })
+      } else {
+        console.error('[DaliVid] Import failed:', file.name, err)
+        addToast({ message: `Couldn't store "${file.name}".`, type: 'error', duration: 8000 })
+      }
+      return null
+    }
+  }, [])
 
   // Import video file
   const handleImportVideo = useCallback(() => {
@@ -166,7 +254,13 @@ export default function MediaPool() {
     input.multiple = true
     input.onchange = async (e) => {
       const files = Array.from(e.target.files)
+      const mode = await decideCopyMode(files, 'video')
+      if (mode === 'cancel') return
+      useMediaStore.getState().setImporting(true)
+      try {
       for (const file of files) {
+        // Probe metadata off a temporary URL. This one is always the File
+        // itself — reading duration/dimensions must not wait on the vault write.
         const url = URL.createObjectURL(file)
 
         // Get video metadata
@@ -205,30 +299,34 @@ export default function MediaPool() {
           })
         }
 
-        const entry = {
-          id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-          filename: file.name,
-          fileUrl: url,
-          fileType: 'video',
+        const meta = {
           width: video.videoWidth || 1920,
           height: video.videoHeight || 1080,
           duration: video.duration || 10,
           fps: 30,
-          size: file.size,
-          file,
         }
 
-        // Replace any existing pool entry with the same filename (avoid duplicates)
-        setImportedVideos(prev => [...prev.filter(v => v.filename !== file.name), entry])
+        // Into the vault (or session-only), keyed by content hash. Re-importing
+        // a file already held writes nothing and returns the ref you had.
+        const ref = await ingestOrWarn(file, { kind: 'video', session: mode === 'session', meta })
+        URL.revokeObjectURL(url)
+        if (!ref) continue
+
+        // Play from the stored bytes, not from the File — that URL is what
+        // survives a reload, and it is the whole point of the change.
+        const playUrl = useMediaStore.getState().urlFor(ref.id) || url
+        const entry = { ...meta, id: ref.id, refId: ref.id, filename: file.name, fileUrl: playUrl, fileType: 'video', size: file.size }
 
         // If clips already reference this filename (e.g. a project whose media
         // couldn't be restored), relink them to the fresh URL and keep their
-        // existing effect graphs — don't add a duplicate clip.
+        // existing effect graphs — don't add a duplicate clip. Relinking also
+        // stamps `mediaRefId`, so this is the LAST time that project needs it.
+        relinkClipsToRef(ref)
         const existing = useTimelineStore.getState().clips.filter(
           c => c.filename === file.name && c.fileType === 'video'
         )
         if (existing.length > 0) {
-          for (const c of existing) updateClip(c.id, { fileUrl: url })
+          for (const c of existing) updateClip(c.id, { fileUrl: playUrl, mediaRefId: ref.id })
         } else {
           // Auto-create track and clip
           let videoTrack = tracks.find(t => t.type === 'video')
@@ -239,7 +337,8 @@ export default function MediaPool() {
 
           const clipId = addClip(videoTrack.id, {
             filename: file.name,
-            fileUrl: url,
+            fileUrl: playUrl,
+            mediaRefId: ref.id,
             fileType: 'video',
             timelineStart: 0,
             timelineEnd: entry.duration,
@@ -255,9 +354,12 @@ export default function MediaPool() {
           initClipGraph(clipId, file.name)
         }
       }
+      } finally {
+        useMediaStore.getState().setImporting(false)
+      }
     }
     input.click()
-  }, [tracks, addTrack, addClip, updateClip, initClipGraph])
+  }, [tracks, addTrack, addClip, updateClip, initClipGraph, decideCopyMode, ingestOrWarn])
 
   // Import audio file
   const handleImportAudio = useCallback(() => {
@@ -267,6 +369,10 @@ export default function MediaPool() {
     input.multiple = true
     input.onchange = async (e) => {
       const files = Array.from(e.target.files)
+      const mode = await decideCopyMode(files, 'audio')
+      if (mode === 'cancel') return
+      useMediaStore.getState().setImporting(true)
+      try {
       for (const file of files) {
         const url = URL.createObjectURL(file)
 
@@ -282,22 +388,18 @@ export default function MediaPool() {
 
         const duration = audio.duration || 30
 
-        const entry = {
-          id: `audio_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-          filename: file.name,
-          fileUrl: url,
-          fileType: 'audio',
-          duration,
-          size: file.size,
-        }
-        setImportedAudio(prev => [...prev.filter(a => a.filename !== file.name), entry])
+        const ref = await ingestOrWarn(file, { kind: 'audio', session: mode === 'session', meta: { duration } })
+        URL.revokeObjectURL(url)
+        if (!ref) continue
 
+        const playUrl = useMediaStore.getState().urlFor(ref.id) || url
         // Relink existing audio clips with this filename instead of duplicating.
+        relinkClipsToRef(ref)
         const existing = useTimelineStore.getState().clips.filter(
           c => c.filename === file.name && c.fileType === 'audio'
         )
         if (existing.length > 0) {
-          for (const c of existing) updateClip(c.id, { fileUrl: url })
+          for (const c of existing) updateClip(c.id, { fileUrl: playUrl, mediaRefId: ref.id })
         } else {
           let audioTrack = tracks.find(t => t.type === 'audio')
           if (!audioTrack) {
@@ -306,7 +408,8 @@ export default function MediaPool() {
           }
           const clipId = addClip(audioTrack.id, {
             filename: file.name,
-            fileUrl: url,
+            fileUrl: playUrl,
+            mediaRefId: ref.id,
             fileType: 'audio',
             timelineStart: 0,
             timelineEnd: duration,
@@ -316,13 +419,25 @@ export default function MediaPool() {
           initClipGraph(clipId, file.name, 'audio')
         }
       }
+      } finally {
+        useMediaStore.getState().setImporting(false)
+      }
     }
     input.click()
-  }, [tracks, addTrack, addClip, updateClip, initClipGraph])
+  }, [tracks, addTrack, addClip, updateClip, initClipGraph, decideCopyMode, ingestOrWarn])
 
-  // Import still images. Each image is read as a data URL so it can be embedded
-  // in the IMAGE_INPUT node's params and persisted with the project. Cards are
-  // dragged onto the Node Editor to create an image source node.
+  // Import still images.
+  //
+  // Images used to be inlined into params as a base64 data URL, which persisted
+  // but at a cost that dominated the whole project document — measured on this
+  // machine, one image was 389 KB of a 401 KB project, and autosave rewrote all
+  // of it every two seconds while typing. They are now blobs like any other
+  // media, addressed by `params.imageRefId`; `imageSrc` remains as the runtime
+  // URL so every consumer (ensureNodeImage, the node card, timeline thumbnails)
+  // is untouched.
+  //
+  // The downscale + re-encode is kept: it still bounds texture size to the
+  // WebGL2-guaranteed 2048 and keeps the stored blob small.
   const handleImportImage = useCallback(() => {
     const input = document.createElement('input')
     input.type = 'file'
@@ -330,25 +445,35 @@ export default function MediaPool() {
     input.multiple = true
     input.onchange = async (e) => {
       const files = Array.from(e.target.files)
-      for (const file of files) {
-        try {
-          // Downscale + re-encode so the embedded data URL stays small.
-          const { dataUrl, width, height } = await prepareImageDataURL(file)
-          const after = dataUrlBytes(dataUrl)
-          const pct = file.size > 0 ? Math.round((1 - after / file.size) * 100) : 0
-          console.log(`[DaliVid] Imported "${file.name}": ${formatBytes(file.size)} → ${formatBytes(after)} (${pct}% smaller)`)
-          const entry = {
-            id: `image_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-            filename: file.name,
-            dataUrl,
-            width,
-            height,
-            size: after,
+      useMediaStore.getState().setImporting(true)
+      try {
+        for (const file of files) {
+          try {
+            const { dataUrl, width, height } = await prepareImageDataURL(file)
+            const after = dataUrlBytes(dataUrl)
+            const pct = file.size > 0 ? Math.round((1 - after / file.size) * 100) : 0
+            console.log(`[DaliVid] Imported "${file.name}": ${formatBytes(file.size)} → ${formatBytes(after)} (${pct}% smaller)`)
+
+            const blob = await fetch(dataUrl).then(r => r.blob())
+            await useMediaStore.getState().ingestBytes(blob, {
+              filename: file.name,
+              kind: 'image',
+              mime: blob.type || 'image/webp',
+              meta: { width, height },
+            })
+          } catch (err) {
+            if (err instanceof VaultQuotaError) {
+              addToast({
+                message: `Out of browser storage — "${file.name}" was not saved. Free space in Media Pool → Storage.`,
+                type: 'error', duration: 12000,
+              })
+            } else {
+              console.error('[DaliVid] Failed to import image:', file.name, err)
+            }
           }
-          setImportedImages(prev => [...prev.filter(i => i.filename !== file.name), entry])
-        } catch (err) {
-          console.error('[DaliVid] Failed to import image:', file.name, err)
         }
+      } finally {
+        useMediaStore.getState().setImporting(false)
       }
     }
     input.click()
@@ -571,14 +696,17 @@ export default function MediaPool() {
       _memWarned.delete(clip.id)
       setRecordTick(t => t + 1)
       if (!result) return
-      const { file, url, durationSec, width, height, fps } = result
-      setImportedVideos(prev => [...prev.filter(v => v.filename !== file.name), {
-        id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-        filename: file.name, fileUrl: url, fileType: 'video',
-        width, height, fps,
-        duration: durationSec, // measured — never video metadata (WebM = Infinity)
-        size: file.size, file,
-      }])
+      const { file, durationSec, width, height, fps } = result
+      // A recording is media like any other: into the vault, so it is already
+      // persistent the moment it stops — no separate import step, and it is
+      // still there after a reload.
+      await ingestOrWarn(file, {
+        kind: 'video',
+        meta: {
+          width, height, fps,
+          duration: durationSec, // measured — never video metadata (WebM = Infinity)
+        },
+      })
       addToast({ message: `Recording saved: ${file.name}`, type: 'success' })
       return
     }
@@ -613,7 +741,7 @@ export default function MediaPool() {
       stopRecordingIfActive(clip.id)
       addToast({ message: 'Could not start recording.', type: 'error' })
     }
-  }, [screenFormat])
+  }, [screenFormat, ingestOrWarn])
 
   // End a live screen share: stop any recording, drop the stream (clip freezes).
   const handleEndShare = useCallback(async (clip) => {
@@ -671,7 +799,10 @@ export default function MediaPool() {
       filename, fileType: 'image',
       timelineStart: playhead, timelineEnd: playhead + DEFAULT_GENERATOR_DURATION,
       sourceStart: 0, sourceEnd: DEFAULT_GENERATOR_DURATION,
-      params: makeImageClipParams({ imageSrc: img.dataUrl, imageName: filename }),
+      // imageRefId is the persistent identity; imageSrc is this session's URL
+      // for it and is dropped by the serializer. A dragged card that predates
+      // the vault has no refId, and keeps working on imageSrc alone.
+      params: makeImageClipParams({ imageSrc: img.dataUrl, imageRefId: img.refId, imageName: filename }),
       width: img.width || 1920, height: img.height || 1080,
     })
     initClipGraph(clipId, filename, 'image')
@@ -762,15 +893,16 @@ export default function MediaPool() {
     }
 
     if (kind === 'video' || kind === 'audio') {
-      // Deliberately NOT revoking the blob URL: the delete is undoable (Ctrl+Z
-      // restores the clips through the history snapshot) and a revoked URL would
-      // come back as unplayable media. The URL dies with the page instead.
-      const setter = kind === 'video' ? setImportedVideos : setImportedAudio
-      setter(prev => prev.filter(x => x.filename !== entry.filename))
+      // Deliberately NOT revoking the blob URL or deleting the blob: the delete
+      // is undoable (Ctrl+Z restores the clips through the history snapshot) and
+      // a revoked URL would come back as unplayable media. The blob is reclaimed
+      // later by the GC on save, once nothing references it — and only then,
+      // because another project may share the very same bytes.
+      if (entry.refId) removeRef(entry.refId)
     } else if (kind === 'image') {
       const { top, nested } = imageNodeUses(entry.dataUrl)
       for (const u of top) removeNode(u.graphLevel, u.clipId, u.nodeId)
-      setImportedImages(prev => prev.filter(i => i.dataUrl !== entry.dataUrl))
+      if (entry.refId) removeRef(entry.refId)
       if (nested > 0) {
         addToast({
           message: `"${label}" is still used inside ${nested} compound node${nested !== 1 ? 's' : ''} — card kept.`,
@@ -781,7 +913,7 @@ export default function MediaPool() {
     }
 
     addToast({ message: `Removed "${label}" from the pool`, type: 'info' })
-  }, [clipsUsing, imageNodeUses, removeClip, removeClipGraph, removeNode])
+  }, [clipsUsing, imageNodeUses, removeClip, removeClipGraph, removeNode, removeRef])
 
   const menuItems = useMemo(() => {
     if (!menu) return []
@@ -840,7 +972,7 @@ export default function MediaPool() {
         label: 'Add to Master Graph', icon: '◆',
         hint: 'Adds an Image source node with this image loaded',
         onSelect: () => addToMasterGraph('IMAGE_INPUT', entry.filename || 'Image', {
-          imageSrc: entry.dataUrl, imageName: entry.filename || '',
+          imageSrc: entry.dataUrl, imageRefId: entry.refId, imageName: entry.filename || '',
         }),
       })
     } else if (kind === 'screen') {
@@ -973,6 +1105,7 @@ export default function MediaPool() {
                         nodeType: 'IMAGE_INPUT',
                         name: img.filename || 'Image',
                         imageSrc: img.dataUrl,
+                        imageRefId: img.refId,
                         imageName: img.filename,
                       }))
                       e.dataTransfer.effectAllowed = 'copy'
@@ -1334,6 +1467,8 @@ export default function MediaPool() {
             <ScopesBars />
           </div>
         )}
+
+        {activeTab === 'storage' && <StorageTab />}
       </div>
 
       {menu && (
@@ -1347,7 +1482,53 @@ export default function MediaPool() {
           onClose={closeMenu}
         />
       )}
+
+      {copyPrompt && (
+        <CopyDecisionModal
+          {...copyPrompt}
+          onDecide={(choice) => { copyPrompt.resolve(choice); setCopyPrompt(null) }}
+        />
+      )}
     </>
+  )
+}
+
+/**
+ * Asked once per import, and only above the threshold.
+ *
+ * Copying is what makes media survive a reload, so below the threshold it simply
+ * happens. Above it the duplication is large enough that it is the user's call —
+ * nobody should discover after the fact that the app quietly wrote another 40 GB
+ * to their disk. The session-only option is the honest alternative rather than a
+ * dead end: the media works now, and the warning says exactly what it costs.
+ */
+function CopyDecisionModal({ files, totalBytes, kind, onDecide }) {
+  const count = files.length
+  return (
+    <div className="media-pool__modal-backdrop" onClick={() => onDecide('cancel')}>
+      <div className="media-pool__modal" onClick={e => e.stopPropagation()}>
+        <h3>Add {count} {kind} file{count === 1 ? '' : 's'} to this project?</h3>
+        <p>
+          That&rsquo;s <strong>{formatBytes(totalBytes)}</strong>. Copying into the project
+          means it will still be here after you reload or reopen the app.
+        </p>
+        <div className="media-pool__modal-actions">
+          <button className="media-pool__modal-btn media-pool__modal-btn--primary"
+            onClick={() => onDecide('copy')}>
+            Add to project
+            <span>Uses {formatBytes(totalBytes)} · survives reload</span>
+          </button>
+          <button className="media-pool__modal-btn" onClick={() => onDecide('session')}>
+            This session only
+            <span>No copy · lost when you close the tab</span>
+          </button>
+          <button className="media-pool__modal-btn media-pool__modal-btn--quiet"
+            onClick={() => onDecide('cancel')}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 

@@ -562,3 +562,165 @@
   border-color: var(--accent-cyan);
   background: var(--bg-active);
 }
+
+/* ── Import copy decision ─────────────────────────────────────────────────
+   Shown only above the copy threshold, where duplicating the media is a big
+   enough commitment that it is the user's call rather than the app's. */
+.media-pool__modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+}
+
+.media-pool__modal {
+  background: var(--bg-panel, #1b1e24);
+  border: 1px solid var(--border, #333842);
+  border-radius: 8px;
+  padding: 20px 22px;
+  width: min(440px, calc(100vw - 48px));
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+}
+
+.media-pool__modal h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary, #e8ecf1);
+}
+
+.media-pool__modal p {
+  margin: 0 0 18px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-secondary, #9aa4b2);
+}
+
+.media-pool__modal-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.media-pool__modal-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #333842);
+  border-radius: 6px;
+  background: var(--bg-input, #23272e);
+  color: var(--text-primary, #e8ecf1);
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.media-pool__modal-btn:hover {
+  border-color: var(--accent, #00e5ff);
+}
+
+.media-pool__modal-btn span {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-secondary, #9aa4b2);
+}
+
+.media-pool__modal-btn--primary {
+  border-color: var(--accent, #00e5ff);
+  background: rgba(0, 229, 255, 0.08);
+}
+
+.media-pool__modal-btn--quiet {
+  align-items: center;
+  background: transparent;
+  color: var(--text-secondary, #9aa4b2);
+  font-size: 12px;
+}
+
+/* A pool card whose bytes are not in the vault: the project still references it,
+   so the card stays and says so rather than silently disappearing. */
+.media-pool__file-item--offline {
+  opacity: 0.55;
+  border-style: dashed;
+}
+
+/* ── Storage tab ──────────────────────────────────────────────────────────
+   Media that survives a reload occupies disk, so the app owes the user a way
+   to see the cost and reclaim it without nuking their projects too. */
+.storage-tab { padding: 10px 12px; overflow-y: auto; }
+
+.storage-tab__summary { display: flex; gap: 8px; margin-bottom: 10px; }
+
+.storage-tab__stat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  background: var(--bg-input, #23272e);
+  border: 1px solid var(--border, #333842);
+  border-radius: 5px;
+}
+
+.storage-tab__stat-value { font-size: 14px; font-weight: 600; color: var(--text-primary, #e8ecf1); }
+.storage-tab__stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-secondary, #9aa4b2); }
+
+.storage-tab__meter {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-input, #23272e);
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.storage-tab__meter-fill { height: 100%; background: var(--accent, #00e5ff); }
+
+.storage-tab__note { margin: 0 0 12px; font-size: 11px; line-height: 1.45; color: var(--text-secondary, #9aa4b2); }
+.storage-tab__note--warn { color: #ffb454; }
+
+.storage-tab__purge {
+  width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 14px;
+  border: 1px solid var(--border, #333842);
+  border-radius: 5px;
+  background: var(--bg-input, #23272e);
+  color: var(--text-primary, #e8ecf1);
+  font-size: 12px;
+  cursor: pointer;
+}
+.storage-tab__purge:hover:not(:disabled) { border-color: #ffb454; color: #ffb454; }
+.storage-tab__purge:disabled { opacity: 0.6; cursor: default; }
+
+.storage-tab__section { margin-bottom: 14px; }
+.storage-tab__section h4 {
+  margin: 0 0 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary, #9aa4b2);
+}
+
+.storage-tab__hint { margin: 0; font-size: 11px; color: var(--text-secondary, #9aa4b2); }
+
+.storage-tab__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  color: var(--text-primary, #e8ecf1);
+}
+.storage-tab__row:nth-child(even) { background: rgba(255, 255, 255, 0.025); }
+.storage-tab__row--unused { color: var(--text-secondary, #9aa4b2); }
+
+.storage-tab__row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.storage-tab__row-kind { font-size: 10px; text-transform: uppercase; color: var(--text-secondary, #9aa4b2); }
+.storage-tab__row-size { font-variant-numeric: tabular-nums; color: var(--text-secondary, #9aa4b2); }

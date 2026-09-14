@@ -11,14 +11,78 @@ import useTimelineStore, { restoreTrackOrder } from '../store/useTimelineStore.j
 import { STARTER_TRANSITION_COMPOUND } from '../shaders/compoundPresets.js'
 import { clearDetectedAlpha } from '../gl/alphaRegistry.js'
 import { resetTransitionStatus } from '../gl/transitionStatus.js'
-import { migrateTimeNodeParams } from '../shaders/dataNodeParams.js'
+import { migrateTimeNodeParams, getDataNodeParams } from '../shaders/dataNodeParams.js'
+import { getNodeSource } from '../shaders/shaderRegistry.js'
+import { parseParams } from './paramParser.js'
 import { clearHistory } from './history.js'
 import { serializeCustomFontRefs, embedCustomFontData, restoreCustomFonts } from './fontRegistry.js'
 import { collectUsedFontValues } from './fontUsage.js'
 import { addToast } from '../components/common/Toast.jsx'
+import useMediaStore from '../store/useMediaStore.js'
+import { SCHEMA_VERSION, migrateV1toV2, mapNodes } from '../storage/schema.js'
+import {
+  writeProject, readProjectMigrating,
+  listProjects as listStoredProjects, deleteProject as removeStoredProject,
+} from '../storage/projectStore.js'
 
-const PROJECT_PREFIX = 'dalivid_project_'
+// Projects live in the vault now (see storage/projectStore.js). The legacy
+// `dalivid_project_<id>` IndexedDB keys are still READ, and migrated into the
+// vault on first open — `listProjects` unions both so nothing is stranded.
 const AUTOSAVE_KEY = 'dalivid_autosave'
+
+/**
+ * Fields that exist only while the app is running and must never be written.
+ *
+ * `fileUrl` was always handled this way (a `blob:` URL in a saved file is
+ * meaningless garbage that *looks* like a working reference). `imageSrc` now
+ * joins it: from v2 an image's identity is `imageRefId`, and `imageSrc` is just
+ * this session's resolution of it. Writing it back would re-inflate exactly the
+ * base64 payload the whole change exists to remove — on `Streetlamp_vid_2108`
+ * that is 389 KB of a 401 KB document, rewritten on every autosave.
+ *
+ * `imageSrc` is only dropped when there IS an `imageRefId` to replace it. A v1
+ * project that has not been migrated yet keeps its data URL, so an interrupted
+ * migration can never lose the image.
+ */
+function stripRuntimeParams(params) {
+  if (!params || typeof params !== 'object') return params
+  if (params.imageRefId && params.imageSrc !== undefined) {
+    const out = { ...params }
+    delete out.imageSrc
+    return out
+  }
+  return params
+}
+
+/**
+ * Remove runtime-only media fields from a fully-built document.
+ *
+ * Done as one pass over the finished document rather than at each of the four
+ * places that map a node, because `subGraph` is deep-cloned wholesale — so a
+ * compound's interior would keep its data URLs no matter how carefully the
+ * top-level mapping was written. `mapNodes` is the single definition of "every
+ * node, everywhere", which is exactly the recursion this needs.
+ */
+function stripRuntimeMedia(doc) {
+  const out = { ...doc }
+
+  if (doc.timeline?.clips) {
+    out.timeline = {
+      ...doc.timeline,
+      clips: doc.timeline.clips.map(c => {
+        const params = stripRuntimeParams(c.params)
+        return params === c.params ? c : { ...c, params }
+      }),
+    }
+  }
+
+  out.graph = mapNodes(doc.graph, (n) => {
+    const params = stripRuntimeParams(n?.params)
+    return params === n?.params ? n : { ...n, params }
+  })
+
+  return out
+}
 
 /**
  * Plain-object copy of an edge transition, or null.
@@ -41,6 +105,48 @@ function serializeTransition(tr) {
  * copied when something actually changes, so a project with no TIME nodes keeps
  * its object identity (Zustand's snapshot-based undo depends on that).
  */
+/**
+ * Backfill any param the node's shader DECLARES but the saved node does not
+ * carry, from that param's own `@param` default.
+ *
+ * **This is a whole CLASS of silent bug, not a one-off.** `uploadUniforms` skips
+ * a uniform the node has no value for, so the shader runs on GLSL's implicit
+ * ZERO — and a project saved before a shader gained a param has exactly that
+ * gap. It is the same failure `SOURCE_PARAMS` already guards for TRANSITION_FX
+ * ("switching Crossfade → Film Burn leaves every Film Burn uniform absent…"),
+ * and the v0.15 AUDIO_VISUALIZER rework reintroduced it at scale: 39 new
+ * uniforms, 18 with non-zero defaults. On a pre-v0.15 node that meant
+ * `u_intensity` = 0, so `col *= u_intensity` erased the graphics ENTIRELY, and
+ * `u_style` = 0 (Over) while the card's select displayed its default of 1 (Add)
+ * — the UI and the shader disagreeing about the same control.
+ *
+ * Only ever ADDS keys, so a value the user actually set always wins, and the
+ * node object is reused untouched when nothing is missing (Zustand's
+ * snapshot-based undo depends on that identity).
+ */
+function backfillNodeParams(node) {
+  if (!node?.type) return node
+  let configs
+  try {
+    // getNodeSource resolves custom edits → attached shaderCode → registry, so a
+    // Monaco-forked node backfills against ITS source, not the stock one.
+    const src = getNodeSource(node)
+    configs = src ? parseParams(src) : getDataNodeParams(node.type)
+  } catch {
+    return node // a node type with no resolvable source is simply not our problem
+  }
+  if (!configs || configs.length === 0) return node
+  const params = node.params || {}
+  let missing = null
+  for (const c of configs) {
+    if (!c?.uniformName || c.default === undefined) continue
+    if (Object.prototype.hasOwnProperty.call(params, c.uniformName)) continue
+    if (!missing) missing = {}
+    missing[c.uniformName] = c.default
+  }
+  return missing ? { ...node, params: { ...params, ...missing } } : node
+}
+
 function migrateGraphNodes(nodes) {
   if (!Array.isArray(nodes)) return nodes
   let changed = false
@@ -52,6 +158,9 @@ function migrateGraphNodes(nodes) {
       node = { ...n, type, params, name: wasDefault ? (type === 'RAMP' ? 'Ramp' : 'LFO') : n.name }
       changed = true
     }
+    // After the TIME split, so a migrated RAMP/LFO is filled from ITS own config.
+    const filled = backfillNodeParams(node)
+    if (filled !== node) { node = filled; changed = true }
     if (node?.subGraph?.nodes) {
       const inner = migrateGraphNodes(node.subGraph.nodes)
       if (inner !== node.subGraph.nodes) {
@@ -76,9 +185,21 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
   const graph = getGraphStore()
   const timeline = getTimelineStore()
 
-  return {
-    version: 1,
+  const doc = {
+    version: SCHEMA_VERSION,
     savedAt: new Date().toISOString(),
+
+    // The Media Pool. Until v2 this did not persist at all — it lived in
+    // `useState` inside MediaPool.jsx, so every reload lost it and the only way
+    // back was matching by filename. Refs are content-addressed, so a reload
+    // re-resolves them against the vault with no prompt.
+    //
+    // `serializeRefs` strips local-only fields and drops session-only entries:
+    // their bytes were never copied into the vault, so saving them would produce
+    // a document claiming media it cannot possibly resolve on the next open.
+    media: {
+      refs: useMediaStore.getState().serializeRefs(),
+    },
 
     project: {
       name: app.projectName,
@@ -113,6 +234,11 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
         id: c.id,
         trackId: c.trackId,
         filename: c.filename,
+        // KEPT FOREVER, alongside mediaRefId. It is the downgrade path (a v2
+        // project opened by a v1 build falls back to relink-by-name and loses
+        // the refs, not the edit) and the fallback when a ref cannot resolve.
+        // Costs nothing. See VAULT.md.
+        mediaRefId: c.mediaRefId || null,
         fileType: c.fileType,
         timelineStart: c.timelineStart,
         timelineEnd: c.timelineEnd,
@@ -170,6 +296,13 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
           customShaderSource: n.customShaderSource,
           bypassed: n.bypassed,
           locked: n.locked,
+          // Card geometry. Not cosmetic enough to drop: a graph you collapsed and
+          // sized IS the layout you arranged, and losing it on reload is the same
+          // class of bug as the terminal tags below. undefined values are dropped
+          // by JSON.stringify, so an untouched node costs nothing.
+          collapsed: n.collapsed || undefined,
+          width: n.width,
+          height: n.height,
           audioBindings: { ...n.audioBindings },
           // Terminal tags on EFFECT_INPUT nodes. Both were being dropped, and
           // both matter on reload: `terminalRole` is how a transition binds FROM
@@ -205,6 +338,10 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
               customShaderSource: n.customShaderSource,
               bypassed: n.bypassed,
               locked: n.locked,
+              // See masterGraph note — card geometry.
+              collapsed: n.collapsed || undefined,
+              width: n.width,
+              height: n.height,
               audioBindings: n.audioBindings ? { ...n.audioBindings } : {},
               // See masterGraph note — transition graphs live in clipGraphs, so
               // this is the map that actually carries FROM/TO roles.
@@ -246,6 +383,8 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
       editMode: app.editMode,
     },
   }
+
+  return stripRuntimeMedia(doc)
 }
 
 /**
@@ -256,10 +395,17 @@ export function serializeProject(getAppStore, getGraphStore, getTimelineStore) {
  * @param {Function} getTimelineStore
  */
 export function deserializeProject(data, getAppStore) {
-  if (!data || data.version !== 1) {
+  if (!data || (data.version !== 1 && data.version !== SCHEMA_VERSION)) {
     console.error('[ProjectSerializer] Unsupported project version:', data?.version)
     return false
   }
+
+  // v1 → v2 is pure and idempotent: it adds `media.refs` and `mediaRefId: null`
+  // and nothing else, so a v1 project opens exactly as it always did. Converting
+  // its inlined images into blobs needs bytes written to storage, so that half
+  // runs afterwards in `restoreProjectMedia` — deliberately not blocking the
+  // open, the same way `restoreCustomFonts` below does not.
+  data = migrateV1toV2(data)
 
   const app = getAppStore()
 
@@ -410,14 +556,28 @@ export function deserializeProject(data, getAppStore) {
  */
 export async function saveProject(getAppStore, getGraphStore, getTimelineStore) {
   const data = serializeProject(getAppStore, getGraphStore, getTimelineStore)
-  const key = `${PROJECT_PREFIX}${data.project.id}`
-  await idbSet(key, data)
+
+  // Into the vault: validated before any I/O, written atomically, and with the
+  // previous version rotated into `backups/` first. `idbSet` had none of those
+  // properties — one bad serialise landed straight on top of the only copy.
+  await writeProject(data.project.id, data)
+
+  // The autosave slot stays in IndexedDB and stays the fast path. It is the
+  // "reopen what I had" pointer, rewritten every couple of seconds; it is not
+  // the durable record, and giving it backups would mint one per keystroke.
+  await idbSet(AUTOSAVE_KEY, data)
+
   console.log('[ProjectSerializer] Saved project:', data.project.name)
   return data
 }
 
 /**
  * Autosave to IndexedDB.
+ *
+ * Deliberately does NOT go through `writeProject`. Autosave fires two seconds
+ * after any change, so routing it through validation + backup rotation would
+ * spend that budget continuously and fill the backup history with keystrokes.
+ * Durability is the explicit save's job; this is a crash-recovery pointer.
  */
 export async function autosave(getAppStore, getGraphStore, getTimelineStore) {
   const data = serializeProject(getAppStore, getGraphStore, getTimelineStore)
@@ -426,12 +586,11 @@ export async function autosave(getAppStore, getGraphStore, getTimelineStore) {
 }
 
 /**
- * Load project from IndexedDB by ID.
+ * Load a project by id, migrating it out of IndexedDB into the vault if that is
+ * still where it lives.
  */
 export async function loadProject(projectId) {
-  const key = `${PROJECT_PREFIX}${projectId}`
-  const data = await idbGet(key)
-  return data || null
+  return await readProjectMigrating(projectId)
 }
 
 /**
@@ -442,31 +601,17 @@ export async function loadAutosave() {
 }
 
 /**
- * List all saved projects.
+ * List all saved projects — vault and legacy IndexedDB together.
  */
 export async function listProjects() {
-  const allKeys = await idbKeys()
-  const projectKeys = allKeys.filter(k => typeof k === 'string' && k.startsWith(PROJECT_PREFIX))
-  const projects = []
-  for (const key of projectKeys) {
-    const data = await idbGet(key)
-    if (data) {
-      projects.push({
-        id: data.project.id,
-        name: data.project.name,
-        savedAt: data.savedAt,
-      })
-    }
-  }
-  return projects.sort((a, b) => new Date(b.savedAt) - new Date(a.savedAt))
+  return await listStoredProjects()
 }
 
 /**
  * Delete a saved project.
  */
 export async function deleteProject(projectId) {
-  const key = `${PROJECT_PREFIX}${projectId}`
-  await idbDel(key)
+  await removeStoredProject(projectId)
 }
 
 /**

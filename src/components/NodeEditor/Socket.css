@@ -9,6 +9,10 @@
   cursor: pointer;
   padding: 2px 0;
   position: relative;
+  /* Above .node-card__resize (z-index 1-2): the left and right resize handles
+     straddle exactly the edge the sockets sit on, so without this a socket on
+     that edge would be unclickable and you could not wire the node. */
+  z-index: 3;
 }
 
 .socket--input {

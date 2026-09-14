@@ -2,9 +2,13 @@ import { useState, useRef, useCallback, useMemo, memo } from 'react'
 import Socket from './Socket'
 import { IconChevronDown, IconSettings, IconEye, IconCode, IconClose } from '../common/Icons'
 import { getNodeSockets } from '../../shaders/nodeDefinitions'
+import {
+  NODE_MIN_WIDTH, NODE_MAX_WIDTH, NODE_MIN_HEIGHT, NODE_MAX_HEIGHT, NODE_MIN_PARAMS_H, nodeWidth,
+} from './nodeGeometry'
 import { visibleDataParams } from '../../shaders/dataNodeParams'
 import { getNodeSource } from '../../shaders/shaderRegistry'
 import { prepareImageDataURL, dataUrlBytes, formatBytes } from '../../utils/imageProcessing'
+import useMediaStore from '../../store/useMediaStore'
 import './NodeCard.css'
 
 export const NODE_COLORS = {
@@ -14,6 +18,7 @@ export const NODE_COLORS = {
   'CAMERA_INPUT': '#44aaff', 'SCREEN_INPUT': '#44aaff', 'AUDIO_INPUT': '#ff00aa', 'AUDIO_SPLITTER': '#cc44ff',
   'AUDIO_VISUALIZER': '#ff00aa', 'OUTPUT': '#ff6644', 'EDGE_DETECTION': '#ff8844',
   'COLOR_INVERSION': '#ff44cc', 'GLITCH': '#ff3344', 'FEEDBACK': '#aa44ff',
+  'FEEDBACK_MACHINE': '#c46bff',
   'KALEIDOSCOPE': '#44ccff', 'PIXEL_SORT': '#ff8844', 'CHROMATIC_ABERRATION': '#ff44aa',
   'BLOOM': '#ffcc44', 'CRT': '#88aa44', 'VORONOI': '#44ffaa', 'FLUID_WARP': '#4488ff',
   'HALFTONE': '#aaaacc', 'THRESHOLD': '#ccaa44', 'DEPTH_BLUR': '#44aacc',
@@ -35,9 +40,18 @@ export const NODE_COLORS = {
   'VOXEL_3D': '#d8c86a', 'DEPTH_DISPLACE': '#e08adf', 'TIME_SLICE_3D': '#9a8cff',
 }
 
-// Must match .node-card { width } in NodeCard.css — marquee hit-testing and the
-// socket-position fallback in NodeCanvas both derive geometry from this.
-export const NODE_WIDTH = 270
+// Edge/corner drag handles. The letters name the edges the drag MOVES: 'w'/'e'
+// change width ('w' also shifts position.x so the opposite edge stays planted),
+// 's' changes height. There is deliberately no north handle — the header owns
+// that edge and dragging it is the move gesture; a resize there would be a coin
+// toss between the two.
+const RESIZE_HANDLES = [
+  ['w', 'Drag to resize width · double-click to reset'],
+  ['e', 'Drag to resize width · double-click to reset'],
+  ['s', 'Drag to resize height · double-click to reset'],
+  ['sw', 'Drag to resize · double-click to reset'],
+  ['se', 'Drag to resize · double-click to reset'],
+]
 
 // How far a Shift+drag must travel (screen px, so it's zoom-independent) before
 // the node is pulled out of its chain. Extraction rewrites edges, so it must not
@@ -160,7 +174,7 @@ const NodeCard = memo(function NodeCard({
   executionOrder = null, paramConfigs = [], onSelect, onDelete, onMove, onMoveEnd, onOpenMonaco,
   onSetPreview, onToggleBypass, onParamChange, onSocketDragStart, onSocketDragEnd,
   onDuplicate, onExtractNode, onDissolveNode, connectedInputs = new Set(), connectedOutputs = new Set(),
-  zoom = 1, onEnterCompound, onExposedParamChange,
+  zoom = 1, onEnterCompound, onExposedParamChange, onToggleCollapse, onResize,
 }) {
   const cardRef = useRef(null)
   const [isDragging, setIsDragging] = useState(false)
@@ -170,6 +184,14 @@ const NodeCard = memo(function NodeCard({
   const accentColor = NODE_COLORS[node.type] || '#00e5ff'
   const isLocked = node.locked
   const isCompound = node.type === 'COMPOUND'
+  const isCollapsed = !!node.collapsed
+  const cardWidth = nodeWidth(node)
+  // A collapsed card is laid out by its content, so an explicit height is only
+  // honoured while expanded — otherwise expanding a node you had sized small
+  // would hand back a card too short for its own params.
+  const sizedHeight = (!isCollapsed && typeof node.height === 'number' && isFinite(node.height))
+    ? Math.max(NODE_MIN_HEIGHT, Math.min(NODE_MAX_HEIGHT, node.height))
+    : null
 
   // Sockets are built from the FULL config list, never the visible subset: a
   // hidden param can still be driven by a wire, and dropping its socket would
@@ -178,6 +200,17 @@ const NodeCard = memo(function NodeCard({
   const fixedInputs = inputs.filter(s => !s.isParam)
   const paramInputs = inputs.filter(s => s.isParam)
   const compoundExposedParams = isCompound ? (node.exposedParams || []) : []
+
+  // What a COLLAPSED card still shows: every fixed socket (there are only ever a
+  // handful, and a collapsed node must stay wireable), plus any PARAM socket that
+  // currently has a noodle on it. That second half is not cosmetic — getSocketPos
+  // anchors each noodle to the socket's live DOM circle, so dropping a connected
+  // socket would strand its wire on the position-estimate fallback and the noodle
+  // would visibly jump. Unconnected param sockets (there can be a dozen) are the
+  // only thing hidden; expand the node to wire one.
+  const railInputs = isCollapsed
+    ? [...fixedInputs, ...paramInputs.filter(s => connectedInputs.has(s.id))]
+    : fixedInputs
 
   // Controls whose value can't do anything are noise (Beats/Cycle with Beat Sync
   // off, Pulse Width on a Sine wave). `connectedInputs` is passed as the
@@ -269,6 +302,72 @@ const NodeCard = memo(function NodeCard({
     if (isCompound && onEnterCompound) { e.stopPropagation(); onEnterCompound(node.id) }
   }, [isCompound, node.id, onEnterCompound])
 
+  // ── Edge / corner resize ──
+  // Deltas are divided by `zoom` for the same reason the move drag is: the card
+  // lives inside a CSS-scaled surface, so screen px and graph px differ.
+  const handleResizeDown = useCallback((e, dir) => {
+    if (e.button !== 0) return
+    e.stopPropagation()
+    e.preventDefault()
+    const card = cardRef.current
+    if (!card) return
+    const startW = cardWidth
+    const startH = card.offsetHeight
+    const startX = node.position.x
+    const startY = node.position.y
+    // Floor for a height drag. The params list is the ONLY part that shrinks
+    // (`.node-card--sized > *` pins everything else at flex-shrink 0), so the
+    // floor is the measured height of that fixed chrome plus a usable sliver of
+    // list. Measured rather than assumed because it is not just the header and
+    // sockets: IMAGE / TEXT / SHAPE cards each carry an extra fixed block, and
+    // the card has `overflow: visible` (sockets hang past its edges), so
+    // under-counting doesn't clip — it spills the image out the bottom.
+    // Absolutely-positioned children (the resize handles, the exec-order and
+    // orphan badges) are out of flow and must not be counted.
+    let fixedH = 0
+    let hasParams = false
+    for (const el of card.children) {
+      if (el.classList.contains('node-card__params')) { hasParams = true; continue }
+      if (getComputedStyle(el).position === 'absolute') continue
+      fixedH += el.offsetHeight
+    }
+    const minH = Math.max(NODE_MIN_HEIGHT, fixedH + (hasParams ? NODE_MIN_PARAMS_H : 0) + 6)
+    const west = dir.includes('w')
+    const wantsW = west || dir.includes('e')
+    const wantsH = dir.includes('s') && !isCollapsed
+
+    const handleMove = (ev) => {
+      // Both axes are measured from the gesture's START, never accumulated per
+      // move event — a cumulative delta drifts as soon as a value hits a clamp.
+      const dx = (ev.clientX - e.clientX) / zoom
+      const dy = (ev.clientY - e.clientY) / zoom
+      const patch = {}
+      if (wantsW) {
+        const w = Math.round(Math.max(NODE_MIN_WIDTH, Math.min(NODE_MAX_WIDTH, west ? startW - dx : startW + dx)))
+        patch.width = w
+        // Dragging the west edge keeps the EAST edge planted, so the card grows
+        // into the drag rather than sliding away from it.
+        if (west) patch.position = { x: Math.round(startX + (startW - w)), y: startY }
+      }
+      if (wantsH) patch.height = Math.round(Math.max(minH, Math.min(NODE_MAX_HEIGHT, startH + dy)))
+      onResize?.(node.id, patch)
+    }
+    const handleUp = () => {
+      document.removeEventListener('mousemove', handleMove)
+      document.removeEventListener('mouseup', handleUp)
+    }
+    document.addEventListener('mousemove', handleMove)
+    document.addEventListener('mouseup', handleUp)
+  }, [node.id, node.position.x, node.position.y, cardWidth, zoom, isCollapsed, onResize])
+
+  // Double-click any handle clears BOTH overrides — back to the 270px default and
+  // content height. `undefined` is the "no override" value everywhere (nodeWidth
+  // falls through to the default, JSON.stringify drops the key on save).
+  const handleResizeReset = useCallback((e) => {
+    e.stopPropagation()
+    onResize?.(node.id, { width: undefined, height: undefined })
+  }, [node.id, onResize])
+
   // ── Image source: load / replace the still image on this node ──
   const isImageNode = node.type === 'IMAGE_INPUT'
   const isTextNode = node.type === 'TEXT_INPUT'
@@ -277,12 +376,30 @@ const NodeCard = memo(function NodeCard({
   const readImageFile = useCallback(async (file) => {
     if (!file || !file.type?.startsWith('image/')) return
     try {
-      // Downscale + re-encode so the persisted data URL stays small.
-      const { dataUrl } = await prepareImageDataURL(file)
+      // Downscale + re-encode: still bounds the texture to the WebGL2-guaranteed
+      // 2048 and keeps the stored blob small.
+      const { dataUrl, width, height } = await prepareImageDataURL(file)
       const after = dataUrlBytes(dataUrl)
       const pct = file.size > 0 ? Math.round((1 - after / file.size) * 100) : 0
       console.log(`[DaliVid] Loaded "${file.name}": ${formatBytes(file.size)} → ${formatBytes(after)} (${pct}% smaller)`)
-      onParamChange?.(node.id, 'imageSrc', dataUrl) // data URL → persisted in params
+
+      // Into the blob store rather than inlined into params. imageRefId is what
+      // persists; imageSrc is this session's URL for it and the serializer drops
+      // it. If the store write fails we still set imageSrc, so the node works
+      // now and simply does not survive a reload — never a black frame.
+      let src = dataUrl
+      try {
+        const blob = await fetch(dataUrl).then(r => r.blob())
+        const ref = await useMediaStore.getState().ingestBytes(blob, {
+          filename: file.name, kind: 'image',
+          mime: blob.type || 'image/webp', meta: { width, height },
+        })
+        src = useMediaStore.getState().urlFor(ref.id) || dataUrl
+        onParamChange?.(node.id, 'imageRefId', ref.id)
+      } catch (err) {
+        console.warn('[DaliVid] Image kept in-document (could not store it):', err)
+      }
+      onParamChange?.(node.id, 'imageSrc', src)
       onParamChange?.(node.id, 'imageName', file.name)
     } catch (err) {
       console.error('[DaliVid] Failed to load image:', err)
@@ -330,8 +447,18 @@ const NodeCard = memo(function NodeCard({
         isDragging && 'node-card--dragging',
         isCompound && 'node-card--compound',
         compoundExpanded && 'node-card--compound-expanded',
+        isCollapsed && 'node-card--collapsed',
+        sizedHeight != null && 'node-card--sized',
       ].filter(Boolean).join(' ')}
-      style={{ left: node.position.x, top: node.position.y, borderLeftColor: isCompound ? (node.color || accentColor) : accentColor }}
+      style={{
+        left: node.position.x, top: node.position.y, width: cardWidth,
+        // Height is only ever set once the bottom edge has been dragged —
+        // otherwise the card stays content-sized, exactly as every node was
+        // before this. `node-card--sized` is what turns the params list into the
+        // scrolling region that absorbs the difference.
+        ...(sizedHeight != null ? { height: sizedHeight } : null),
+        borderLeftColor: isCompound ? (node.color || accentColor) : accentColor,
+      }}
       onMouseDown={handleMouseDown}
       onContextMenu={handleContextMenu}
       onClick={(e) => {
@@ -344,12 +471,25 @@ const NodeCard = memo(function NodeCard({
       onDoubleClick={handleDoubleClick}
     >
       <div className="node-card__header">
+        {/* Disclosure sits LEFT of the title, not in the right-hand action
+            cluster: a COMPOUND card already has a chevron there (exposed params),
+            and two chevrons side by side is a guess. Left of the title is the
+            conventional place for "open/close this thing" and reads as such.
+            Deliberately outside the !isLocked guard — collapsing is a view-only
+            change, so OUTPUT and CLIP_SOURCE can be tidied away too. */}
+        <button
+          className={`node-card__disclosure ${isCollapsed ? 'node-card__disclosure--collapsed' : ''}`}
+          onClick={(e) => { e.stopPropagation(); onToggleCollapse?.(node.id) }}
+          data-tooltip={isCollapsed ? 'Expand node (H)' : 'Collapse node (H)'}
+        >
+          <IconChevronDown size={11} />
+        </button>
         <span className="node-card__type" style={{ color: isCompound ? (node.color || accentColor) : accentColor }}>
           {node.name || node.type}
         </span>
-        {isCompound && <span className="node-card__compound-badge mono">{exposedParamCount} param{exposedParamCount !== 1 ? 's' : ''}</span>}
+        {isCompound && !isCollapsed && <span className="node-card__compound-badge mono">{exposedParamCount} param{exposedParamCount !== 1 ? 's' : ''}</span>}
         <div className="node-card__header-actions">
-          {isCompound && (
+          {isCompound && !isCollapsed && (
             <button className={`node-card__action-btn ${compoundExpanded ? 'node-card__action-btn--active' : ''}`}
               onClick={(e) => { e.stopPropagation(); setCompoundExpanded(!compoundExpanded) }}
               data-tooltip={compoundExpanded ? 'Collapse Parameters' : 'Expand Parameters'}>
@@ -369,6 +509,24 @@ const NodeCard = memo(function NodeCard({
         </div>
       </div>
 
+      {isCollapsed ? (
+        // One rail row, inputs hugging the left edge and outputs the right. The
+        // dots are `mini` (no labels — there is no room and the tooltip carries
+        // the name), but the .socket hit box is padded out in CSS so they stay
+        // grabbable; getSocketPos reads the CIRCLE, so noodles still land dead on.
+        <div className="node-card__rail">
+          <div className="node-card__rail-side node-card__rail-side--in">
+            {railInputs.map((socket) => (
+              <Socket key={socket.id} type="input" dataType={socket.type} name={socket.name} connected={connectedInputs.has(socket.id)} nodeId={node.id} socketId={socket.id} onDragStart={onSocketDragStart} onDragEnd={onSocketDragEnd} mini />
+            ))}
+          </div>
+          <div className="node-card__rail-side node-card__rail-side--out">
+            {outputs.map((socket) => (
+              <Socket key={socket.id} type="output" dataType={socket.type} name={socket.name} connected={connectedOutputs.has(socket.id)} nodeId={node.id} socketId={socket.id} onDragStart={onSocketDragStart} mini />
+            ))}
+          </div>
+        </div>
+      ) : (
       <div className="node-card__socket-area">
         <div className="node-card__sockets-left">
           {fixedInputs.map((socket) => (
@@ -389,8 +547,9 @@ const NodeCard = memo(function NodeCard({
           ))}
         </div>
       </div>
+      )}
 
-      {isImageNode && (
+      {!isCollapsed && isImageNode && (
         <div
           className="node-card__image-loader"
           onMouseDown={(e) => e.stopPropagation()}
@@ -427,7 +586,7 @@ const NodeCard = memo(function NodeCard({
         </div>
       )}
 
-      {isTextNode && (
+      {!isCollapsed && isTextNode && (
         <div
           className="node-card__text-editor"
           onMouseDown={(e) => e.stopPropagation()}
@@ -452,7 +611,7 @@ const NodeCard = memo(function NodeCard({
         </div>
       )}
 
-      {isShapeNode && (
+      {!isCollapsed && isShapeNode && (
         // Quick shape switcher — the same u_shp_type the "Shape" dropdown sets,
         // one click away (the dropdown still lives in the params list below).
         <div
@@ -482,7 +641,7 @@ const NodeCard = memo(function NodeCard({
         </div>
       )}
 
-      {compoundExpanded && isCompound && exposedParamCount > 0 && (
+      {!isCollapsed && compoundExpanded && isCompound && exposedParamCount > 0 && (
         <div className="node-card__params">
           <div className="node-card__params-divider">EXPOSED PARAMETERS</div>
           {compoundExposedParams.map((ep, i) => (
@@ -495,7 +654,7 @@ const NodeCard = memo(function NodeCard({
         </div>
       )}
 
-      {!isCompound && visibleParams.length > 0 && (
+      {!isCollapsed && !isCompound && visibleParams.length > 0 && (
         <div className="node-card__params">
           <div className="node-card__params-divider">PARAMETERS</div>
           {visibleParams.map(param => {
@@ -516,6 +675,22 @@ const NodeCard = memo(function NodeCard({
           })}
         </div>
       )}
+
+      {/* Handles straddle the card edge (half in, half out) so they are
+          grabbable at low zoom. Sockets are given a higher z-index in Socket.css,
+          so a socket sitting on the same edge still wins the click. The south
+          handles are dropped while collapsed — that height is laid out, not set. */}
+      {RESIZE_HANDLES.map(([dir, tip]) => (
+        (isCollapsed && dir.includes('s')) ? null : (
+          <div
+            key={dir}
+            className={`node-card__resize node-card__resize--${dir}`}
+            data-tooltip={tip}
+            onMouseDown={(e) => handleResizeDown(e, dir)}
+            onDoubleClick={handleResizeReset}
+          />
+        )
+      ))}
 
       {executionOrder !== null && <div className="node-card__exec-order mono">{executionOrder}</div>}
       {isOrphaned && <div className="node-card__orphan-warning" data-tooltip="Not connected to OUTPUT — will not render">⚠</div>}

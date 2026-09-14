@@ -674,6 +674,183 @@ void main() {
 }
 `)
 
+// ── Feedback Machine ──
+// Analogue-style optical feedback: every lap applies camera geometry, monitor
+// knobs (with hard clipping), lens softness and a keyed input, over an N-frame
+// history ring (u_prev_delay — see the ring branch in executeGraphDAG).
+registerShader('FEEDBACK_MACHINE', `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform sampler2D u_texture_b;
+uniform sampler2D u_prev_frame;
+uniform vec2 u_resolution;
+uniform float u_time;
+
+// @param name="Clear Loop" type=bool default=false
+uniform bool u_fm_clear;
+// @param name="Zoom" min=0.9 max=1.1 default=1.01 step=0.001
+uniform float u_fm_zoom;
+// @param name="Rotate" min=-0.2 max=0.2 default=0.01 step=0.0005
+uniform float u_fm_rotate;
+// @param name="Offset X" min=-0.5 max=0.5 default=0.0 step=0.001
+uniform float u_fm_pan_x;
+// @param name="Offset Y" min=-0.5 max=0.5 default=0.0 step=0.001
+uniform float u_fm_pan_y;
+// @param name="Fold" min=0 max=4 default=0 step=1 type=select options="None,Mirror X,Mirror Y,Rotate 90,Rotate 180"
+uniform int u_fm_fold;
+// @param name="Edges" min=0 max=3 default=0 step=1 type=select options="Black,Clamp,Mirror,Tile"
+uniform int u_fm_edge;
+// @param name="Drift" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_fm_drift;
+// @param name="Gain" min=0.5 max=1.5 default=0.95 step=0.005
+uniform float u_fm_gain;
+// @param name="Contrast" min=0.5 max=2.0 default=1.03 step=0.005
+uniform float u_fm_contrast;
+// @param name="Brightness" min=-0.2 max=0.2 default=0.0 step=0.001
+uniform float u_fm_brightness;
+// @param name="Hue Shift" min=-0.1 max=0.1 default=0.01 step=0.0005
+uniform float u_fm_hue;
+// @param name="Saturation" min=0.0 max=2.0 default=1.0 step=0.01
+uniform float u_fm_saturation;
+// @param name="Auto Level" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_fm_auto_level;
+// @param name="Soften" min=0.0 max=3.0 default=0.8 step=0.01
+uniform float u_fm_soften;
+// @param name="Sharpen" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_fm_sharpen;
+// @param name="Delay (frames)" min=1 max=30 default=1 step=1
+uniform int u_prev_delay;
+// @param name="Mix" min=0 max=4 default=0 step=1 type=select options="Add,Crossfade,Luma Key,Screen,Difference"
+uniform int u_fm_mix;
+// @param name="Input Amount" min=0.0 max=1.0 default=0.35 step=0.01
+uniform float u_fm_amount;
+// @param name="Key Threshold" min=0.0 max=1.0 default=0.3 step=0.01
+uniform float u_fm_key_thr;
+// @param name="Key Softness" min=0.0 max=0.5 default=0.1 step=0.01
+uniform float u_fm_key_soft;
+// @param name="Input B Amount" min=0.0 max=1.0 default=0.0 step=0.01
+uniform float u_fm_b_amount;
+// @param name="Resolution" min=0 max=2 default=0 step=1 type=select options="Full,Half,Quarter"
+uniform int u_fm_res;
+out vec4 fragColor;
+
+vec3 rgb2hsv(vec3 c) {
+  vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+  vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+  vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+  float d = q.x - min(q.w, q.y);
+  return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + 0.001)), d / (q.x + 0.001), q.x);
+}
+
+vec3 hsv2rgb(vec3 c) {
+  vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+// History sample with the chosen edge rule. Black = outside the screen is black
+// AND transparent, like the bezel around his monitor.
+vec4 histSample(vec2 uv) {
+  if (u_fm_edge == 1) return texture(u_prev_frame, clamp(uv, 0.0, 1.0));
+  if (u_fm_edge == 2) {
+    vec2 m = 1.0 - abs(fract(uv * 0.5) * 2.0 - 1.0);
+    return texture(u_prev_frame, m);
+  }
+  if (u_fm_edge == 3) return texture(u_prev_frame, fract(uv));
+  vec2 fw = fwidth(uv) + 1e-5;
+  vec2 lo = smoothstep(vec2(0.0), fw, uv);
+  vec2 hi = smoothstep(vec2(0.0), fw, vec2(1.0) - uv);
+  return texture(u_prev_frame, clamp(uv, 0.0, 1.0)) * (lo.x * lo.y * hi.x * hi.y);
+}
+
+// Lens: a 5-tap soften and an unsharp-mask sharpen, both inside the loop.
+vec4 lensSample(vec2 uv) {
+  vec4 c = histSample(uv);
+  if (u_fm_soften <= 0.0 && u_fm_sharpen <= 0.0) return c;
+  vec2 px = max(u_fm_soften, 0.5) / u_resolution;
+  vec4 b = (histSample(uv + vec2(px.x, 0.0)) + histSample(uv - vec2(px.x, 0.0))
+          + histSample(uv + vec2(0.0, px.y)) + histSample(uv - vec2(0.0, px.y))) * 0.25;
+  vec4 soft = mix(c, b, 0.5 * min(u_fm_soften, 1.0));
+  return soft + (c - b) * u_fm_sharpen;
+}
+
+float keyOf(vec4 c) {
+  return smoothstep(u_fm_key_thr - u_fm_key_soft, u_fm_key_thr + u_fm_key_soft, luma(c.rgb)) * c.a;
+}
+
+void main() {
+  vec4 curr = texture(u_texture, v_uv);
+  if (u_fm_clear) { fragColor = curr; return; }
+
+  // ── Camera ── frame units: y in [-0.5, 0.5], x scaled by aspect so rotation stays circular.
+  float aspect = u_resolution.x / max(u_resolution.y, 1.0);
+  vec2 p = vec2((v_uv.x - 0.5) * aspect, v_uv.y - 0.5);
+
+  if (u_fm_fold == 1) p.x = abs(p.x);
+  else if (u_fm_fold == 2) p.y = abs(p.y);
+  else if (u_fm_fold == 3) p = vec2(-p.y, p.x);
+  else if (u_fm_fold == 4) p = -p;
+
+  float t = u_time;
+  // Audio drivers (0 until wired): mid rotates, sub-bass zooms, treble shifts hue.
+  float ang = u_fm_rotate + u_fm_drift * 0.04 * sin(t * 0.37) + u_mid * 0.03;
+  float cs = cos(ang), sn = sin(ang);
+  p = mat2(cs, -sn, sn, cs) * p;
+  float zoom = u_fm_zoom + u_sub_bass * 0.01 + u_fm_drift * 0.01 * sin(t * 0.21);
+  p /= max(zoom, 0.01);
+  p += vec2(u_fm_pan_x, u_fm_pan_y) + u_fm_drift * 0.03 * vec2(sin(t * 0.23), cos(t * 0.19));
+  vec2 huv = vec2(p.x / aspect + 0.5, p.y + 0.5);
+
+  vec4 hist = lensSample(huv);
+
+  // ── Monitor ── knobs applied every lap; the clamp is the screen's white and black.
+  vec3 rgb = hist.rgb * u_fm_gain;
+
+  // Auto Level: coarse mean brightness of the last frame pulls the gain back
+  // toward a mid grey, so the loop neither whites out nor dies. 0 = fully manual.
+  if (u_fm_auto_level > 0.0) {
+    float m = 0.0;
+    for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < 4; j++) {
+        m += luma(texture(u_prev_frame, vec2(0.125 + 0.25 * float(i), 0.125 + 0.25 * float(j))).rgb);
+      }
+    }
+    m /= 16.0;
+    float corr = clamp(0.3 / max(m, 0.02), 0.5, 1.5);
+    rgb *= mix(1.0, corr, u_fm_auto_level * 0.5);
+  }
+
+  rgb = (rgb - 0.5) * u_fm_contrast + 0.5 + u_fm_brightness;
+  vec3 hsv = rgb2hsv(clamp(rgb, 0.0, 1.0));
+  hsv.x = fract(hsv.x + u_fm_hue + u_treble * 0.02);
+  hsv.y = clamp(hsv.y * u_fm_saturation, 0.0, 1.0);
+  rgb = clamp(hsv2rgb(hsv), 0.0, 1.0);
+
+  // ── Mix ── how the live input joins the loop.
+  vec3 inp = curr.rgb * u_fm_amount;
+  vec3 outRgb;
+  if (u_fm_mix == 1) outRgb = mix(rgb, curr.rgb, u_fm_amount);
+  else if (u_fm_mix == 2) outRgb = mix(rgb, curr.rgb, keyOf(curr) * u_fm_amount);
+  else if (u_fm_mix == 3) outRgb = 1.0 - (1.0 - rgb) * (1.0 - inp);
+  else if (u_fm_mix == 4) outRgb = abs(rgb - inp);
+  else outRgb = rgb + inp;
+
+  // Input B: the second screen in the beam splitter, always luma-keyed in.
+  if (u_fm_b_amount > 0.0) {
+    vec4 b = texture(u_texture_b, v_uv);
+    outRgb = mix(outRgb, b.rgb, keyOf(b) * u_fm_b_amount);
+  }
+
+  outRgb = clamp(outRgb, 0.0, 1.0);
+  // Trails may add coverage but never eat the live frame's own matte.
+  float a = max(clamp(hist.a, 0.0, 1.0), curr.a);
+  fragColor = vec4(outRgb, a);
+}
+`)
+
 // ── Blur (Gaussian) ──
 registerShader('BLUR', `#version 300 es
 precision highp float;
@@ -2964,91 +3141,112 @@ void main() {
 }
 `)
 
-// ── Math / Blend (mixes two inputs with selectable blend mode) ──
-registerShader('MATH_BLEND', `#version 300 es
+// ── Math / Blend + Mix / Blend (one shader, two node types) ──────────────────
+// Two texture inputs and one Operation select, in two families:
+//
+//   0-5  COLOUR MATHS — Mix, Add, Multiply, Screen, Difference, Overlay. These
+//        combine the two pictures' colour and say nothing about shape.
+//   6-9  COMPOSITING — Over, Under, Mask, Cut Out. These read B's MATTE (its
+//        alpha, or its brightness) and use it to decide WHERE B lands on A, or
+//        where A survives. This is what makes a Shape / Text / alpha image
+//        usable as a cover or a mask over video — colour maths alone cannot do
+//        it, because "transparent" is not a colour.
+//
+// The pipeline is STRAIGHT (unassociated) alpha throughout, which has two
+// consequences worth knowing before editing:
+//   • A fully transparent pixel's RGB is UNDEFINED — for a shape it happens to
+//     be black, for alpha video it is codec noise. So the colour operations
+//     weight their result by B's coverage: at b.a == 1 (all ordinary footage)
+//     that is exactly the old maths, at b.a == 0 A passes through untouched
+//     instead of being blended toward whatever junk was in the transparent
+//     region.
+//   • blendOver sums PREMULTIPLIED colour and divides the result back out by
+//     its own alpha, so nothing leaves this node premultiplied.
+//
+// Operation indices are FROZEN — a saved project stores the index, not the
+// label — so new operations may only ever be appended to the end of the list.
+const BLEND_NODE_FS = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform sampler2D u_texture_b;
+// @showif u_operation == Mix,Add,Multiply,Screen,Difference,Overlay
 // @param name="Mix" min=0.0 max=1.0 default=0.5 step=0.01
 uniform float u_mix;
-// @param name="Operation" min=0 max=5 default=0 step=1 type=select options="Mix,Add,Multiply,Screen,Difference,Overlay"
+// @param name="Operation" min=0 max=9 default=0 step=1 type=select options="Mix,Add,Multiply,Screen,Difference,Overlay,Over,Under,Mask,Cut Out"
 uniform int u_operation;
+// @showif u_operation == Over,Under,Mask,Cut Out
+// @param name="Amount" min=0.0 max=1.0 default=1.0 step=0.01
+uniform float u_amount;
+// @showif u_operation == Over,Under,Mask,Cut Out
+// @param name="Matte From" min=0 max=2 default=0 step=1 type=select options="B Alpha,B Brightness,B Alpha x Brightness"
+uniform int u_matte;
 out vec4 fragColor;
+
+// Straight-alpha source-over: s over d, un-premultiplied on the way out.
+vec4 blendOver(vec4 s, vec4 d) {
+  float outA = s.a + d.a * (1.0 - s.a);
+  if (outA <= 0.0) return vec4(0.0);
+  return vec4((s.rgb * s.a + d.rgb * d.a * (1.0 - s.a)) / outA, outA);
+}
 
 void main() {
   vec4 a = texture(u_texture, v_uv);
   vec4 b = texture(u_texture_b, v_uv);
-  vec3 result;
 
-  if (u_operation == 0) result = mix(a.rgb, b.rgb, u_mix);
-  else if (u_operation == 1) result = a.rgb + b.rgb * u_mix;
-  else if (u_operation == 2) result = a.rgb * mix(vec3(1.0), b.rgb, u_mix);
-  else if (u_operation == 3) result = 1.0 - (1.0 - a.rgb) * (1.0 - b.rgb * u_mix);
-  else if (u_operation == 4) result = abs(a.rgb - b.rgb) * u_mix + a.rgb * (1.0 - u_mix);
-  else {
-    vec3 overlay = vec3(
-      a.r < 0.5 ? 2.0*a.r*b.r : 1.0 - 2.0*(1.0-a.r)*(1.0-b.r),
-      a.g < 0.5 ? 2.0*a.g*b.g : 1.0 - 2.0*(1.0-a.g)*(1.0-b.g),
-      a.b < 0.5 ? 2.0*a.b*b.b : 1.0 - 2.0*(1.0-a.b)*(1.0-b.b)
-    );
-    result = mix(a.rgb, overlay, u_mix);
+  vec3 rgb;
+  float outA;
+
+  if (u_operation >= 6) {
+    // B's matte. Alpha is the right source for a Shape / Text / alpha image;
+    // Brightness is for a matte painted as a white-on-black picture.
+    float lum = dot(clamp(b.rgb, 0.0, 1.0), vec3(0.299, 0.587, 0.114));
+    float mt = clamp(u_matte == 1 ? lum : (u_matte == 2 ? b.a * lum : b.a), 0.0, 1.0);
+    // Amount == 0 is a no-op for all four, so the slider always reads as
+    // "how much of this operation", never as "how transparent the result is".
+    vec4 col;
+    if (u_operation == 6)      col = blendOver(vec4(b.rgb, mt * u_amount), a);           // Over — B on top of A
+    else if (u_operation == 7) col = blendOver(a, vec4(b.rgb, mt * u_amount));           // Under — B behind A
+    else if (u_operation == 8) col = vec4(a.rgb, a.a * mix(1.0, mt, u_amount));          // Mask — keep A inside B
+    else                       col = vec4(a.rgb, a.a * mix(1.0, 1.0 - mt, u_amount));    // Cut Out — punch B out of A
+    rgb = col.rgb;
+    outA = col.a;
+  } else if (u_operation == 0) {
+    // Crossfade. Coverage-weighted, so a transparent side contributes nothing
+    // rather than its undefined colour. With two opaque inputs this is exactly
+    // mix(a.rgb, b.rgb, u_mix) — i.e. every existing transition is unchanged.
+    outA = mix(a.a, b.a, u_mix);
+    vec3 sum = a.rgb * a.a * (1.0 - u_mix) + b.rgb * b.a * u_mix;
+    rgb = outA > 0.0 ? sum / outA : mix(a.rgb, b.rgb, u_mix);
+  } else {
+    vec3 op;
+    if (u_operation == 1) op = a.rgb + b.rgb * u_mix;
+    else if (u_operation == 2) op = a.rgb * mix(vec3(1.0), b.rgb, u_mix);
+    else if (u_operation == 3) op = 1.0 - (1.0 - a.rgb) * (1.0 - b.rgb * u_mix);
+    else if (u_operation == 4) op = abs(a.rgb - b.rgb) * u_mix + a.rgb * (1.0 - u_mix);
+    else {
+      vec3 overlay = vec3(
+        a.r < 0.5 ? 2.0*a.r*b.r : 1.0 - 2.0*(1.0-a.r)*(1.0-b.r),
+        a.g < 0.5 ? 2.0*a.g*b.g : 1.0 - 2.0*(1.0-a.g)*(1.0-b.g),
+        a.b < 0.5 ? 2.0*a.b*b.b : 1.0 - 2.0*(1.0-a.b)*(1.0-b.b)
+      );
+      op = mix(a.rgb, overlay, u_mix);
+    }
+    // These layer two pictures rather than replace one, so the union of the two
+    // silhouettes is the right coverage.
+    rgb = mix(a.rgb, op, clamp(b.a, 0.0, 1.0));
+    outA = max(a.a, b.a);
   }
 
   // Audio driver (0 until wired): bass pulses the blended result.
-  // Mix (0) is a CROSSFADE, so its COVERAGE has to crossfade too. max() keeps
-  // the outgoing side's silhouette fully opaque for the whole mix, so an image
-  // or shape carrying an alpha channel never actually leaves — which reads as
-  // a second copy of it hanging around. The other operations layer two pictures
-  // rather than replace one, so the union is right for them. This is the node
-  // the starter transition graph is built from.
-  float outA = u_operation == 0 ? mix(a.a, b.a, u_mix) : max(a.a, b.a);
-  fragColor = vec4(clamp(result * (1.0 + u_bass * 0.5), 0.0, 1.0), outA);
+  fragColor = vec4(clamp(rgb * (1.0 + u_bass * 0.5), 0.0, 1.0), clamp(outA, 0.0, 1.0));
 }
-`)
+`
 
-// ── Mix / Blend (same shader as MATH_BLEND, registered separately) ──
-registerShader('MIX_BLEND', `#version 300 es
-precision highp float;
-in vec2 v_uv;
-uniform sampler2D u_texture;
-uniform sampler2D u_texture_b;
-// @param name="Mix" min=0.0 max=1.0 default=0.5 step=0.01
-uniform float u_mix;
-// @param name="Operation" min=0 max=5 default=0 step=1 type=select options="Mix,Add,Multiply,Screen,Difference,Overlay"
-uniform int u_operation;
-out vec4 fragColor;
-
-void main() {
-  vec4 a = texture(u_texture, v_uv);
-  vec4 b = texture(u_texture_b, v_uv);
-  vec3 result;
-
-  if (u_operation == 0) result = mix(a.rgb, b.rgb, u_mix);
-  else if (u_operation == 1) result = a.rgb + b.rgb * u_mix;
-  else if (u_operation == 2) result = a.rgb * mix(vec3(1.0), b.rgb, u_mix);
-  else if (u_operation == 3) result = 1.0 - (1.0 - a.rgb) * (1.0 - b.rgb * u_mix);
-  else if (u_operation == 4) result = abs(a.rgb - b.rgb) * u_mix + a.rgb * (1.0 - u_mix);
-  else {
-    vec3 overlay = vec3(
-      a.r < 0.5 ? 2.0*a.r*b.r : 1.0 - 2.0*(1.0-a.r)*(1.0-b.r),
-      a.g < 0.5 ? 2.0*a.g*b.g : 1.0 - 2.0*(1.0-a.g)*(1.0-b.g),
-      a.b < 0.5 ? 2.0*a.b*b.b : 1.0 - 2.0*(1.0-a.b)*(1.0-b.b)
-    );
-    result = mix(a.rgb, overlay, u_mix);
-  }
-
-  // Audio driver (0 until wired): bass pulses the blended result.
-  // Mix (0) is a CROSSFADE, so its COVERAGE has to crossfade too. max() keeps
-  // the outgoing side's silhouette fully opaque for the whole mix, so an image
-  // or shape carrying an alpha channel never actually leaves — which reads as
-  // a second copy of it hanging around. The other operations layer two pictures
-  // rather than replace one, so the union is right for them. This is the node
-  // the starter transition graph is built from.
-  float outA = u_operation == 0 ? mix(a.a, b.a, u_mix) : max(a.a, b.a);
-  fragColor = vec4(clamp(result * (1.0 + u_bass * 0.5), 0.0, 1.0), outA);
-}
-`)
+// MATH_BLEND is the legacy type name, MIX_BLEND the one the node menu adds.
+// Registering the identical source means they also share one compiled program.
+registerShader('MATH_BLEND', BLEND_NODE_FS)
+registerShader('MIX_BLEND', BLEND_NODE_FS)
 
 // ── BIOMATH (Procedural Raymarching) ──
 registerShader('BIOMATH', `#version 300 es
@@ -3495,7 +3693,7 @@ void main() {
     vec2 z = p;
     float trap = 1e9;
     float iter = 0.0;
-    float maxI = min(24.0 + 40.0 * u_complexity, 64.0);
+    float maxI = min(4.0 + 16.0 * u_complexity, 64.0);
     for (float i = 0.0; i < 64.0; i++) {
       if (i >= maxI) break;
       z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
@@ -3516,7 +3714,7 @@ void main() {
     float ss = 1.8 + 0.15 * sin(t * 0.2) + u_bass * 0.1;
     vec3 q = vec3(p, 0.3 + 0.1 * sin(t * 0.13));
     float scale = 1.0;
-    float maxI = min(5.0 + 5.0 * u_complexity, 12.0);
+    float maxI = min(1.0 + 5.0 * u_complexity, 12.0);
     for (float i = 0.0; i < 12.0; i++) {
       if (i >= maxI) break;
       q = -1.0 + 2.0 * fract(0.5 * q + 0.5);
@@ -3546,7 +3744,7 @@ void main() {
     vec2 p = uv * 20.0;
     vec3 col = vec3(0.0);
     float rt = t + u_bass * 2.0;
-    int maxIters = int(10.0 * u_complexity);
+    int maxIters = int(2.0 * u_complexity);
     for(int i=0; i<12; i++) {
       if (i >= maxIters) break;
       vec3 pal = cos(p.x + vec3(2.0, 1.0, 0.0)) + 1.0;
@@ -3560,7 +3758,7 @@ void main() {
   else if (u_mode == 4) { // Newton Fractal
     vec2 z = uv * 3.0;
     float rt = t * 0.2;
-    int maxIters = int(12.0 * u_complexity);
+    int maxIters = int(2.0 * u_complexity);
     for(int i=0; i<16; i++) {
       if (i >= maxIters) break;
       vec2 z2 = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y);
@@ -3601,22 +3799,37 @@ void main() {
     genColor = col * (0.75 + u_bass * 0.8) * u_intensity;
   }
   else if (u_mode == 6) { // Burning Ship
-    vec2 c = vec2(-0.4 + sin(t * 0.2) * 0.1, -0.5 + cos(t * 0.15) * 0.1);
+    // z -> (|Re z| + i|Im z|)^2 + c, starting from z = 0, so C IS THE PIXEL.
+    // The iteration below was always correct; what was missing is that uv never
+    // reached it - c was a function of time alone and z started at a constant,
+    // so every pixel computed the SAME orbit and the whole frame came out one
+    // flat colour. It was the only mode of the eight that ignored uv.
+    vec2 p = uv * 2.4 / max(u_scale_val, 0.1);
+    // y is negated because the set is conventionally drawn inverted; that flip
+    // is what makes the hull read as a ship instead of an upside-down smear.
+    // The tiny drift keeps it alive without wandering off the interesting part.
+    vec2 c = vec2(p.x - 0.5 + sin(t * 0.07) * 0.02,
+                  -p.y - 0.5 + cos(t * 0.05) * 0.02);
     vec2 z = vec2(0.0);
+    float trap = 1e9;
     float iter = 0.0;
-    int maxIters = int(16.0 * u_complexity);
-    for(int i=0; i<20; i++) {
-      if (i >= maxIters) break;
-      float x = (z.x * z.x - z.y * z.y) + c.x;
-      float y = (2.0 * abs(z.x) * abs(z.y)) + c.y;
-      z = vec2(x, y);
-      if (length(z) > 4.0) break;
+    float maxI = min(8.0 + 24.0 * u_complexity, 64.0);
+    for (float i = 0.0; i < 64.0; i++) {
+      if (i >= maxI) break;
+      // abs() on BOTH components before squaring is the whole difference from a
+      // Mandelbrot: 2*|x|*|y| folds every orbit into the positive quadrant.
+      z = vec2(z.x * z.x - z.y * z.y, 2.0 * abs(z.x * z.y)) + c;
+      trap = min(trap, abs(length(z) - 1.2));
+      if (dot(z, z) > 64.0) break;
       iter += 1.0;
     }
-    float smoothIter = iter - log2(log2(dot(z, z) + 1e-6)) + 4.0;
-    vec3 col = palette(u_palette, smoothIter * 0.1 + t * 0.1);
-    col *= smoothstep(0.0, 1.0, iter / 16.0);
-    genColor = col * (0.7 + u_bass * 0.8) * u_intensity;
+    // Guarded exactly like Julia Deep above. Unguarded this is a NaN factory:
+    // an interior point never escapes, so dot(z, z) stays below 1, log2 of that
+    // is negative, and log2 of a negative is NaN - which then poisons the pixel.
+    float sm = iter - log2(max(log2(max(dot(z, z), 2.0)), 1.0));
+    vec3 col = palette(u_palette, sm * 0.045 + t * 0.05) * smoothstep(maxI, maxI * 0.15, iter);
+    col += palette(u_palette, 0.6 + sm * 0.03) * exp(-trap * 6.0) * 0.6;
+    genColor = col * (0.75 + u_bass * 0.8) * u_intensity;
   }
   else { // Mainframe
     vec2 p = abs(uv) * 2.5;

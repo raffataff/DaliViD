@@ -80,6 +80,10 @@ const useAppStore = create(
     previewAlphaView: false,
     exportModalOpen: false,
     newProjectModalOpen: false,
+    // Lives here rather than in Toolbar's local state because the app opens it
+    // at launch — the project browser is the front door, not a toolbar popup.
+    projectBrowserOpen: false,
+    projectSettingsOpen: false,
     welcomeShown: false,
 
     // ── Selection ──
@@ -205,6 +209,8 @@ const useAppStore = create(
     setClipPreviewMode: (mode) => set({ clipPreviewMode: mode }),
     setExportModalOpen: (open) => set({ exportModalOpen: open }),
     setNewProjectModalOpen: (open) => set({ newProjectModalOpen: open }),
+    setProjectBrowserOpen: (open) => set({ projectBrowserOpen: open }),
+    setProjectSettingsOpen: (open) => set({ projectSettingsOpen: open }),
     setWelcomeShown: () => set({ welcomeShown: true }),
 
     // Selection

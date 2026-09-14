@@ -13,7 +13,7 @@ export function pickCompoundColor(existingLibrary) {
   return COMPOUND_COLORS[Math.floor(Math.random() * COMPOUND_COLORS.length)]
 }
 
-export default function ActionContextMenu({ position, selectedCount, onCreateCompound, onDuplicate, onToggleBypass, onDeleteNodes, onDeselect, onClose }) {
+export default function ActionContextMenu({ position, selectedCount, onCreateCompound, onDuplicate, onToggleBypass, onToggleCollapse, onDeleteNodes, onDeselect, onClose }) {
   const menuRef = useRef(null)
 
   const handleKeyDown = useCallback((e) => {
@@ -66,6 +66,12 @@ export default function ActionContextMenu({ position, selectedCount, onCreateCom
           onClick={() => { onToggleBypass(); onClose() }}
         >
           Bypass / Enable All
+        </button>
+        <button
+          className="node-canvas__menu-item"
+          onClick={() => { onToggleCollapse?.(); onClose() }}
+        >
+          Collapse / Expand All
         </button>
       </div>
       <div className="node-canvas__menu-section">

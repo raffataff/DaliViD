@@ -1195,7 +1195,14 @@ export class Renderer {
           const val = floatOverrides[nid]?.[paramName]
           if (val !== undefined) {
             const isInspector = el.classList.contains('inspector__slider-value')
-            el.textContent = (isInspector ? '⚡ ' : '') + val.toFixed(2)
+            const text = (isInspector ? '⚡ ' : '') + val.toFixed(2)
+            // Retarget the existing text node instead of replacing it. Setting
+            // textContent destroys whatever nodes React put there, and React
+            // then throws NotFoundError on removeChild the next time it updates
+            // that span. Writing nodeValue leaves React's node in place.
+            const textNode = el.childNodes.length === 1 ? el.firstChild : null
+            if (textNode && textNode.nodeType === 3) textNode.nodeValue = text
+            else el.textContent = text
           }
         }
       })
@@ -2131,6 +2138,7 @@ export class Renderer {
     const free = (n, scope) => {
       this.fbos.delete(`__n_${scope}${n.id}`)            // DAG per-node output FBO
       this.fbos.deletePingPong(`__npp_${scope}${n.id}`)  // DAG feedback ping-pong
+      this.fbos.deleteRing(`__nring_${scope}${n.id}`)   // FEEDBACK_MACHINE delay ring
       this.fbos.delete(`__img_${scope}${n.id}`)          // IMAGE_INPUT source FBO
       this.textures.delete(`img_${n.id}`)                // decoded image texture (id-keyed)
       this.fbos.delete(`__txt_${scope}${n.id}`)          // TEXT_INPUT source FBO

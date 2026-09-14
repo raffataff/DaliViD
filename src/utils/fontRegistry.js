@@ -37,6 +37,16 @@
 
 import { get as idbGet, set as idbSet, del as idbDel, keys as idbKeys } from 'idb-keyval'
 import { readSfntMetadata, DEFAULT_WEIGHT_RANGE } from './fontMetadata.js'
+// SHA-256 of the font bytes, used as its identity. Content addressing means
+// re-importing the same file (or two projects sharing a font) stores one copy,
+// and a project that references `custom:<hash>` is matched by content rather
+// than by a filename the user may have changed.
+//
+// It lives in storage/ now so media blobs are addressed by the exact same
+// scheme, rather than by a second copy of the same twenty lines — two hashing
+// functions that must agree are two that eventually won't. The algorithm is
+// byte-identical, so every existing `custom:<hash>` id still resolves.
+import { hashBytes as hashBuffer } from '../storage/hash.js'
 
 const FONT_KEY_PREFIX = 'dalivid_font_'
 export const CUSTOM_FONT_PREFIX = 'custom:'
@@ -459,26 +469,6 @@ export function listAllFonts() {
  */
 export function preloadPickerFonts() {
   for (const f of BUNDLED_FONTS) requestFont(f.id)
-}
-
-/**
- * SHA-256 of the font bytes, used as its identity. Content addressing means
- * re-importing the same file (or two projects sharing a font) stores one copy,
- * and a project that references `custom:<hash>` is matched by content rather
- * than by a filename the user may have changed.
- */
-async function hashBuffer(buffer) {
-  if (globalThis.crypto?.subtle) {
-    const digest = await crypto.subtle.digest('SHA-256', buffer)
-    return [...new Uint8Array(digest).slice(0, 10)]
-      .map(b => b.toString(16).padStart(2, '0')).join('')
-  }
-  // Non-secure context (plain http:// on a LAN IP). FNV-1a over the bytes is
-  // not cryptographic but is fine for de-duplicating a handful of local files.
-  const bytes = new Uint8Array(buffer)
-  let h = 0x811c9dc5
-  for (let i = 0; i < bytes.length; i++) { h ^= bytes[i]; h = (h * 0x01000193) >>> 0 }
-  return 'f' + h.toString(16).padStart(8, '0') + bytes.length.toString(16)
 }
 
 /** Turn "Helvetica-Neue_Bold.otf" into "Helvetica Neue Bold". */
