@@ -1,8 +1,10 @@
 /**
  * DaliVid — FBOManager.js
  * Manages framebuffer allocation, ping-pong double-buffering,
- * and thumbnail extraction for the node graph.
+ * multi-frame history rings, and thumbnail extraction for the node graph.
  */
+
+import { ringSlots } from './historyRing.js'
 
 export class FBOManager {
   /**
@@ -12,6 +14,7 @@ export class FBOManager {
     this.gl = gl
     this.fbos = new Map() // id → { fbo, texture, width, height }
     this.pingPongPairs = new Map() // id → { current: 0|1, fbos: [fbo0, fbo1] }
+    this.rings = new Map() // id → { count, tick, ids, readId, writeId, lastId, advance }
     this.thumbnailFBO = null
     this.thumbnailSize = 64
     this._hasHalfFloat = !!gl.getExtension('EXT_color_buffer_half_float')
@@ -132,6 +135,53 @@ export class FBOManager {
    */
   getPingPong(id) {
     return this.pingPongPairs.get(id) || null
+  }
+
+  /**
+   * Ensure a delay ring of `count` same-size FBOs exists for `id`.
+   * Rebuilds when the count changes, seeding every new slot with the most recent
+   * frame so the picture freezes for one frame instead of going black.
+   */
+  ensureRing(id, count, width, height) {
+    let ring = this.rings.get(id)
+    if (ring && ring.count === count) {
+      for (let i = 0; i < count; i++) this.resize(`${id}_${i}`, width, height)
+      return ring
+    }
+    const seedId = ring ? ring.lastId : null
+    const ids = []
+    for (let i = 0; i < count; i++) {
+      const slotId = `${id}_${i}`
+      if (ring && i < ring.count) {
+        this.resize(slotId, width, height)
+      } else {
+        this.create(slotId, width, height)
+      }
+      ids.push(slotId)
+    }
+    if (ring) {
+      // Seed first, THEN drop surplus slots — the seed may live in one of them.
+      if (seedId && this.fbos.has(seedId)) {
+        for (const slotId of ids) if (slotId !== seedId) this.blit(seedId, slotId, width, height)
+      }
+      for (let i = count; i < ring.count; i++) this.delete(`${id}_${i}`)
+    }
+    const next = {
+      id, count, tick: 0, ids,
+      get readId() { return `${id}_${ringSlots(this.tick, this.count).read}` },
+      get writeId() { return `${id}_${ringSlots(this.tick, this.count).write}` },
+      get lastId() { return `${id}_${ringSlots(this.tick, this.count).last}` },
+      advance() { this.tick = (this.tick + 1) % this.count },
+    }
+    this.rings.set(id, next)
+    return next
+  }
+
+  /**
+   * Get a delay ring by base ID.
+   */
+  getRing(id) {
+    return this.rings.get(id) || null
   }
 
   /**
@@ -336,6 +386,16 @@ export class FBOManager {
   }
 
   /**
+   * Delete a delay ring (every slot FBO and the ring record).
+   */
+  deleteRing(id) {
+    const ring = this.rings.get(id)
+    if (!ring) return
+    for (const slotId of ring.ids) this.delete(slotId)
+    this.rings.delete(id)
+  }
+
+  /**
    * Clean up all FBOs.
    */
   dispose() {
@@ -344,5 +404,6 @@ export class FBOManager {
     }
     this.fbos.clear()
     this.pingPongPairs.clear()
+    this.rings.clear()
   }
 }

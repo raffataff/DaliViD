@@ -41,4 +41,12 @@ export default [
       ],
     },
   },
+  // Unit tests run under `node --test`, not in a page. Linting them against
+  // browser globals makes every Node construct read as an undefined variable —
+  // and worse, would let a browser-only global pass unnoticed in a file that
+  // can never have one.
+  {
+    files: ['test/**/*.js'],
+    languageOptions: { globals: { ...globals.node, ...globals.browser } },
+  },
 ]

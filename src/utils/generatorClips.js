@@ -18,8 +18,11 @@ function shaderDefaults(type) {
 }
 
 /** Params for an IMAGE clip/node: image transform defaults + the data URL. */
-export function makeImageClipParams({ imageSrc = null, imageName = '' } = {}) {
-  return { ...shaderDefaults('IMAGE_INPUT'), imageSrc, imageName }
+export function makeImageClipParams({ imageSrc = null, imageRefId = null, imageName = '' } = {}) {
+  // imageRefId is the persistent, content-addressed identity; imageSrc is the
+  // runtime URL resolved from it (and, for a pre-vault project, a data URL).
+  // The serializer drops imageSrc whenever imageRefId is present.
+  return { ...shaderDefaults('IMAGE_INPUT'), imageSrc, imageRefId, imageName }
 }
 
 /** Params for a TEXT clip/node: shader transform defaults + text/style + overrides. */

@@ -2,18 +2,16 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import useAppStore from '../../store/useAppStore'
 import useGraphStore from '../../store/useGraphStore'
 import useTimelineStore from '../../store/useTimelineStore'
-import {
-  saveProject, importProjectFromJSON, deserializeProject,
-  exportProjectAsJSON, pickMediaFiles, relinkMediaFromFiles, getExpectedMediaFilenames
-} from '../../utils/projectSerializer'
+import { saveProject } from '../../utils/projectSerializer'
 import { addToast } from '../common/Toast'
 import { ASPECT_PRESETS, aspectLabel } from '../../utils/aspectPresets'
 import {
   IconPlay, IconPause, IconSkipStart, IconSkipEnd,
   IconStepBack, IconStepForward,
-  IconSave, IconImportVideo,
+  IconSave,
   IconExport, IconLoop, IconAudioReactive, IconNewProject
 } from '../common/Icons'
+import ProjectBrowserModal from '../common/ProjectBrowserModal'
 import './Toolbar.css'
 
 export default function Toolbar() {
@@ -41,6 +39,12 @@ export default function Toolbar() {
 
   const projectName = useAppStore(s => s.projectName)
 
+  // Owned by the app store: App opens it at launch, so it cannot be Toolbar's
+  // local state any more.
+  const projectBrowserOpen = useAppStore(s => s.projectBrowserOpen)
+  const setProjectBrowserOpen = useAppStore(s => s.setProjectBrowserOpen)
+  const setProjectSettingsOpen = useAppStore(s => s.setProjectSettingsOpen)
+
   const [renderFps, setRenderFps] = useState(0)
   const frameCountRef = useRef(0)
   const lastFpsTime = useRef(performance.now())
@@ -62,103 +66,20 @@ export default function Toolbar() {
     return () => cancelAnimationFrame(animId)
   }, [])
 
-  // Quick save → browser storage only. Durable copies come from "Save Project
-  // File"; this is the fast, no-dialog path used by Ctrl+S and autosave.
+  // Ctrl+S and the toolbar button. Writes the project where it lives — its own
+  // folder — so this IS the durable save now, not a cache of one.
   const handleSaveProject = useCallback(async () => {
     const appState = useAppStore.getState()
     try {
       appState.markSaving()
       await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
       appState.markSaved()
-      addToast({ message: 'Saved to this browser. Use "Save Project File" for a copy on disk.', type: 'info' })
+      addToast({ message: 'Project saved.', type: 'info' })
     } catch (err) {
       console.error(err)
       addToast({ message: 'Failed to save project', type: 'error' })
     }
   }, [])
-
-  // Download the whole edit as a single .dalivid.json. The zero-authority save
-  // path: no directory handle, no persisted grant, nothing the app can read back
-  // on its own. Video/audio bytes aren't included (images are, as data URLs), so
-  // opening it again goes through the relink prompt below.
-  const handleSaveProjectFile = useCallback(async () => {
-    try {
-      const appState = useAppStore.getState()
-      // The Save As dialog goes FIRST: showSaveFilePicker needs transient user
-      // activation, and awaiting the IndexedDB write before it can outlive that
-      // window (which would silently demote us to a Downloads-folder dump).
-      const how = await exportProjectAsJSON(
-        useAppStore.getState, useGraphStore.getState, useTimelineStore.getState
-      )
-      if (how === 'cancelled') return
-
-      appState.markSaving()
-      // Keep the browser-cache copy in step so the autosave dot isn't lying
-      // about the state of the project the user just wrote to disk.
-      await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
-      appState.markSaved()
-      // Records that a durable copy now exists — drives the unload warning.
-      appState.markProjectExported()
-      addToast({
-        message: how === 'picker' ? 'Project file saved' : 'Project file downloaded',
-        type: 'success',
-      })
-    } catch (err) {
-      console.error(err)
-      addToast({ message: 'Failed to save project file', type: 'error' })
-    }
-  }, [])
-
-  // After a JSON import, offer to relink media by filename. Runs as a separate
-  // user gesture (a file input) so the import itself needs no disk access.
-  const relinkImportedMedia = useCallback(async () => {
-    const expected = getExpectedMediaFilenames(useTimelineStore.getState().clips)
-    if (expected.length === 0) {
-      addToast({ message: 'No file-backed media in this project — nothing to relink.', type: 'info' })
-      return
-    }
-
-    addToast({
-      message: `Select the ${expected.length} media file${expected.length > 1 ? 's' : ''} for this project: ${expected.slice(0, 3).join(', ')}${expected.length > 3 ? '…' : ''}`,
-      type: 'info',
-      duration: 7000,
-    })
-
-    const files = await pickMediaFiles()
-    if (!files || files.length === 0) {
-      addToast({ message: 'Media not relinked — clips will be offline until you re-import them.', type: 'warning', duration: 8000 })
-      return
-    }
-
-    const { restoredCount, missing } = relinkMediaFromFiles(
-      files,
-      useTimelineStore.getState().clips,
-      useTimelineStore.getState().updateClip
-    )
-
-    if (missing.length > 0) {
-      addToast({
-        message: `Relinked ${restoredCount} clip${restoredCount === 1 ? '' : 's'}. Still missing: ${missing.join(', ')}`,
-        type: 'warning',
-        duration: 9000,
-      })
-    } else {
-      addToast({ message: `Relinked ${restoredCount} clip${restoredCount === 1 ? '' : 's'}`, type: 'success' })
-    }
-  }, [])
-
-  const handleLoadProject = useCallback(async () => {
-    const data = await importProjectFromJSON()
-    if (!data) return
-    try {
-      deserializeProject(data, useAppStore.getState)
-      addToast({ message: `Project "${data.project?.name || 'Loaded'}" imported`, type: 'success' })
-      await relinkImportedMedia()
-    } catch (err) {
-      console.error(err)
-      addToast({ message: 'Failed to load project', type: 'error' })
-    }
-  }, [relinkImportedMedia])
 
   const handleExportFrame = useCallback(() => {
     const previewCanvas = document.querySelector('#preview-canvas canvas')
@@ -205,21 +126,22 @@ export default function Toolbar() {
           onClick={handleSaveProject}>
           <IconSave />
         </button>
-        <button className="toolbar__btn toolbar__btn--small" data-tooltip="Save Project File — downloads the whole edit, no disk access needed"
-          onClick={handleSaveProjectFile}>
+        <button className="toolbar__btn toolbar__btn--small" data-tooltip="Projects — open a project, or start a new one"
+          onClick={() => setProjectBrowserOpen(true)}>
+          <IconNewProject />
+          <span style={{ fontSize: '10px' }}>▾</span>
+        </button>
+        <button className="toolbar__btn toolbar__btn--small" data-tooltip="Project Settings — name, resolution, frame rate, folder and version history"
+          onClick={() => setProjectSettingsOpen(true)}>
           <IconSave />
-          <span style={{ fontSize: '10px' }}>.json</span>
+          <span style={{ fontSize: '10px' }}>set</span>
         </button>
-        <button className="toolbar__btn toolbar__btn--small" data-tooltip="Open Project File — pick a .dalivid.json, then relink its media"
-          onClick={handleLoadProject}>
-          <IconImportVideo />
-          <span style={{ fontSize: '10px' }}>.json</span>
-        </button>
-        <button className="toolbar__btn toolbar__btn--small" data-tooltip="Relink Media — re-attach video/audio files to this project's clips"
-          onClick={relinkImportedMedia}>
-          <IconImportVideo />
-          <span style={{ fontSize: '10px' }}>link</span>
-        </button>
+        {/* Save Project File / Open Project File / Relink Media were here.
+            A project is a folder now: it saves itself, it reopens from the
+            Projects window, and its media sits beside it — so all three were
+            answers to problems that no longer exist. Removed to find out
+            whether anything still needs them; the functions they called are
+            untouched in projectSerializer if one has to come back. */}
 
         <div className="toolbar__divider" />
 
@@ -368,6 +290,10 @@ export default function Toolbar() {
           }
         />
       </div>
+
+      {projectBrowserOpen && (
+        <ProjectBrowserModal onClose={() => setProjectBrowserOpen(false)} />
+      )}
     </div>
   )
 }

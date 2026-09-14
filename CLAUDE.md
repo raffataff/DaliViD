@@ -365,6 +365,8 @@ then failed the build from inside rolldown with `'node:util' does not provide an
 - **Everything is a `@param`**, which is the point: `hasParamInputs` gives every control a float
   socket, so position/size/rotation/colors can be driven by splitter bands, `MATH`/`ENVELOPE` or
   keyframes, and the transparent background means a shape doubles as a mask / displacement input.
+  The node that CONSUMES it as a mask is `MIX_BLEND` — Operation = Over / Under / Mask / Cut Out
+  (see the 2026-09-01 entry); its six colour operations combine colour only and cannot mask.
 - **Shape coordinate convention** (shader and gizmo must agree): *frame units* — `1.0` == the frame
   HEIGHT on both axes (x is aspect-corrected), `u_shp_x/u_shp_y` are ±1 at the frame edges with **y up**,
   and `u_shp_rot` is **counter-clockwise-positive on screen** (so the SVG gizmo uses `rotate(-deg)`).
@@ -559,7 +561,370 @@ then failed the build from inside rolldown with `'node:util' does not provide an
   noodle keeps a real DOM anchor. `ARRAY` is the first shader to use it: Radius / Arc / Face Center
   appear only in Radial, Spacing Y only in Grid, Stacking only when Blend is Over.
 
+## Persistence — the vault, MediaRefs, and what is runtime vs saved
+
+`PLAN_Persistence.md` is the roadmap; **`src/storage/VAULT.md` is the authoritative contract.**
+Phases 0, 1 and 2 are done (2026-08-26) — the whole web half. Phase 3+ (Electron) is not started
+and is the next commitment point. Deliberately built in the order 0 → 2 → 1: phase 2 was the
+actual complaint, phase 1 hardened the part that already worked.
+
+- **Projects live in the vault** (`storage/projectStore.js`): `projects/<id>/project.json` plus
+  `projects/<id>/backups/`. `writeProject` **validates before any I/O** and writes atomically
+  (tmp + rename), so a rejected or torn write leaves the previous version intact — the single
+  failure this phase exists to prevent, and it is demonstrated, not assumed.
+  - Backups are rate-limited to one per 5 min so the 2-second autosave cannot mint one per
+    keystroke, and pruning keeps **the last 10 plus one per day for 7 days** — those answer two
+    different questions ("undo the last few saves" / "get back to Tuesday") and one count cannot
+    serve both. `restoreBackup` goes through `writeProject`, so restoring the wrong version is
+    itself undoable.
+  - **The autosave slot deliberately stays a plain `idbSet`.** It fires every two seconds; routing
+    it through validation + backup rotation would spend that budget continuously and fill the
+    history with keystrokes. It is a crash-recovery pointer, not the durable record.
+  - **Legacy `dalivid_project_*` IndexedDB keys are still read**, listed alongside vault projects
+    with a `legacy` flag, and migrated on first open — write OPFS, read it back, and only *then*
+    delete the IndexedDB key, so an interruption leaves the project readable from one of the two.
+- **`listProjects` / `loadProject` / `deleteProject` had NO call sites** before the Project Browser
+  (`components/common/ProjectBrowserModal.jsx`). Every explicit save wrote a project nothing could
+  reopen; the app restored the *last* session and offered no route to any other. That was a large
+  part of what "persistence is broken" meant.
+- **No Worker for project writes, deliberately.** The plan called for `createSyncAccessHandle` in a
+  dedicated Worker on the grounds that writes were large. Phase 2 removed that premise — documents
+  went 41,521 → 8,159 chars once images became blobs, and a full autosave measures 0.58 ms on the
+  main thread. Revisit only if a measurement demands it.
+- **`webVault` exposes a generic file API** (`readText` / `writeTextAtomic` / `copyFile` / `list` /
+  `remove`) rather than project-shaped methods, so it stays a dumb byte-mover and all orchestration
+  is backend-agnostic in `projectStore` — which is what the desktop backend will inherit unchanged.
+  Every path segment is regex-validated: `getDirectoryHandle` accepts `..` quite happily, and ids
+  come from project documents, which are untrusted input.
+
+- **The one rule: authority lives in the trusted process; the renderer holds identifiers, never
+  paths.** On the web there is no authority to hold — OPFS is origin-scoped, so the browser
+  enforces it. `showDirectoryPicker` is not coming back, and `purgeStoredFolderHandles()` stays
+  forever.
+- **Every media kind now has a PERSISTENT identity and a RUNTIME resolution, and only the first is
+  ever written to a document:**
+  | | persistent | runtime |
+  |---|---|---|
+  | video / audio | `clip.mediaRefId` | `clip.fileUrl` |
+  | images | `params.imageRefId` | `params.imageSrc` |
+  `clip.fileUrl` always worked this way (the serializer has never saved it); images simply joined
+  the pattern. **Keeping the runtime field on the key every consumer already reads is what made
+  the change small** — `Renderer`, `waveformCache`, `ensureNodeImage` and the timeline thumbnails
+  are untouched and still just receive a URL string.
+- **`stripRuntimeMedia` runs as ONE pass over the finished document**, not at each of the four
+  places that map a node, because `subGraph` is deep-cloned wholesale — a compound's interior would
+  otherwise keep its data URLs however carefully the top-level mapping was written. `mapNodes`
+  (schema.js) is the single definition of "every node, everywhere".
+- **A MediaRef's `id` is derived from its content hash** (`mr_<hash>`), so importing the same file
+  twice yields one ref and one stored copy. **Dedup falls out of the naming; there is no dedup
+  pass.** Verified live: one image used by both a clip and a node resolved to a single ref.
+- **`webVault` stores bytes keyed by hash and NOTHING else** — no filename, MIME or duration, all
+  of which live on the ref in the project document. No sidecar index to corrupt or keep consistent.
+  The consequence: OPFS `File`s have `type: ''`, so **`getPlaybackURL` must be given the MIME from
+  the ref** or some containers will not play. Writes go to `<hash>.part` then rename — a blob is
+  named by its own content, so a torn write would leave a *short file under the right name* that
+  every future dedup check would accept as valid forever.
+- **`ref.meta`** (duration/width/height/fps) exists because those are facts about the *file*.
+  Without it a restored pool card renders `0:00`, since the probe only ran at import.
+- **The image migration is safe to interrupt.** `imageSrc` is replaced only once the bytes are
+  committed, and the serializer drops `imageSrc` only when an `imageRefId` sits beside it — so a
+  half-finished migration leaves a project part-migrated and entirely intact.
+- **GC runs on EXPLICIT saves only — never the autosave, never during an export.** This one shipped
+  broken and deleted a user's media mid-playback, so the reasoning is worth keeping:
+  - Autosave fires two seconds after *any* change, so hanging the GC off it meant a full OPFS
+    scan-and-delete pass running continuously while editing. Any momentary gap in the reachable
+    set then became permanent deletion, a couple of seconds after import. **Reclaiming space is
+    never urgent; deleting the wrong file is irreversible.**
+  - **A blob with a live playback URL is never deleted, whatever the reachable set says**
+    (`_urls.has(hash)` in `gcBlobs`, reported as `pinned`). Not redundant with reachability: an
+    object URL exists only because something asked to play those bytes, so it is a *direct*
+    statement of "in use" that cannot go stale the way a derived set can.
+  - The `.part` sweep only removes files older than `PART_STALE_MS` (5 min). A `.part` is also what
+    an in-flight import is writing into, and age is the only thing distinguishing the two.
+  - The reachable set is the pool's hashes **plus** a sweep of what clips and nodes reference.
+- **`hydrate` MERGES and does not revoke — do not "simplify" it back.** It used to replace the ref
+  list and call `revokeAllPlaybackURLs()` first. It runs inside `restoreProjectMedia`, which is
+  deliberately async, so anything imported while it was in flight had its URL revoked and its ref
+  dropped — and the next GC then deleted those bytes as unreachable. Symptom: video plays for a
+  couple of seconds, dies, console fills with `net::ERR_FILE_NOT_FOUND` on a `blob:` URL. Merging
+  costs nothing (refs are content-addressed, so an id collision *is* the same file).
+  `revokeAllPlaybackURLs` now happens only in `clear()`, called at one explicit project-close
+  boundary where nothing can still be playing.
+- **An OPFS `File` is a reference to bytes on disk, not a copy** — `new Blob([file])` does not read
+  it. Delete or rewrite the underlying file and every `blob:` URL made from it starts failing with
+  `ERR_FILE_NOT_FOUND`. That is why the two rules above matter and why a "dead URL" and "deleted
+  media" look identical from the console.
+- **`loadAutosave` had no call site.** Autosave always wrote to IndexedDB every two seconds and
+  nothing ever read it back, so a reload appeared to lose everything even though the edit was
+  stored — the only way in was importing the `.dalivid.json` by hand. `App.jsx` now restores the
+  last session on boot (gated on real content, so New Project still lands clean).
+- **`beforeunload` now fires ONLY for session-only media.** The old "you haven't downloaded a file"
+  condition fired on every reload, and now that the project reopens itself a reload loses nothing.
+  A prompt that cries wolf every refresh is how people learn to dismiss the one that matters.
+- **Measured (2026-08-26):** moving one inlined image to a blob took the document 41,521 → 8,159
+  chars and **full autosave 13.2 ms → 0.58 ms (22.8×)**. The win is in the *write*, not the
+  stringify, which is why the document-size ratio understates it. Real projects are worse before
+  the fix: `Streetlamp_vid_2108` is 389 KB of base64 in a 401 KB document — **97%**.
+- **Verification trap, cost real time.** From the DevTools console,
+  `await import('/src/store/useMediaStore.js')` gives you a **different module instance** than the
+  running app: Vite serves HMR'd modules as `/src/…js?t=<timestamp>`, and an import without that
+  query is a separate URL and therefore a separate Zustand store. The symptom is perfect state in
+  the console and zero refs in the saved document — which reads exactly like a serializer bug.
+  **Restart the dev server before console-verifying anything stateful.**
+- Unit tests live in `test/` and run under `node --test` (`npm test`, and a CI step). No test-runner
+  dependency — it is built into the Node the repo already requires.
+
 ## Recently completed
+
+- **A Shape wired into `MIX_BLEND` could not cover or mask the video (2026-09-01).** Reported as
+  "the video still shows through the circle, on every blending mode". Not a wiring mistake, and not
+  the preview backdrop (that is the last pass of `_presentToScreen` — it cannot reach a graph) —
+  **the node had no operation that reads B's alpha at all.** All six operations were pure colour
+  maths on `a.rgb` / `b.rgb`, so the only question they could answer was "what colour", never
+  "where". A shape's transparent region carries `rgb = 0`, so Multiply darkened the frame, Mix at
+  1.0 replaced the whole frame with the shape's black background, and nothing could put the circle
+  *on top of* the picture.
+  - **Four compositing operations appended (indices 6-9): Over, Under, Mask, Cut Out.** Over/Under
+    are a straight-alpha source-over (`blendOver` sums premultiplied and divides the result back out
+    by its own alpha, so nothing leaves this node premultiplied); Mask multiplies A's alpha by the
+    matte, Cut Out by its inverse. `Amount` (default 1.0) scales all four and is a **no-op at 0**,
+    so the slider always reads as "how much of this operation", never as "how transparent the
+    result is". `Matte From` picks B Alpha (shapes, text, alpha images), B Brightness (a matte
+    painted white-on-black), or both.
+  - **Indices are frozen** — a saved project stores the operation INDEX, not the label — so the six
+    originals kept 0-5 and new operations may only ever be appended.
+  - **The six colour operations became alpha-aware in the same pass**, which is the older backlog
+    item below finally coming due. They now weight by B's coverage, and Mix sums premultiplied
+    before dividing back out. **At `b.a == 1` — i.e. all ordinary footage, and every existing
+    transition — the arithmetic is bit-identical**; it only changes where B was transparent, and
+    there the old result was undefined colour. Checked numerically against the old shader across
+    all six operations and five mix values before shipping.
+  - **A new uniform in an OLD saved node was the real trap.** `uploadUniforms` only uploads keys the
+    node actually stores, so `u_amount` would have run at GLSL's implicit 0 on any node created
+    before this change — pick Over, get nothing, conclude it is still broken. Hence
+    `DEFAULT_FILL_PARAMS` in `useGraphStore`: changing `u_operation` on `MIX_BLEND` / `MATH_BLEND`
+    refills the shader's defaults underneath the node's own values (existing values still win). It
+    is `SOURCE_PARAMS`' quieter sibling — same `withSourceDefaults` call, **no** `topologyVersion`
+    bump, because the source did not change. Any future param group hidden behind a mode select
+    needs the same treatment, or it is invisible to every project made before it existed.
+  - **`MATH_BLEND` and `MIX_BLEND` are now literally one source string** (`BLEND_NODE_FS`) instead
+    of two hand-maintained copies. Same string also means one entry in the program cache, so the
+    duplicate node type costs nothing.
+  - **UI**: `@showif` hides `Mix` for the compositing operations and `Amount` / `Matte From` for the
+    colour ones, so the node shows one strength slider, never two. A param with a wire into it stays
+    visible regardless (`visibleDataParams`' `alwaysShow`), so hiding can't strand a connection.
+
+- **`FRACTAL`'s Burning Ship mode rendered a black frame — it never looked at the pixel
+  (2026-08-21).** Two bugs stacked, and the second was hiding the first.
+  - **`uv` was never referenced in the branch.** `c` was a function of `t` alone and `z` started at
+    a constant `vec2(0.0)`, so every pixel ran the IDENTICAL orbit — the mode was mathematically a
+    single point stretched over the screen. It was the only one of the eight modes that ignored
+    `uv` (and the only one that ignored `u_scale_val`, so Scale did nothing either). The iteration
+    itself was always correct: `z.x*z.x - z.y*z.y` and `2*|z.x|*|z.y|` is exactly the Burning Ship
+    step. What was missing is that **c IS the pixel** — the set is the escape-time image over c,
+    from z = 0.
+  - **The smooth-iteration count was an unguarded NaN factory**, which is why the result was BLACK
+    rather than a flat colour. `iter - log2(log2(dot(z, z) + 1e-6))`: that constant orbit never
+    escaped, so `dot(z, z)` stayed below 1, `log2` of it went negative, and `log2` of a negative is
+    NaN — which propagated through `palette()` to the whole frame. Julia Deep two branches up
+    already had the guarded form (`log2(max(log2(max(dot(z, z), 2.0)), 1.0))`); Burning Ship simply
+    never got it. **Any escape-time mode added here needs those two `max` guards**, because the
+    interior of the set is precisely where the unguarded form blows up.
+  - Also fixed in passing: the fade was normalised by a hard-coded `iter / 16.0` while the loop ran
+    `int(16.0 * u_complexity)` iterations, so Complexity above 1 saturated instantly and below 1
+    never reached full; it now normalises by the same `maxI` it iterates to, and `maxI` uses the
+    explicit `min(..., 64.0)` cap idiom the other modes use rather than silently colliding with the
+    loop bound.
+  - The set is drawn with **y negated**, which is the convention that makes the hull read as a ship
+    rather than an upside-down smear, plus a small time drift so it breathes without wandering off
+    the interesting region.
+  - **Measured on real WebGL2, before and after, same harness and same params:** the original code
+    gave mean luma 0.0, std dev 0.00 and **1 distinct colour** (a black frame); the fix gives mean
+    72.2, std dev 34.02 and **7548 distinct colours**, animating between t=3 and t=9. Raising
+    Complexity now adds detail (6583 → 7758 colours across 0.1 → 3.0) and Scale now zooms
+    (3420 → 7548 → 3239 colours across 0.5 → 2.5), neither of which did anything before.
+  - **Harness note, worth keeping for the next shader check.** Two traps cost real time here and
+    both produce a convincing all-flat reading that looks like a shader bug: (1) `FULLSCREEN_QUAD_VS`
+    takes `v_uv` from a SEPARATE attribute at `layout(location = 1)` (`a_texcoord`) — bind only
+    `a_position` and `v_uv` is constant, so EVERY mode measures flat; (2) `createShaderProgram`'s
+    `programCache` is module-level and keyed by source hash, NOT per GL context, so a second
+    offscreen context gets handed the first one's program and silently draws nothing. Compile
+    manually in the context under test. `injectAudioDrivers` is also required — the registry source
+    references `u_has_source`, which is auto-declared and won't compile standalone.
+
+- **A saved node silently ran on GLSL's implicit ZEROS for every param its shader gained
+  after the save (2026-08-21).** Reported as two separate faults on `AUDIO_VISUALIZER` — "the
+  Input socket isn't reading what's coming in" and "the Blend select doesn't do much". They were
+  one bug, and it was neither of those things.
+  - **`uploadUniforms` skips a uniform the node has no value for**, so the shader gets GLSL's
+    implicit 0. The v0.15 visualiser rework added **39 uniforms, 18 with non-zero defaults**, and a
+    project saved before it carries none of them. Two of those zeros produce exactly the reported
+    symptoms:
+    - `u_intensity` = 0 → `col *= u_intensity` erases the graphics **entirely**, so coverage is 0
+      everywhere. With `cov` = 0 the composite collapses to `base` in Over, Add AND Screen alike —
+      three of the four modes become algebraically identical, which is "the Blend select doesn't
+      do much" — and the only thing left on screen is `bg * u_bg_dim`, i.e. the input at a quarter
+      brightness, which is "the input isn't being read".
+    - `u_style` = 0 (Over) while NodeCard's select displays `param.default` = 1 (Add). **The UI and
+      the shader disagreed about the same control** until you touched it, at which point it wrote a
+      real value and started working — which is the worst possible way for this to present.
+  - **Measured, not inferred.** With a PLASMA wired into the Input the composited mean was exactly
+    0.25x the plasma's own (109,104,169 → 27,26,44), i.e. `u_bg_dim`'s default to three decimals —
+    the socket was routing perfectly the whole time. Sweeping Composite gave Over/Add/Screen within
+    noise of each other and Solo at black, which is the signature of zero coverage rather than of a
+    broken select.
+  - **Fixed generally, at the load path, not on this shader.** `backfillNodeParams`
+    (projectSerializer) fills any param the node's resolved source DECLARES but the saved node
+    lacks, from that param's own `@param` default. It runs inside `migrateGraphNodes`, so it
+    reaches master, every clip graph, compound interiors and the compound library, and it sits
+    after the TIME split so a migrated RAMP/LFO is filled from its own config. It only ever ADDS
+    keys — a value the user set always wins — and returns the same object when nothing is missing,
+    which the Zustand snapshot undo depends on. Source comes from `getNodeSource`, so a
+    Monaco-forked node backfills against ITS shader and a `TRANSITION_FX` against its selected
+    effect.
+  - **This is the third appearance of this class.** `SOURCE_PARAMS` guards it for `TRANSITION_FX`
+    ("switching Crossfade → Film Burn leaves every Film Burn uniform absent…"), `u_fb_decay` dodged
+    it only because its neutral value happens to BE 0. The load-path backfill is the general
+    answer, so **adding a `@param` to any existing shader is now safe by construction** — but note
+    it only repairs a node on LOAD, so a graph edited in the current session is fixed on the next
+    open.
+  - Verified by round-tripping a node with 22 params stripped through the real save/load path: all
+    22 restored at their declared values (`u_style` 1, `u_intensity` 1, `u_count` 64,
+    `u_react_gain` 1.3, `u_color_a` #00e5ff), and a deliberately user-set `u_bg_dim` of 0.9
+    untouched. Confirmed against real projects too — of the three on disk carrying a visualiser,
+    `HMW_guitars_promo` and `SOMS_vod1Project` were both missing all five key params;
+    `audioVizTest`, made after v0.15, was intact.
+  - **NOT changed, and worth knowing:** `Background Dim` defaults to **0.25**, so even once the
+    graphics are drawing, a wired Input shows at a quarter brightness by design. That is the knob
+    to raise if the intent is to keep the incoming picture — it is an artistic default, so it was
+    left alone.
+
+- **Node cards collapse and resize (2026-08-21).** Per-node `collapsed` / `width` / `height`, a
+  disclosure chevron plus `H`, drag handles on the left/right/bottom edges and both bottom corners,
+  and a `Collapse / Expand All` action-menu entry. New
+  `src/components/NodeEditor/nodeGeometry.js`; `NodeCard`, `NodeCanvas`, `ActionContextMenu`,
+  `Socket.css`, `NodeCard.css` and `projectSerializer` touched. **Verified live in `npm run dev`**
+  (see the numbers below) — `npm run lint` and `npm run build` both pass.
+  - **`nodeGeometry.js` exists because card size stopped being a constant.** `NODE_WIDTH` was a
+    module constant read by five hit tests (marquee, wire-insert box, fit-to-window, minimap, the
+    socket-position fallback); with a per-node width every one of them has to go through
+    `nodeWidth(node)` instead. `estimateNodeHeight` moved out of `NodeCanvas` to sit beside it, so
+    the two halves of "how big is this card" are in one file — they are the pair that must never
+    disagree, and the old comment saying so was in a different module from the width it referred to.
+    Side benefit: it clears the `react-refresh/only-export-components` warning that exporting
+    `nodeWidth` from a component file would otherwise have added. `NODE_COLORS` still lives in
+    `NodeCard` with the pre-existing warning — out of scope.
+  - **A collapsed card keeps every FIXED socket plus any PARAM socket that is WIRED, and the second
+    half is load-bearing rather than tidy.** `getSocketPos` anchors each noodle to the socket's live
+    DOM circle and only falls back to arithmetic when the element is absent — so dropping a
+    connected socket strands its wire on the estimate and the noodle visibly jumps. Unconnected
+    param sockets (there can be a dozen) are the only thing hidden; expand to wire one. Measured on
+    a BLOOM node with `bass` wired into its second param: collapsed rail = `input`, `audio_drivers`,
+    `u_bloom_intensity`, `output`, with the other two param sockets gone and the wired noodle
+    landing **0.00 units** from its socket.
+  - **THE BUG THIS FEATURE HAD TO FIND: `getSocketPos` reads the DOM in the RENDER phase, so a card
+    that changes SHAPE leaves every noodle on it one layout stale.** Measured immediately after a
+    collapse: dx **6.0**, dy **-6.4**; exactly **0.00** after any later render. A drag hides this
+    (one render per mousemove, each one frame behind, invisible at 60fps) — a collapse is one-shot,
+    so nothing ever corrects it and the wire just sits detached. Fixed with a `useLayoutEffect` that
+    bumps an epoch when the graph's collapse/size signature changes, forcing exactly one more pass;
+    it runs after layout and before paint, so the correction is never a visible flicker. **Any
+    future one-shot change to card geometry needs to go through that signature** or it will
+    reintroduce this.
+  - **The canvas wheel handler had to learn that a sized card's params list is a scroll container.**
+    It `preventDefault`s unconditionally to zoom, so a node you deliberately shrank could never be
+    scrolled. Handed over only while the list can still move that way, so reaching either end
+    resumes zooming instead of dead-ending the gesture. Same shape as the 2026-08-12 font-picker
+    bug: an outer handler swallowing a nested scroller's own wheel. Verified all four branches
+    (over grid → zooms; scrollable with room → handed over; pinned at the bottom scrolling down →
+    zooms; pinned at the bottom scrolling up → handed over).
+  - **The height floor is MEASURED from the card's non-shrinkable children, not assumed to be
+    header + sockets.** `.node-card--sized > *` pins everything except the params list at
+    `flex-shrink: 0`, and the card is `overflow: visible` (sockets hang past its edges) — so
+    under-counting does not clip, it spills an IMAGE / TEXT / SHAPE block out of the bottom of the
+    card. Absolutely-positioned children (the handles, the exec-order and orphan badges) are out of
+    flow and must be skipped. `NODE_MIN_PARAMS_H` (46) is on top of it because the first cut let a
+    card shrink until its list was a **2px** sliver — a scroll container nobody can use, which
+    reads as a rendering fault. Now bottoms out at one visible row plus the divider (measured: card
+    114, list 44).
+  - **Dragging the WEST edge keeps the EAST edge planted** (width up, `position.x` down by the same
+    amount), so the card grows into the drag rather than sliding away from it. Measured: east drag
+    +120 → width 390, `left` unchanged; west drag −60 → width 450, `left` −60.
+  - **There is deliberately no NORTH handle.** The header owns that edge and dragging it is the move
+    gesture; a resize there would be a coin toss between the two.
+  - **Sockets outrank the handles** (`z-index` 3 in `Socket.css` vs 1–2). The left and right strips
+    straddle exactly the edge the sockets sit on, so without that a socket on that edge would be
+    unclickable and the node unwireable. Verified by `elementFromPoint`: a point on a socket returns
+    the socket, a point on the same edge clear of one returns the handle.
+  - **Collapsing is allowed on LOCKED nodes** (the chevron sits outside the `!isLocked` guard) — it
+    is a view-only change, so `OUTPUT` and `CLIP_SOURCE` can be tidied away too. Note the `H` path
+    goes through the selection, and `EXCLUDED_FROM_MARQUEE` keeps those nodes out of `Ctrl+A`, so
+    for them the chevron is the only route. Inherited from the selection model, not new.
+  - **Three fields added to BOTH node maps in `projectSerializer`.** That file's own comment already
+    records what happens when a node field is left out ("Both were being dropped, and both matter on
+    reload"); a graph you collapsed and sized IS the layout you arranged. `undefined` is dropped by
+    `JSON.stringify`, so an untouched node carries none of the three keys — verified on a real
+    round trip. Both duplicate paths carry them too, so a copy arrives the same shape as its source.
+  - **Undo works for free** — none of the three is in `RECOMPILE_KEYS`, so they ride `updateNode`
+    with no recompile, and `history.js` snapshots the store. A resize drag's many updates coalesce
+    into one step like a slider drag. Verified: collapse → Ctrl+Z reverts → Ctrl+Shift+Z reapplies.
+  - **Geometry is exact for both new branches** (graph units, zoom factored out): collapsed
+    estimate 52 vs drawn 52.4, explicit height 114 vs drawn 114.0, width 270 vs 270. The
+    **pre-existing** inaccuracy on AUTO-height cards is untouched and still in the backlog
+    ("Measure real card heights") — measured here at −24 and +22 units on two of the default nodes,
+    which is worth knowing because it is now the only source of hit-test drift left.
+  - **FOLLOW-UP PASS (2026-08-21, same day) — five faults found by actually using it.** Four of
+    them trace to ONE mistake: making `.node-card__params` a scroll container, which clips
+    everything that deliberately hangs outside it.
+    - **The param sockets were being sliced off AND made unwireable.** They sit at `left: -13px` so
+      they straddle the card's border, and a scroll container clips at its padding box — measured
+      7 of the socket's 8 pixels gone, with `elementFromPoint` at the socket's centre returning the
+      resize handle. Every float modulation input on a sized card was dead. Fixed by padding the
+      list out past them (`padding-left: 22px`) and pulling it back by the same amount
+      (`margin-left: -16px`), so the clip edge moves and the content does not — the row's content
+      box lands on exactly the same x as an unsized card's.
+    - **The permanent horizontal scrollbar was `[data-tooltip]::after`.** That pseudo-element is in
+      the DOM at all times (opacity 0, `white-space: nowrap`), and a long one — "Drag to scrub
+      (Shift = fine) · Click to type" — measured ~112px past the right edge. Nothing was ever
+      scrollable there. Leaving `overflow-x` unstated is what exposed it: with `overflow-y: auto`,
+      CSS computes a `visible` cross-axis to `auto`. Now `overflow-x: hidden` explicitly. **The
+      cost is that tooltips inside a sized card's params list are clipped** — they already were
+      vertically, and there is no way to scroll one axis without clipping the other.
+    - **A slider row never actually filled the card.** It is a GRID inside a FLEX parent, and a
+      flex item does not grow by default — it only looked right because `<input type="range">` has
+      an intrinsic ~129px width that padded the middle track out by luck. That accident is also why
+      the first attempt at a percentage label track collapsed to its floor: the grid container was
+      sized to its own content, so there was no width to take a percentage of. Rows now
+      `flex: 1 1 auto; min-width: 0`.
+    - **The label column was a hard 60px**, so widening a card grew only the slider and a long param
+      name stayed truncated forever — the entire point of being able to widen it. Now
+      `--node-label-col: clamp(60px, 32%, 190px)`. A shared custom property rather than a
+      content-sized `auto` track because every row is its OWN grid: `auto` would size to each row's
+      own label and the sliders would come out ragged. Measured on ARRAY (19 params, longest label
+      "Jitter Position"): label 60 → **77.7** at the default 270 width, **141.7** at 470, **190** at
+      the 720 cap, with **zero** truncated labels at any width above the minimum.
+    - **The hover treatment is gone, not tweaked.** Tinting all four edges on card hover put a cyan
+      cage around every node the pointer crossed, and the bottom strip was inset 12px while the
+      sides were inset 10px, which is what made it look misaligned. Now: no decoration at rest or
+      on card hover; all edge strips inset the SAME 12px; a 2px accent line flush with an edge only
+      while that handle itself is hovered; and the one persistent affordance is a small bracket in
+      the bottom-right corner echoing the card's radius.
+  - **`NODE_HEADER_H` was wrong and the collapsed height with it — 30 encoded, 35.8 measured.** The
+    header is sized by its 27px action buttons, and a LOCKED node renders fewer of them, so no
+    single constant could describe both. `.node-card--collapsed .node-card__header` is now pinned
+    (34px, with 22px buttons to suit the compact state) and the constant includes the card's 2px of
+    border. Verified: all four nodes in the default graph collapse to **57.6 drawn vs 58 estimated,
+    spread 0.00 across locked and unlocked**, where the collapsed height previously varied by ~8px
+    with lock state and drifted 7.4px from the estimate.
+  - **STILL WANTS A REAL LOOK AT** — the browser pane could not composite in either session, so all
+    of the above is DOM measurement rather than eyes on pixels. Specifically unverified: whether the
+    corner bracket reads as a resize grip, whether the 10px edge strips feel grabbable at low zoom
+    on a trackpad, and whether a collapsed card's rail of up to ten mini dots (the Audio Splitter)
+    reads as sockets or as noise.
+  - **DELIBERATELY NOT DONE:** no per-node collapse of the params section alone (the COMPOUND card's
+    existing chevron already does that for its own exposed params); no double-click-header to
+    collapse, because `COMPOUND` already uses that gesture to enter the sub-graph; and no
+    auto-collapse / tidy-layout command.
 
 - **`FEEDBACK` gained a `Decay` param (2026-08-14).** Shader-only change — one uniform plus its
   `@param` in `shaderRegistry.js`. Everything downstream is derived, so the Inspector slider,
@@ -1672,13 +2037,13 @@ Image-import downscaling + the GPU max-texture clamp (`src/utils/imageProcessing
      and a VP9+Alpha export of a transparent clip's transition should keep clean edges over a
      coloured page.
 
-- **Straight-space mixing inside node graphs has the same latent fault.** The transition
-  compositor's inputs are fixed, but `MIX_BLEND` (and any node doing `mix(a, b, t)` on two texture
-  inputs) still interpolates STRAIGHT RGBA, so crossfading transparent content *inside* a graph can
-  still pull undefined colour out of the matte. The pipeline-wide fix is the one the older backlog
-  entry already names — pick ONE alpha convention app-wide instead of straight-for-effects /
-  premultiplied-for-the-compositor. Short of that, `MIX_BLEND` could premultiply, mix, and
-  un-premultiply internally, which is 2 divides and correct; worth doing if it bites.
+- **Straight-space mixing inside node graphs — DONE for `MIX_BLEND` (2026-09-01), still open
+  everywhere else.** `MIX_BLEND` / `MATH_BLEND` now do exactly what this note predicted: weight by
+  coverage, sum premultiplied, divide back out. Any OTHER node doing `mix(a, b, t)` on two texture
+  inputs still interpolates STRAIGHT RGBA and can pull undefined colour out of a matte
+  (`DISPLACEMENT`'s map input is the next candidate). The pipeline-wide fix remains the one the
+  older backlog entry names — pick ONE alpha convention app-wide instead of straight-for-effects /
+  premultiplied-for-the-compositor.
 
 - **Verify "In Context" clip preview in `npm run dev`** — written with the Cowork sandbox down, so
   no lint/build run. No shader changed, so `smoke:shaders` is not the signal here; the risk is all

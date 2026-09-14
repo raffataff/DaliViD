@@ -47,6 +47,7 @@ const NODE_CATALOG = [
     items: [
       { type: 'EDGE_DETECTION', name: 'Edge Detection' },
       { type: 'FEEDBACK', name: 'Feedback Loop' },
+      { type: 'FEEDBACK_MACHINE', name: 'Feedback Machine' },
       { type: 'GLITCH', name: 'Glitch / Datamosh' },
       { type: 'KALEIDOSCOPE', name: 'Kaleidoscope' },
       { type: 'PIXELATE', name: 'Pixelate' },

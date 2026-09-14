@@ -1,6 +1,7 @@
-import { useRef, useState, useCallback, useMemo, useEffect } from 'react'
+import { useRef, useState, useCallback, useMemo, useEffect, useLayoutEffect } from 'react'
 import { IconChevronDown, IconFitWindow, IconShaderGenerate } from '../common/Icons'
-import NodeCard, { NODE_WIDTH, NODE_COLORS } from './NodeCard'
+import NodeCard, { NODE_COLORS } from './NodeCard'
+import { NODE_HEADER_H, NODE_RAIL_H, nodeWidth, estimateNodeHeight } from './nodeGeometry'
 import Noodle, { NoodleDrag, NoodleFilters } from './Noodle'
 import NodeSearchMenu from './NodeSearchMenu'
 import MonacoDrawer from './MonacoDrawer'
@@ -17,7 +18,7 @@ import { getShaderSource, getNodeSource } from '../../shaders/shaderRegistry'
 import { instantiatePreset, instantiateUserCompound } from '../../shaders/compoundPresets'
 import { generateCombinedShader } from '../../shaders/shaderGenerator'
 import { getNodeSockets, getSocketYOffset, canConnect } from '../../shaders/nodeDefinitions'
-import { getDataNodeParams, visibleDataParams } from '../../shaders/dataNodeParams'
+import { getDataNodeParams } from '../../shaders/dataNodeParams'
 import { parseTransitionGraphKey, edgeLabel } from '../../utils/clipTransitions'
 import TransitionGraphBar from './TransitionGraphBar'
 import './NodeCanvas.css'
@@ -80,19 +81,6 @@ const AUDIO_AUTOWIRE = {
 // reading the noodles, and undoing its guess costs more than making the two
 // connections yourself. Ctrl+drag-over-a-wire is still there for deliberate
 // insertion.
-
-// Estimated card height: header(30) + sockets + params + footer. Shared by the
-// marquee hit test, fit-to-window, the wire-insert hit test and the minimap so
-// they can never drift apart again.
-function estimateNodeHeight(node, params) {
-  const { inputs, outputs } = getNodeSockets(node.type, params, node)
-  const socketCount = Math.max(inputs.filter(s => !s.isParam).length, outputs.length)
-  // Sockets come from the full config list, but only VISIBLE param rows occupy
-  // height — a `showIf`-hidden control (LFO's Beats/Cycle, …) draws nothing, and
-  // counting it would leave the marquee/insert hit tests reaching below the card.
-  const rows = visibleDataParams(params, node.params).length
-  return 30 + socketCount * 22 + rows * 26 + 40
-}
 
 // Node clipboard (Ctrl+C / Ctrl+V) — module-level so it survives graph
 // switches (copy in a clip graph, paste in master) and canvas remounts.
@@ -277,6 +265,19 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
   }, [graph.nodes, graph.edges])
 
   const handleWheel = useCallback((e) => {
+    // A card sized shorter than its content turns its params list into a scroll
+    // container. This handler is on the canvas and preventDefaults every wheel
+    // event, so without this a node you deliberately shrank could never be
+    // scrolled — the wheel would zoom instead. Same shape as the font-picker bug:
+    // an outer handler swallowing a nested scroller's own wheel. Handed over only
+    // while the list can still move that way, so reaching either end resumes
+    // zooming rather than dead-ending the gesture.
+    const scroller = e.target?.closest?.('.node-card__params')
+    if (scroller && scroller.scrollHeight > scroller.clientHeight) {
+      const atTop = scroller.scrollTop <= 0
+      const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1
+      if (!((e.deltaY < 0 && atTop) || (e.deltaY > 0 && atBottom))) return
+    }
     e.preventDefault()
     const factor = e.deltaY > 0 ? 0.92 : 1.08
     const next = Math.min(4, Math.max(0.1, zoom * factor))
@@ -316,7 +317,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       if (EXCLUDED_FROM_MARQUEE.has(node.type) || node.locked || already.has(node.id)) continue
       const nodeBottom = node.position.y + estimateNodeHeight(node, nodeParamConfigs[node.id] || [])
       // Any intersection counts
-      if (node.position.x < right && node.position.x + NODE_WIDTH > left &&
+      if (node.position.x < right && node.position.x + nodeWidth(node) > left &&
           node.position.y < bottom && nodeBottom > top) {
         selected.push(node.id)
       }
@@ -480,6 +481,44 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     for (const n of nodes) updateNode(graphLevel, graphClipId, n.id, { bypassed: bypass })
     setShowActionMenu(false)
   }, [selectedNodeIds, graph.nodes, updateNode, graphLevel, graphClipId])
+
+  // ── Collapse / resize ──
+  // Both are plain node fields (`collapsed`, `width`, `height`), so they ride the
+  // existing update path: no recompile (none of them is in RECOMPILE_KEYS) and
+  // undo picks them up for free, with a resize drag's many updates coalescing
+  // into one history step exactly like a slider drag.
+  const handleNodeResize = useCallback((nodeId, patch) => {
+    updateNode(graphLevel, graphClipId, nodeId, patch)
+  }, [updateNode, graphLevel, graphClipId])
+
+  const setCollapsedOn = useCallback((nodes, collapsed) => {
+    for (const n of nodes) updateNode(graphLevel, graphClipId, n.id, { collapsed })
+  }, [updateNode, graphLevel, graphClipId])
+
+  // The card's own chevron. Hitting it on a node that is part of a multi-selection
+  // collapses the WHOLE selection — the same rule the group drag follows, so the
+  // selection keeps behaving as one thing.
+  const handleToggleNodeCollapse = useCallback((nodeId) => {
+    const g = useGraphStore.getState().getActiveGraph(graphLevel, graphClipId)
+    const node = g?.nodes.find(n => n.id === nodeId)
+    if (!node) return
+    if (selectedNodeIds.length > 1 && selectedNodeIds.includes(nodeId)) {
+      const nodes = selectedNodeIds.map(id => g.nodes.find(n => n.id === id)).filter(Boolean)
+      setCollapsedOn(nodes, nodes.some(n => !n.collapsed))
+      return
+    }
+    setCollapsedOn([node], !node.collapsed)
+  }, [graphLevel, graphClipId, selectedNodeIds, setCollapsedOn])
+
+  // H, and the action menu. Same one-click-uniform rule as Bypass All: if
+  // anything in the group is open, close everything.
+  const handleToggleCollapseSelected = useCallback(() => {
+    const ids = selectedNodeIds.length > 0 ? selectedNodeIds : (selectedNodeId ? [selectedNodeId] : [])
+    const nodes = ids.map(id => graph.nodes.find(n => n.id === id)).filter(Boolean)
+    if (nodes.length === 0) return
+    setCollapsedOn(nodes, nodes.some(n => !n.collapsed))
+    setShowActionMenu(false)
+  }, [selectedNodeIds, selectedNodeId, graph.nodes, setCollapsedOn])
 
   // ── Clipboard (Ctrl+C / Ctrl+V) ──
   const handleCopyToClipboard = useCallback(() => {
@@ -659,6 +698,9 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       // it onto the new IMAGE_INPUT node so it renders immediately.
       if (payload.imageSrc) {
         defaultParams.imageSrc = payload.imageSrc
+        // Carry the vault identity too, so the dropped node's image survives a
+        // reload instead of relying on this session's object URL.
+        if (payload.imageRefId) defaultParams.imageRefId = payload.imageRefId
         defaultParams.imageName = payload.imageName || payload.name || ''
       }
       // Preset cards (e.g. Media Pool shapes) carry a param patch — apply it so
@@ -723,6 +765,11 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       shaderCode: node.shaderCode || null,
       audioBindings: JSON.parse(JSON.stringify(node.audioBindings || {})),
       bypassed: node.bypassed || false,
+      // A copy that arrives a different shape from the thing you copied reads as
+      // a bug. undefined stays undefined, i.e. "no override".
+      width: node.width,
+      height: node.height,
+      collapsed: node.collapsed || false,
     }
     const newId = addNode(graphLevel, graphClipId, nodeData)
     selectNode(newId)
@@ -802,6 +849,25 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     removeNode(graphLevel, graphClipId, nodeId)
   }, [detachNodeWires, removeNode, graphLevel, graphClipId])
 
+  // ── One extra render after a card changes SHAPE ──
+  // getSocketPos prefers a socket's live DOM circle, and it runs in the RENDER
+  // phase — so on the pass where a card collapses or resizes it is still reading
+  // the previous layout, and every noodle on that node lands ~6px off its socket.
+  // A drag hides this (a render per mousemove, each one frame behind, invisible
+  // at 60fps); a collapse is one-shot, so nothing ever corrects it and the wire
+  // sits visibly detached until something else re-renders. Measured: dx/dy 6.0 /
+  // -6.4 immediately after a collapse, exactly 0 after any later render.
+  // useLayoutEffect fires after the DOM is laid out and BEFORE paint, so the
+  // correcting pass is never visible as a flicker.
+  const geomSig = useMemo(
+    () => graph.nodes.map(n => `${n.id}:${n.collapsed ? 1 : 0}:${n.width || 0}:${n.height || 0}`).join('|'),
+    [graph.nodes]
+  )
+  // The value is never read — the state change IS the fix, because it schedules
+  // the render in which the edges re-measure.
+  const [, setSocketEpoch] = useState(0)
+  useLayoutEffect(() => { setSocketEpoch(e => e + 1) }, [geomSig])
+
   const getSocketPos = useCallback((nodeId, socketId, socketSide) => {
     const node = graph.nodes.find(n => n.id === nodeId)
     if (!node) return { x: 0, y: 0 }
@@ -814,6 +880,17 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       const x = (rect.left + rect.width / 2 - containerRect.left - pan.x) / zoom
       const y = (rect.top + rect.height / 2 - containerRect.top - pan.y) / zoom
       return { x, y }
+    }
+    // Fallback: the card isn't mounted (or the socket isn't in the DOM), so
+    // estimate from the layout instead. Width is per-node now, so read it.
+    const width = nodeWidth(node)
+    if (node.collapsed) {
+      // A collapsed card puts every visible socket on the single rail row under
+      // the header — there is no per-socket y to work out.
+      return {
+        x: socketSide === 'output' ? node.position.x + width : node.position.x,
+        y: node.position.y + NODE_HEADER_H + NODE_RAIL_H / 2,
+      }
     }
     const params = nodeParamConfigs[nodeId] || []
     const { inputs, outputs } = getNodeSockets(node.type, params, node)
@@ -840,8 +917,12 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     }
     if (socketIndex < 0) socketIndex = 0
     const y = node.position.y + getSocketYOffset(socketIndex, sockets.length)
-    const x = socketSide === 'output' ? node.position.x + NODE_WIDTH : node.position.x
+    const x = socketSide === 'output' ? node.position.x + width : node.position.x
     return { x, y }
+    // socketEpoch is deliberately NOT a dependency: this body reads the live DOM
+    // on every call, so it is never stale. The epoch exists to force the RENDER
+    // in which the edges call it, and the edges are built inline in JSX — so the
+    // re-render alone is the whole fix.
   }, [graph.nodes, nodeParamConfigs, pan, zoom])
 
   // ── Ctrl/Shift+drag auto-insert (Blender-style) ──
@@ -866,8 +947,9 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
 
     // Approximate the card's bounding box (same estimate as the marquee).
     const height = estimateNodeHeight(node, params)
-    const box = { left: position.x, right: position.x + NODE_WIDTH, top: position.y, bottom: position.y + height }
-    const cx = position.x + NODE_WIDTH / 2
+    const width = nodeWidth(node)
+    const box = { left: position.x, right: position.x + width, top: position.y, bottom: position.y + height }
+    const cx = position.x + width / 2
     const cy = position.y + height / 2
 
     // Reject splices that would create a cycle: never target a wire whose
@@ -1053,7 +1135,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
       const height = estimateNodeHeight(node, nodeParamConfigs[node.id] || [])
       minX = Math.min(minX, node.position.x)
       minY = Math.min(minY, node.position.y)
-      maxX = Math.max(maxX, node.position.x + NODE_WIDTH)
+      maxX = Math.max(maxX, node.position.x + nodeWidth(node))
       maxY = Math.max(maxY, node.position.y + height)
     }
     const PAD = 60
@@ -1076,12 +1158,15 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     if (graph.nodes.length === 0) return null
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
     const heights = {}
+    const widths = {}
     for (const node of graph.nodes) {
       const h = estimateNodeHeight(node, nodeParamConfigs[node.id] || [])
+      const w = nodeWidth(node)
       heights[node.id] = h
+      widths[node.id] = w
       minX = Math.min(minX, node.position.x)
       minY = Math.min(minY, node.position.y)
-      maxX = Math.max(maxX, node.position.x + NODE_WIDTH)
+      maxX = Math.max(maxX, node.position.x + w)
       maxY = Math.max(maxY, node.position.y + h)
     }
     const MARGIN = 300
@@ -1097,7 +1182,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
         return {
           id: node.id,
           x: p.x, y: p.y,
-          w: Math.max(2, NODE_WIDTH * scale),
+          w: Math.max(2, widths[node.id] * scale),
           h: Math.max(2, heights[node.id] * scale),
           color: node.type === 'COMPOUND' ? (node.color || '#ff00aa') : (NODE_COLORS[node.type] || '#00e5ff'),
         }
@@ -1192,6 +1277,9 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
             shaderCode: node.shaderCode || null,
             audioBindings: JSON.parse(JSON.stringify(node.audioBindings || {})),
             bypassed: node.bypassed || false,
+            width: node.width,
+            height: node.height,
+            collapsed: node.collapsed || false,
           }
           const newId = addNode(graphLevel, graphClipId, nodeData)
           selectNode(newId)
@@ -1231,6 +1319,10 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
         e.preventDefault()
         fitToWindow()
       }
+      if (e.code === 'KeyH' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault()
+        handleToggleCollapseSelected()
+      }
       if (e.code === 'Escape') {
         if (marquee) setMarquee(null) // cancel an in-progress box-select
         if (selectedNodeIds.length > 0) {
@@ -1241,7 +1333,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [selectedNodeId, selectedNodeIds, marquee, graph.nodes, addNode, removeNode, graphLevel, graphClipId, selectNode, clearSelection, clearNodeSelection, setSelectedNodeIds, fitToWindow, handleCopyToClipboard, handlePasteFromClipboard])
+  }, [selectedNodeId, selectedNodeIds, marquee, graph.nodes, addNode, removeNode, graphLevel, graphClipId, selectNode, clearSelection, clearNodeSelection, setSelectedNodeIds, fitToWindow, handleCopyToClipboard, handlePasteFromClipboard, handleToggleCollapseSelected])
 
   return (
     <>
@@ -1401,6 +1493,8 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
                   onEnterCompound={enterCompound}
                   onExposedParamChange={handleCompoundExposedParamChange}
                   onExpandCompound={handleExpandCompound}
+                  onToggleCollapse={handleToggleNodeCollapse}
+                  onResize={handleNodeResize}
                 />
               )
             })}
@@ -1412,6 +1506,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
               <p className="text-muted">Drag effects from the Media Pool</p>
               <p className="text-muted">Drag on empty space to box-select · Alt-drag or middle-drag to pan</p>
               <p className="text-muted">Ctrl-drag a node onto a wire to insert it</p>
+            <p className="text-muted">Drag a node&apos;s edge to resize it · H to collapse</p>
             </div>
           )}
 
@@ -1443,6 +1538,7 @@ export default function NodeCanvas({ collapsed, onToggleCollapse }) {
               onDuplicate={handleDuplicateSelectedNodes}
               onCreateCompound={handleCreateCompound}
               onToggleBypass={handleToggleBypassSelected}
+              onToggleCollapse={handleToggleCollapseSelected}
               onDeleteNodes={handleDeleteSelectedNodes}
               onDeselect={clearNodeSelection}
               onClose={() => setShowActionMenu(false)}

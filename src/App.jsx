@@ -9,15 +9,19 @@ import Timeline from './components/Timeline/Timeline'
 import ResizeHandle from './components/common/ResizeHandle'
 import ExportModal from './components/Export/ExportModal'
 import NewProjectModal from './components/common/NewProjectModal'
+import ProjectSettingsModal from './components/common/ProjectSettingsModal'
 import ToastContainer, { addToast } from './components/common/Toast'
 import WelcomeModal from './components/common/WelcomeModal'
 import ShortcutsOverlay from './components/common/ShortcutsOverlay'
 import useAppStore from './store/useAppStore'
 import useGraphStore from './store/useGraphStore'
 import useTimelineStore from './store/useTimelineStore'
+import useMediaStore from './store/useMediaStore'
 import {
-  saveProject, requestPersistentStorage, purgeStoredFolderHandles
+  saveProject, requestPersistentStorage, purgeStoredFolderHandles,
 } from './utils/projectSerializer'
+import { collectGarbage } from './utils/projectMedia'
+import { onProjectFolderChange } from './storage/index.js'
 import { initFontRegistry } from './utils/fontRegistry'
 import { initHistory, undo, redo } from './utils/history'
 import { nearestEdge } from './utils/clipTransitions'
@@ -84,8 +88,26 @@ const clearSelection = useAppStore(s => s.clearSelection)
        appState.markSaving()
        await saveProject(useAppStore.getState, useGraphStore.getState, useTimelineStore.getState)
        appState.markSaved()
+
+       // Reclaim blobs nothing references any more.
+       //
+       // **Explicit saves only — NEVER the autosave.** Autosave fires two
+       // seconds after any change, so hanging the GC off it meant a full OPFS
+       // scan-and-delete pass running continuously while editing. That is both
+       // wasteful and dangerous: it turned any momentary gap in the reachable
+       // set into permanent deletion of the user's media a couple of seconds
+       // after they imported it. Reclaiming space is not urgent; deleting the
+       // wrong file is irreversible, so this runs rarely and predictably —
+       // here, and from the Storage tab's purge button.
+       //
+       // Also never during an export: an export holds object URLs it resolved
+       // earlier, and pulling a file out from under one surfaces as a corrupt
+       // output half an hour in.
+       if (!silent && !useAppStore.getState().exportModalOpen) {
+         collectGarbage().catch(err => console.warn('[DaliVid] Blob GC skipped:', err))
+       }
        if (!silent) {
-         addToast({ message: 'Saved to this browser. Use "Save Project File" for a copy on disk.', type: 'info' })
+         addToast({ message: 'Project saved.', type: 'info' })
        }
      } catch (err) {
        console.error(err)
@@ -134,18 +156,63 @@ const clearSelection = useAppStore(s => s.clearSelection)
      initFontRegistry()
    }, [])
 
+   // ── Open on the project browser, not on the last session ──
+   //
+   // The app used to silently reopen whatever was in the autosave slot. That was
+   // added when nothing read the slot at all, but as a front door it is wrong:
+   // it makes "which project am I in?" ambiguous, it reopens a project the user
+   // may have been finished with, and a stale slot reads as "loading is broken"
+   // because the app lands somewhere other than where they left it.
+   //
+   // The browser lists every saved project and offers a new one, so the user
+   // chooses. The autosave slot stays exactly as it is — it remains the
+   // crash-recovery pointer, and the browser surfaces it as "Last session".
+   useEffect(() => {
+     useAppStore.getState().setProjectBrowserOpen(true)
+   }, [])
+
+   // ── The vault's root changed under an open project ──
+   // Connecting or disconnecting a folder repoints the vault, so every playback
+   // URL the open project is holding now refers to a file in the root we just
+   // left. Those URLs are already revoked; the pool has to be emptied to match,
+   // or the Media Pool shows entries whose bytes are unreachable.
+   //
+   // Clips keep their `mediaRefId`, so reopening the project resolves everything
+   // against the new root. Saying so is the whole job here.
+   useEffect(() => onProjectFolderChange(() => {
+     useMediaStore.getState().clear()
+     if (useTimelineStore.getState().clips.length > 0) {
+       addToast({
+         message: 'Storage location changed. Reopen this project to reconnect its media.',
+         type: 'warning',
+         duration: 9000,
+       })
+     }
+   }), [])
+
    // Warn before leaving with work that exists nowhere but this browser.
-   // lastExportTime is set by "Save Project File"; lastSaveTime by any save. If
-   // edits are newer than the last download — and there's actually something to
-   // lose — the browser shows its generic "Leave site?" confirmation.
+   // The only genuine loss left is session-only media: bytes that were never
+   // copied anywhere. A folder project's edit is already on disk, so a reload
+   // costs nothing and must not raise a prompt.
    useEffect(() => {
      const onBeforeUnload = (e) => {
-       const { lastSaveTime, lastExportTime } = useAppStore.getState()
-       const hasContent =
-         useTimelineStore.getState().clips?.length > 0 ||
-         useGraphStore.getState().masterGraph?.nodes?.length > 0
-       const undownloaded = lastSaveTime && (!lastExportTime || lastExportTime < lastSaveTime)
-       if (hasContent && undownloaded) {
+       // Media imported "this session only" was never copied into the vault, so
+       // closing genuinely destroys those bytes and no saved project can bring
+       // them back. This is the one case that is still a real loss, and it is
+       // the case the copy-decision modal deliberately allows.
+       const sessionOnly = useMediaStore.getState().sessionOnlyRefs().length > 0
+
+       // Deliberately NO LONGER warning merely because the project has not been
+       // downloaded as a file. That condition used to fire on every single
+       // reload — and now that autosave is restored at boot and media resolves
+       // out of the vault, a reload loses nothing, so the warning was both
+       // constant and untrue. A prompt that cries wolf on every refresh is how
+       // people learn to dismiss the one that matters.
+       //
+       // Durability against IndexedDB eviction is handled where it belongs:
+       // `requestPersistentStorage()` on mount, and the explicit "Save Project
+       // File" button for a copy on disk.
+       if (sessionOnly) {
          e.preventDefault()
          e.returnValue = ''
        }
@@ -389,6 +456,7 @@ const clearSelection = useAppStore(s => s.clearSelection)
       {/* ── Overlays ── */}
       <ExportModal />
       <NewProjectModal />
+      <ProjectSettingsModal />
       <WelcomeModal />
       <ShortcutsOverlay isOpen={showShortcuts} onClose={() => setShowShortcuts(false)} />
       <ToastContainer />

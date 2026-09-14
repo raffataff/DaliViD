@@ -445,6 +445,20 @@ const NODE_DEFS = {
     ],
     hasParamInputs: true,
   },
+
+  // FEEDBACK_MACHINE declares u_prev_frame (its own history) plus a second
+  // picture input — the beam-splitter's other screen — keyed into the loop.
+  FEEDBACK_MACHINE: {
+    inputs: [
+      { id: 'input', type: 'texture', name: 'Input' },
+      { id: 'input_b', type: 'texture', name: 'Input B' },
+      { id: 'audio_drivers', type: 'float', name: 'Audio Drivers' },
+    ],
+    outputs: [
+      { id: 'output', type: 'texture', name: 'Output' },
+    ],
+    hasParamInputs: true,
+  },
 }
 
 /**

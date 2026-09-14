@@ -37,9 +37,20 @@ const SOURCE_PARAMS = {
   TRANSITION_FX: 'u_tfx_type',
 }
 
+// Params whose value can bring a whole GROUP of uniforms into play that an
+// OLDER saved node has never stored — a mode select that switches on controls
+// added after the project was made. The shader source is unchanged (so no
+// recompile), but the node's defaults are refilled, otherwise those uniforms run
+// at GLSL's implicit zero and the new mode looks broken rather than unset.
+const DEFAULT_FILL_PARAMS = {
+  MIX_BLEND: 'u_operation',
+  MATH_BLEND: 'u_operation',
+}
+
 /**
- * Params for a node whose SOURCE just changed: the new shader's defaults filled
- * in underneath whatever the node already had.
+ * The node's params with its shader's defaults filled in underneath. Used when a
+ * node's SOURCE changed, and when a mode select may have revealed uniforms the
+ * node never stored (see DEFAULT_FILL_PARAMS).
  *
  * Without this, switching a TRANSITION_FX from Crossfade to Film Burn leaves the
  * node holding only Crossfade's params — every Film Burn uniform is absent, so
@@ -124,6 +135,24 @@ const useGraphStore = create((set, get) => ({
   // live param values each frame).
   topologyVersion: 0,
 
+  /**
+   * Put the graphs back to what a freshly-loaded app has.
+   *
+   * A new project used to be given a literally empty master graph — no Master
+   * Output, no Timeline Audio, no Audio Splitter — so the renderer had nothing
+   * to compile (hence "Master graph compile errors" in the console) and the user
+   * had to rebuild the three locked nodes by hand every time. The defaults live
+   * here, beside the initial state they come from, so the two cannot drift.
+   */
+  resetForNewProject: () => set(state => ({
+    masterGraph: createDefaultMasterGraph(),
+    clipGraphs: {},
+    compoundLibrary: [STARTER_TRANSITION_COMPOUND],
+    undoStack: [],
+    redoStack: [],
+    topologyVersion: state.topologyVersion + 1,
+  })),
+
   getActiveGraph: (graphLevel, clipId) => {
     const state = get()
     if (graphLevel === 'master') return state.masterGraph
@@ -195,10 +224,11 @@ const useGraphStore = create((set, get) => ({
       if (!graph) return state
       const target = graph.nodes.find(n => n.id === nodeId)
       const isSourceParam = SOURCE_PARAMS[target?.type] === paramName
+      const needsDefaults = isSourceParam || DEFAULT_FILL_PARAMS[target?.type] === paramName
       const nodes = graph.nodes.map(n => {
         if (n.id !== nodeId) return n
         const next = { ...n, params: { ...n.params, [paramName]: value } }
-        return isSourceParam ? { ...next, params: withSourceDefaults(next) } : next
+        return needsDefaults ? { ...next, params: withSourceDefaults(next) } : next
       })
       // Almost never — see SOURCE_PARAMS. A slider drag must not recompile.
       const bump = isSourceParam ? { topologyVersion: state.topologyVersion + 1 } : {}

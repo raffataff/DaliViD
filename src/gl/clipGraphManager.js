@@ -11,6 +11,7 @@ import { getExecutionOrder } from '../utils/topSort.js'
 import { hexToVec3 } from '../utils/paramParser.js'
 import { AUDIO_DRIVER_BANDS, injectAudioDrivers } from '../utils/audioDrivers.js'
 import { RAMP_SPANS, RAMP_EASINGS, LFO_BASES, LFO_WAVES, selectIndex } from '../shaders/dataNodeParams.js'
+import { ringCount } from './historyRing.js'
 
 // When true, the graph is evaluated as a true DAG (inputs resolved per-edge,
 // multi-input effects supported). Set to false to fall back to the legacy
@@ -55,9 +56,12 @@ function nodeFBOScale(node, liveParams) {
   //   DEPTH             — a data map; half res is invisible downstream.
   //   AUDIO_VISUALIZER  — fill-rate bound generative graphics, where Half is
   //                       close to a 4x saving and reads as a slight softness.
+  //   FEEDBACK_MACHINE  — trades resolution for delay: its history ring holds
+  //                       Delay+1 full buffers, so Half is 4x more frames.
   let idx
   if (node.type === 'DEPTH') idx = Math.round(Number(liveParams?.u_dp_res ?? 1))
   else if (node.type === 'AUDIO_VISUALIZER') idx = Math.round(Number(liveParams?.u_render_scale ?? 0))
+  else if (node.type === 'FEEDBACK_MACHINE') idx = Math.round(Number(liveParams?.u_fm_res ?? 0))
   else return 1
   if (!Number.isFinite(idx)) return 1
   return FBO_SCALE_STEPS[Math.min(FBO_SCALE_STEPS.length - 1, Math.max(0, idx))]
@@ -664,7 +668,6 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
     const isFeedback = node.uniformLocations.u_prev_frame !== undefined
     let outId
     if (isFeedback) {
-      const ppId = `__npp_${scopeId}${node.nodeId}`
       // A feedback node CAN be scaled, as long as BOTH buffers move together:
       // the history is then read 1:1 at its own resolution and resampled exactly
       // once, on the way out. (Mismatched sizes are what would compound
@@ -672,13 +675,29 @@ function executeGraphDAG(renderer, chain, edges, inputFBOId, outputFBOId, standa
       const fbScale = nodeFBOScale(node, liveParams)
       const ppW = Math.max(1, Math.round(renderer.width * fbScale))
       const ppH = Math.max(1, Math.round(renderer.height * fbScale))
-      let pp = fbos.getPingPong(ppId)
-      if (!pp) pp = fbos.createPingPong(ppId, ppW, ppH)
-      else fbos.resizePingPong(ppId, ppW, ppH)
-      const prevFrameFBOId = `${ppId}_${pp.current}`
-      outId = `${ppId}_${1 - pp.current}`
-      renderer.executePass(node, primaryInput, outId, standardState, customParams, prevFrameFBOId, extraTextures)
-      pp.swap() // current now points at the buffer we just wrote
+      // A node whose params carry u_prev_delay wants an N-frame history ring
+      // instead of the single-frame ping-pong. Detected from the PARAM, not the
+      // uniform location: the shader never has to read u_prev_delay, so the GL
+      // compiler may drop it from the active-uniform list.
+      const delayParam = customParams.u_prev_delay
+      if (delayParam !== undefined) {
+        const ringId = `__nring_${scopeId}${node.nodeId}`
+        const count = ringCount(delayParam, ppW, ppH)
+        const ring = fbos.ensureRing(ringId, count, ppW, ppH)
+        const prevFrameFBOId = ring.readId
+        outId = ring.writeId
+        renderer.executePass(node, primaryInput, outId, standardState, customParams, prevFrameFBOId, extraTextures)
+        ring.advance()
+      } else {
+        const ppId = `__npp_${scopeId}${node.nodeId}`
+        let pp = fbos.getPingPong(ppId)
+        if (!pp) pp = fbos.createPingPong(ppId, ppW, ppH)
+        else fbos.resizePingPong(ppId, ppW, ppH)
+        const prevFrameFBOId = `${ppId}_${pp.current}`
+        outId = `${ppId}_${1 - pp.current}`
+        renderer.executePass(node, primaryInput, outId, standardState, customParams, prevFrameFBOId, extraTextures)
+        pp.swap() // current now points at the buffer we just wrote
+      }
     } else {
       // Nodes with a resolution param may render at half / quarter res — see
       // nodeFBOScale. The feedback branch above scales its ping-pong pair the

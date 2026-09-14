@@ -189,6 +189,32 @@
   min-width: 32px;
   text-align: right;
 }
+/* Readout doubles as a control: drag it to scrub, click it to type a value. */
+.inspector__slider-value--scrub {
+  cursor: ew-resize;
+  user-select: none;
+}
+.inspector__slider-value--scrub:hover {
+  color: var(--text-primary);
+}
+/* Type-in box that replaces the readout on click. */
+.inspector__slider-input {
+  flex: 0 0 auto;
+  width: 54px;
+  font-size: 10px;
+  font-family: var(--font-code);
+  text-align: right;
+  padding: 1px 3px;
+  border: 1px solid var(--accent-cyan);
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  color: var(--text-primary);
+}
+.inspector__slider-input::-webkit-outer-spin-button,
+.inspector__slider-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
 
 /* ── Button ── */
 .inspector__btn {

@@ -34,5 +34,11 @@ jobs:
       - name: Lint + shader smoke test
         run: npm run lint
 
+      # node --test, no test-runner dependency. Covers src/storage/ — the schema
+      # validator and the v1 -> v2 migration, whose failure mode is silent data
+      # loss on load rather than anything a build or a lint would notice.
+      - name: Unit tests
+        run: npm test
+
       - name: Production build
         run: npm run build

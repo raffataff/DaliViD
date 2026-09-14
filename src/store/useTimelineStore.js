@@ -201,6 +201,11 @@ const useTimelineStore = create((set, get) => ({
     const clip = {
       filename: clipData.filename || 'Untitled',
       fileUrl: clipData.fileUrl || null,
+      // Content-addressed handle on this clip's media. `fileUrl` is this
+      // session's resolution of it and is never saved; `mediaRefId` is what
+      // persists, and what lets a reload find the bytes again without asking the
+      // user to relink. `filename` is kept alongside both as the fallback.
+      mediaRefId: clipData.mediaRefId || null,
       fileType: clipData.fileType || 'video', // 'video' | 'audio' | 'camera' | 'screen' | 'image' | 'text' | 'shape'
       // Generator clips (text/image) keep their content + style here (text string,
       // image data URL, fit/transform). Empty for media-backed clips.

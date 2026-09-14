@@ -1,0 +1,285 @@
+/* Project Browser — the UI that finally makes saved projects reachable. */
+.pbm__backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+}
+
+.pbm {
+  background: var(--bg-panel, #1b1e24);
+  border: 1px solid var(--border, #333842);
+  border-radius: 8px;
+  width: min(680px, calc(100vw - 48px));
+  max-height: min(72vh, 720px);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.6);
+}
+
+.pbm__head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border, #333842);
+}
+.pbm__head h2 { margin: 0; font-size: 15px; font-weight: 600; color: var(--text-primary, #e8ecf1); }
+
+.pbm__close {
+  background: none;
+  border: none;
+  color: var(--text-secondary, #9aa4b2);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.pbm__close:hover { color: var(--text-primary, #e8ecf1); }
+
+.pbm__head-actions { display: flex; align-items: center; gap: 10px; }
+
+.pbm__new {
+  background: var(--accent, #00e5ff);
+  color: #06121a;
+  border: none;
+  border-radius: 5px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pbm__new:hover:not(:disabled) { filter: brightness(1.1); }
+.pbm__new:disabled { opacity: 0.5; cursor: default; }
+
+/* "Continue where you left off" — the autosave slot, offered not forced. */
+.pbm__last {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 10px 14px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--accent, #00e5ff);
+  border-radius: 6px;
+  background: rgba(0, 229, 255, 0.06);
+}
+.pbm__last-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pbm__last-text strong { font-size: 12.5px; color: var(--text-primary, #e8ecf1); }
+.pbm__last-text span {
+  font-size: 11.5px;
+  color: var(--text-secondary, #9aa4b2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pbm__last button {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--accent, #00e5ff);
+  color: var(--accent, #00e5ff);
+  border-radius: 5px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.pbm__last button:hover:not(:disabled) { background: rgba(0, 229, 255, 0.12); }
+.pbm__last button:disabled { opacity: 0.5; cursor: default; }
+
+.pbm__ghost {
+  background: transparent;
+  border: 1px solid var(--border, #333842);
+  color: var(--text-secondary, #9aa4b2);
+  border-radius: 5px;
+  padding: 6px 11px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.pbm__ghost:hover:not(:disabled) { color: var(--text-primary, #e8ecf1); border-color: var(--text-secondary, #9aa4b2); }
+.pbm__ghost:disabled { opacity: 0.5; cursor: default; }
+
+/* Pre-folder projects, kept reachable so nothing is stranded. */
+.pbm__row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  background: none;
+  border: none;
+  padding: 8px 4px;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+.pbm__row-main:disabled { opacity: 0.5; cursor: default; }
+.pbm__row-main:focus-visible { outline: 2px solid var(--accent, #00e5ff); outline-offset: -2px; border-radius: 4px; }
+
+.pbm__row-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary, #e8ecf1);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pbm__row-main:hover .pbm__row-name { color: var(--accent, #00e5ff); }
+
+.pbm__row-meta { font-size: 11.5px; color: var(--text-secondary, #9aa4b2); }
+
+.pbm__row-actions { flex: none; display: flex; gap: 6px; }
+
+.pbm__legacy { padding: 4px 14px 10px; border-top: 1px solid var(--border, #333842); margin-top: 6px; }
+
+.pbm__legacy-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.pbm__legacy-head h3 { margin: 12px 0 6px; }
+
+/* Two-step confirm: destructive actions never fire on a single click. */
+.pbm__confirm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-secondary, #9aa4b2);
+}
+.pbm__confirm button {
+  padding: 4px 9px;
+  border: 1px solid var(--border, #333842);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary, #9aa4b2);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.pbm__confirm button:hover:not(:disabled) { color: var(--text-primary, #e8ecf1); }
+.pbm__confirm button:disabled { opacity: 0.45; cursor: default; }
+
+.pbm__legacy-head .pbm__danger,
+.pbm__confirm .pbm__danger {
+  border-color: #ff5566;
+  color: #ff5566;
+  background: transparent;
+  border-width: 1px;
+  border-style: solid;
+  border-radius: 4px;
+  padding: 4px 9px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.pbm__legacy-head .pbm__danger:hover:not(:disabled),
+.pbm__confirm .pbm__danger:hover:not(:disabled) { background: rgba(255, 85, 102, 0.12); color: #ff5566; }
+.pbm__legacy-head .pbm__danger:disabled { opacity: 0.45; cursor: default; }
+.pbm__legacy h3 {
+  margin: 12px 0 6px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary, #9aa4b2);
+  font-weight: 600;
+}
+
+.pbm__empty, .pbm__hint {
+  margin: 0;
+  padding: 18px;
+  font-size: 12.5px;
+  color: var(--text-secondary, #9aa4b2);
+}
+.pbm__hint { padding: 6px 2px; }
+
+/* The single scroll region. Head and foot stay put; everything between them
+   scrolls as one, so no section can push the modal past its own height. */
+.pbm__body {
+  flex: 1;
+  min-height: 0;              /* without this a flex child refuses to shrink */
+  overflow-y: auto;
+}
+
+.pbm__list { padding: 6px 10px; }
+
+.pbm__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+}
+.pbm__row:hover { background: rgba(255, 255, 255, 0.03); }
+.pbm__row--current { border-color: var(--accent, #00e5ff); background: rgba(0, 229, 255, 0.05); }
+
+.pbm__badge {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--accent, #00e5ff);
+  color: #04202a;
+  font-weight: 700;
+}
+.pbm__badge--legacy { background: #ffb454; color: #2a1c04; }
+
+.pbm__row-actions button {
+  padding: 4px 9px;
+  border: 1px solid var(--border, #333842);
+  border-radius: 4px;
+  background: var(--bg-input, #23272e);
+  color: var(--text-primary, #e8ecf1);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.pbm__row-actions button:hover:not(:disabled) { border-color: var(--accent, #00e5ff); }
+.pbm__row-actions button:disabled { opacity: 0.45; cursor: default; }
+.pbm__row-actions .pbm__danger { border-color: #ff5566; color: #ff5566; }
+
+.pbm__backups {
+  margin: 8px 0 2px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--border, #333842);
+}
+
+.pbm__backup {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 11.5px;
+  color: var(--text-secondary, #9aa4b2);
+}
+.pbm__backup-size { margin-left: auto; font-variant-numeric: tabular-nums; }
+.pbm__backup button {
+  padding: 2px 8px;
+  border: 1px solid var(--border, #333842);
+  border-radius: 4px;
+  background: var(--bg-input, #23272e);
+  color: var(--text-primary, #e8ecf1);
+  font-size: 11px;
+  cursor: pointer;
+}
+.pbm__backup button:hover:not(:disabled) { border-color: var(--accent, #00e5ff); }
+
+.pbm__foot {
+  flex: none;
+  margin: 0;
+  padding: 10px 18px 14px;
+  border-top: 1px solid var(--border, #333842);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary, #9aa4b2);
+}

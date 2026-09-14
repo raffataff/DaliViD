@@ -422,3 +422,291 @@
   font-size: 12px;
   cursor: help;
 }
+
+/* ══════════════════════════════════════════════════════════
+   Collapse + resize
+   Card geometry is per-node (`collapsed`, `width`, `height`). Width and height
+   arrive as INLINE styles from NodeCard; everything here is the chrome around
+   them. Keep .node-card { width } in sync with NODE_WIDTH — it is the fallback,
+   and the constant is what every hit test derives from.
+   ══════════════════════════════════════════════════════════ */
+
+/* ── Param rows follow the card's width ──
+   The label column used to be a hard 60px, so widening a card grew only the
+   slider and a long param name stayed truncated forever — the whole point of
+   being able to widen it. A percentage track grows with the card instead.
+   It is a shared custom property rather than a content-sized `auto` track
+   because every row is its OWN grid: an `auto` track would size to each row's
+   own label and the sliders would come out ragged. */
+.node-card {
+  --node-label-col: clamp(60px, 32%, 190px);
+}
+
+.node-card__slider-row {
+  grid-template-columns: var(--node-label-col) minmax(48px, 1fr) 46px;
+}
+
+/* A slider row is a GRID inside a FLEX parent, and a flex item does not grow by
+   default — so the row was never filling the card. It only looked as though it
+   did because `<input type="range">` has an intrinsic width (~129px) that padded
+   the middle track out to roughly the right size by luck. That accident is also
+   why a percentage label track resolved to its floor: the grid container was
+   sized to its own content, so there was no container width to take 32% of.
+   Make the row actually fill its parent, and let it shrink below content. */
+.node-card__param-row-with-socket > .node-card__slider-row,
+.node-card__exposed-param-row > .node-card__slider-row {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* The label and slider carried min-widths (48px / 40px) that, with the fixed
+   46px value column and the gaps, made a row's min-content wider than a narrow
+   card — which is what forced the horizontal overflow. The grid tracks above own
+   the sizing now, so the children must be free to shrink into them. */
+.node-card__slider-label,
+.node-card__slider,
+.node-card__select {
+  min-width: 0;
+}
+
+/* ── Disclosure triangle (collapse) ── */
+.node-card__disclosure {
+  width: 16px;
+  height: 20px;
+  margin: 0 3px 0 -2px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: rgba(255, 255, 255, 0.32);
+  cursor: pointer;
+  transition: transform 0.12s, color 0.12s, background 0.12s;
+}
+
+.node-card__disclosure:hover {
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.node-card__disclosure--collapsed {
+  transform: rotate(-90deg);
+}
+
+/* ── Collapsed ── */
+.node-card--collapsed {
+  min-height: 0;
+}
+
+/* The rule under the header reads as "more below", which is the one thing a
+   collapsed card is claiming isn't true. */
+.node-card--collapsed .node-card__header {
+  border-bottom-color: transparent;
+
+  /* Pinned so NODE_HEADER_H can be a constant. Left alone the header is sized by
+     its 27px action buttons — and a LOCKED node renders fewer of them, so the
+     collapsed height would differ per node and estimateNodeHeight could not be
+     right for both. Smaller buttons also suit the compact state. */
+  min-height: 34px;
+  height: 34px;
+}
+
+.node-card--collapsed .node-card__action-btn {
+  width: 22px;
+  height: 22px;
+}
+
+/* One row: inputs hugging the left edge, outputs the right. Height must match
+   NODE_RAIL_H in nodeGeometry.js — estimateNodeHeight answers for cards that
+   aren't mounted, so it can't measure this. */
+.node-card__rail {
+  display: flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 2px 2px;
+}
+
+.node-card__rail-side {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.node-card__rail-side--in {
+  margin-left: -6px;
+}
+
+.node-card__rail-side--out {
+  margin-left: auto;
+  margin-right: -6px;
+}
+
+/* A mini socket's dot is 8px, which is a poor wire target. Pad the .socket hit
+   box out instead of growing the dot — getSocketPos anchors noodles to the
+   CIRCLE, so the wire still lands dead centre on the visible dot. */
+.node-card__rail .socket {
+  padding: 6px 5px;
+}
+
+/* ── Explicitly sized (bottom edge dragged) ── */
+/* The params list is the region that absorbs the difference; everything else on
+   the card is fixed chrome. Applied only when a height is set, so an ordinary
+   content-sized card keeps the plain block layout it has always had. */
+.node-card--sized {
+  display: flex;
+  flex-direction: column;
+}
+
+.node-card--sized > * {
+  flex-shrink: 0;
+}
+
+.node-card--sized .node-card__params {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+
+  /* overflow-x MUST be stated. A scroll container clips both axes, and leaving
+     this `visible` makes CSS compute it to `auto` instead — which produced a
+     permanent horizontal scrollbar, because `[data-tooltip]::after` is in the
+     DOM at all times (opacity 0, `white-space: nowrap`) and a long one like
+     "Drag to scrub (Shift = fine) · Click to type" measured ~112px past the
+     right edge. Nothing was actually scrollable there; the bar was pure noise. */
+  overflow-x: hidden;
+
+  /* …but clipping at the padding box would also slice off the param sockets,
+     which sit at `left: -13px` so they straddle the card's border. Measured
+     before this: 7 of the socket's 8 pixels gone AND `elementFromPoint` at its
+     centre returning the resize handle, i.e. the float inputs on a sized card
+     were unwireable. Pad the box out past them and pull it back by the same
+     amount, so the clip edge moves but the content does not: the row's content
+     box starts at exactly the same x as an unsized card's. */
+  padding-left: 22px;
+  margin-left: -16px;
+
+  /* Don't chain the wheel out to the canvas at the ends — NodeCanvas's wheel
+     handler already decides when to hand the gesture back to zoom. */
+  overscroll-behavior: contain;
+}
+
+/* ── Resize handles ── */
+/* Hit areas only — no decoration at rest. The cursor already announces an edge,
+   and tinting all four on card hover put a cyan cage around every node you
+   passed over. The only persistent affordance is the corner grip below.
+   Each strip straddles its edge (half in, half out) so it stays grabbable when
+   zoomed out, and all of them are inset the SAME 12px from the corners so the
+   hover lines read as one system — the bottom strip used to be inset 12px while
+   the sides were inset 10px, which is what made it look misaligned.
+   Sockets carry a higher z-index (Socket.css) and win where they overlap, which
+   is what keeps a node on either edge wireable. */
+.node-card__resize {
+  position: absolute;
+  z-index: 1;
+}
+
+.node-card__resize::after {
+  content: '';
+  position: absolute;
+  opacity: 0;
+  transition: opacity 0.12s, color 0.12s;
+  pointer-events: none;
+}
+
+.node-card__resize--w,
+.node-card__resize--e {
+  top: 12px;
+  bottom: 12px;
+  width: 10px;
+  cursor: ew-resize;
+}
+
+.node-card__resize--w { left: -5px; }
+.node-card__resize--e { right: -5px; }
+
+.node-card__resize--s {
+  left: 12px;
+  right: 12px;
+  bottom: -5px;
+  height: 10px;
+  cursor: ns-resize;
+}
+
+/* A 2px line flush with the edge, shown only while that handle itself is
+   hovered — confirmation of the target, not a permanent border. */
+.node-card__resize--w::after,
+.node-card__resize--e::after {
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  right: 4px;
+  border-radius: 1px;
+  background: var(--accent-cyan, #00e5ff);
+}
+
+.node-card__resize--s::after {
+  left: 0;
+  right: 0;
+  top: 4px;
+  bottom: 4px;
+  border-radius: 1px;
+  background: var(--accent-cyan, #00e5ff);
+}
+
+.node-card__resize--w:hover::after,
+.node-card__resize--e:hover::after,
+.node-card__resize--s:hover::after {
+  opacity: 0.7;
+}
+
+.node-card__resize--sw,
+.node-card__resize--se {
+  bottom: -5px;
+  width: 14px;
+  height: 14px;
+  /* Above the edge strips they overlap, so a corner drag is never ambiguous. */
+  z-index: 2;
+}
+
+.node-card__resize--sw { left: -5px; cursor: nesw-resize; }
+.node-card__resize--se { right: -5px; cursor: nwse-resize; }
+
+/* The one visible affordance: a small bracket in the bottom-right corner,
+   echoing the card's own radius. Faint on card hover so resizing is
+   discoverable, accent on its own hover. */
+.node-card__resize--se::after {
+  right: 3px;
+  bottom: 3px;
+  width: 9px;
+  height: 9px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  border-bottom-right-radius: 5px;
+  color: rgba(255, 255, 255, 0.28);
+}
+
+.node-card:hover .node-card__resize--se::after {
+  opacity: 1;
+}
+
+.node-card__resize--se:hover::after {
+  color: var(--accent-cyan, #00e5ff);
+  opacity: 1;
+}
+
+.node-card__resize--sw::after {
+  left: 3px;
+  bottom: 3px;
+  width: 9px;
+  height: 9px;
+  border-left: 2px solid var(--accent-cyan, #00e5ff);
+  border-bottom: 2px solid var(--accent-cyan, #00e5ff);
+  border-bottom-left-radius: 5px;
+}
+
+.node-card__resize--sw:hover::after {
+  opacity: 0.7;
+}

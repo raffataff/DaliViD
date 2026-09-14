@@ -4,6 +4,7 @@ import useGraphStore from '../../store/useGraphStore'
 import useTimelineStore from '../../store/useTimelineStore'
 import { parseParams } from '../../utils/paramParser'
 import { prepareImageDataURL } from '../../utils/imageProcessing'
+import useMediaStore from '../../store/useMediaStore'
 import { resolveFont, fontWeightRange, clampWeight } from '../../utils/fontRegistry'
 import FontPicker from './FontPicker'
 import { getNodeSource, getShaderSource } from '../../shaders/shaderRegistry'
@@ -91,6 +92,102 @@ export default function Inspector() {
         {inspectorContext === 'track' && <TrackInspector trackId={selectedTrackId} />}
       </div>
     </>
+  )
+}
+
+/**
+ * Numeric slider row shared by every Inspector control.
+ *
+ * Matches the node-card sliders: drag the track, double-click the track to
+ * reset to the default, drag the number to scrub it (Shift = fine), click the
+ * number to type an exact value. `scale`/`suffix` let a row show its own unit
+ * (opacity as %, fades as s) while the stored value stays raw.
+ */
+function InspectorSlider({
+  value, min = 0, max = 1, step = 0.01, def,
+  onChange, disabled = false,
+  scale = 1, suffix = '', decimals = 2,
+  valuePrefix = '', valueProps = {},
+}) {
+  const [isEditing, setIsEditing] = useState(false)
+  const [editValue, setEditValue] = useState('')
+
+  const num = typeof value === 'number' && Number.isFinite(value) ? value : (parseFloat(value) || 0)
+  const hasDefault = def !== undefined && def !== null
+  const round6 = (v) => parseFloat(v.toFixed(6))
+  const clamp = (v) => round6(Math.max(min, Math.min(max, v)))
+  const snap = (v) => clamp(step > 0 ? Math.round(v / step) * step : v)
+
+  // Drag the readout to scrub: a full ~250px sweep covers min→max, Shift makes
+  // it 10x finer. A plain click (< 3px of travel) opens the type-in box.
+  const handleValueMouseDown = (e) => {
+    if (disabled) return
+    e.stopPropagation()
+    e.preventDefault()
+    const startX = e.clientX
+    const startValue = num
+    let scrubbed = false
+    const handleMove = (ev) => {
+      const dx = ev.clientX - startX
+      if (!scrubbed && Math.abs(dx) < 3) return
+      scrubbed = true
+      const sensitivity = (max - min) / (ev.shiftKey ? 2500 : 250)
+      onChange(snap(startValue + dx * sensitivity))
+    }
+    const handleUp = () => {
+      document.removeEventListener('mousemove', handleMove)
+      document.removeEventListener('mouseup', handleUp)
+      if (!scrubbed) { setEditValue(String(round6(num * scale))); setIsEditing(true) }
+    }
+    document.addEventListener('mousemove', handleMove)
+    document.addEventListener('mouseup', handleUp)
+  }
+
+  // One string, deliberately — NOT {prefix}{value}{suffix}. Renderer.js writes
+  // `el.textContent` straight into this span every frame for modulated params;
+  // React only tolerates that when the span has a single text child. Split it
+  // into several and React loses track of them, then throws NotFoundError on
+  // the next update.
+  const readout = `${valuePrefix}${(num * scale).toFixed(decimals)}${suffix}`
+
+  const commitEdit = () => {
+    const typed = parseFloat(editValue)
+    if (!isNaN(typed)) onChange(clamp(typed / scale))
+    setIsEditing(false)
+  }
+
+  return (
+    <div className="inspector__slider">
+      <input
+        type="range" min={min} max={max} step={step} value={num} disabled={disabled}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        onDoubleClick={() => { if (!disabled && hasDefault) onChange(clamp(def)) }}
+        title={hasDefault ? 'Double-click to reset' : undefined}
+      />
+      {isEditing ? (
+        <input
+          className="inspector__slider-input mono" type="number" value={editValue} autoFocus
+          min={round6(min * scale)} max={round6(max * scale)} step={round6(step * scale)}
+          onFocus={(e) => e.target.select()}
+          onChange={(e) => setEditValue(e.target.value)}
+          onBlur={commitEdit}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') e.target.blur()
+            if (e.key === 'Escape') setIsEditing(false)
+            e.stopPropagation()
+          }}
+        />
+      ) : (
+        <span
+          className={`inspector__slider-value mono ${disabled ? '' : 'inspector__slider-value--scrub'}`}
+          {...valueProps}
+          onMouseDown={handleValueMouseDown}
+          title={disabled ? undefined : 'Drag to scrub (Shift = fine) · Click to type'}
+        >
+          {readout}
+        </span>
+      )}
+    </div>
   )
 }
 
@@ -428,11 +525,10 @@ function CompoundParamRow({ ep, onChange }) {
   return (
     <div className="inspector__field">
       <label className="inspector__label">{label}</label>
-      <div className="inspector__slider">
-        <input type="range" min={param.min} max={param.max} step={param.step} value={value}
-          onChange={(e) => onChange(parseFloat(e.target.value))} />
-        <span className="inspector__slider-value mono">{Number(value).toFixed(2)}</span>
-      </div>
+      <InspectorSlider
+        value={value} min={param.min} max={param.max} step={param.step} def={param.default}
+        onChange={onChange}
+      />
     </div>
   )
 }
@@ -497,11 +593,10 @@ function CompoundInnerParamRow({ innerNodeId, param, value, compoundNode, graphL
   return (
     <div className="inspector__field">
       <label className="inspector__label" style={{ fontSize: 11, paddingLeft: 8 }}>{param.name}</label>
-      <div className="inspector__slider">
-        <input type="range" min={param.min} max={param.max} step={param.step} value={currentValue}
-          onChange={(e) => handleChange(parseFloat(e.target.value))} />
-        <span className="inspector__slider-value mono">{Number(currentValue).toFixed(2)}</span>
-      </div>
+      <InspectorSlider
+        value={currentValue} min={param.min} max={param.max} step={param.step} def={param.default}
+        onChange={handleChange}
+      />
     </div>
   )
 }
@@ -513,10 +608,10 @@ function FieldNum({ label, value, def, min, max, step, onChange }) {
   return (
     <div className="inspector__field">
       <label className="inspector__label">{label}</label>
-      <div className="inspector__slider">
-        <input type="range" min={min} max={max} step={step} value={v} onChange={(e) => onChange(parseFloat(e.target.value))} />
-        <span className="inspector__slider-value">{Number(v).toFixed(decimals)}</span>
-      </div>
+      <InspectorSlider
+        value={v} min={min} max={max} step={step} def={def}
+        decimals={decimals} onChange={onChange}
+      />
     </div>
   )
 }
@@ -882,8 +977,27 @@ function ClipInspector({ clipId }) {
       const file = e.target.files?.[0]
       if (!file) return
       try {
-        const { dataUrl } = await prepareImageDataURL(file)
-        updateClip(clipId, { params: { ...clip.params, imageSrc: dataUrl, imageName: file.name }, filename: file.name })
+        const { dataUrl, width, height } = await prepareImageDataURL(file)
+        // Stored as a blob, referenced by id. imageSrc stays as the runtime URL
+        // and is dropped by the serializer; on a storage failure it falls back
+        // to the data URL so the clip still shows the picture.
+        let src = dataUrl
+        let imageRefId = null
+        try {
+          const blob = await fetch(dataUrl).then(r => r.blob())
+          const ref = await useMediaStore.getState().ingestBytes(blob, {
+            filename: file.name, kind: 'image',
+            mime: blob.type || 'image/webp', meta: { width, height },
+          })
+          imageRefId = ref.id
+          src = useMediaStore.getState().urlFor(ref.id) || dataUrl
+        } catch (err) {
+          console.warn('[DaliVid] Image kept in-document (could not store it):', err)
+        }
+        updateClip(clipId, {
+          params: { ...clip.params, imageSrc: src, imageRefId, imageName: file.name },
+          filename: file.name,
+        })
       } catch (err) { console.error('[DaliVid] Failed to load image:', err) }
     }
     input.click()
@@ -910,7 +1024,7 @@ function ClipInspector({ clipId }) {
       <div className="inspector__field"><label className="inspector__label">Start</label><span className="inspector__value inspector__value--mono">{clip.timelineStart.toFixed(2)}s</span></div>
       <div className="inspector__field"><label className="inspector__label">End</label><span className="inspector__value inspector__value--mono">{clip.timelineEnd.toFixed(2)}s</span></div>
       <div className="inspector__field"><label className="inspector__label">Duration</label><span className="inspector__value inspector__value--mono">{(clip.timelineEnd - clip.timelineStart).toFixed(2)}s</span></div>
-      <div className="inspector__field"><label className="inspector__label">Speed</label><div className="inspector__slider"><input type="range" min={0.1} max={4} step={0.05} value={clip.speed || 1} onChange={(e) => updateClip(clipId, { speed: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(clip.speed || 1).toFixed(2)}×</span></div></div>
+      <div className="inspector__field"><label className="inspector__label">Speed</label><InspectorSlider value={clip.speed == null ? 1 : clip.speed} min={0.1} max={4} step={0.05} def={1} suffix="×" onChange={(v) => updateClip(clipId, { speed: v })} /></div>
       {(clip.fileType === 'video' || clip.fileType === 'audio') && (
         <>
           <div className="inspector__field">
@@ -927,7 +1041,7 @@ function ClipInspector({ clipId }) {
           )}
         </>
       )}
-      <div className="inspector__field"><label className="inspector__label">Opacity</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={clip.opacity || 1} onChange={(e) => updateClip(clipId, { opacity: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{((clip.opacity || 1) * 100).toFixed(0)}%</span></div></div>
+      <div className="inspector__field"><label className="inspector__label">Opacity</label><InspectorSlider value={clip.opacity == null ? 1 : clip.opacity} min={0} max={1} step={0.01} def={1} scale={100} decimals={0} suffix="%" onChange={(v) => updateClip(clipId, { opacity: v })} /></div>
       <div className="inspector__field"><label className="inspector__label">Blend Mode</label><BlendModeSelect allowInherit value={clip.blendMode || 'Inherit'} onChange={(v) => updateClip(clipId, { blendMode: v })} /></div>
       {/* Fade lengths for clips with no picture. For everything else these ARE
           the transition durations, so they live in the Transition In / Out
@@ -939,17 +1053,17 @@ function ClipInspector({ clipId }) {
         <>
           <div className="inspector__field">
             <label className="inspector__label">Fade In</label>
-            <div className="inspector__slider">
-              <input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeIn || 0} onChange={(e) => updateClip(clipId, { fadeIn: parseFloat(e.target.value) })} />
-              <span className="inspector__slider-value">{(clip.fadeIn || 0).toFixed(2)}s</span>
-            </div>
+            <InspectorSlider
+              value={clip.fadeIn || 0} min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05}
+              def={0} suffix="s" onChange={(v) => updateClip(clipId, { fadeIn: v })}
+            />
           </div>
           <div className="inspector__field">
             <label className="inspector__label">Fade Out</label>
-            <div className="inspector__slider">
-              <input type="range" min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05} value={clip.fadeOut || 0} onChange={(e) => updateClip(clipId, { fadeOut: parseFloat(e.target.value) })} />
-              <span className="inspector__slider-value">{(clip.fadeOut || 0).toFixed(2)}s</span>
-            </div>
+            <InspectorSlider
+              value={clip.fadeOut || 0} min={0} max={Math.max(0.1, clip.timelineEnd - clip.timelineStart)} step={0.05}
+              def={0} suffix="s" onChange={(v) => updateClip(clipId, { fadeOut: v })}
+            />
           </div>
         </>
       )}
@@ -1002,7 +1116,7 @@ function ClipInspector({ clipId }) {
               <span className="inspector__toggle-slider" />
             </label>
           </div>
-          <div className="inspector__field"><label className="inspector__label">Volume</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={clip.volume == null ? 1 : clip.volume} onChange={(e) => updateClip(clipId, { volume: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{((clip.volume == null ? 1 : clip.volume) * 100).toFixed(0)}%</span></div></div>
+          <div className="inspector__field"><label className="inspector__label">Volume</label><InspectorSlider value={clip.volume == null ? 1 : clip.volume} min={0} max={1} step={0.01} def={1} scale={100} decimals={0} suffix="%" onChange={(v) => updateClip(clipId, { volume: v })} /></div>
           <div style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '0 8px 6px' }}>
             Audio follows the clip&apos;s fades; transitions crossfade it automatically
           </div>
@@ -1127,13 +1241,10 @@ function EdgeTransitionSection({ clip, edge, region, nextOverlap, transitionComp
             {region.dur.toFixed(2)}s (overlap)
           </span>
         ) : (
-          <div className="inspector__slider">
-            <input
-              type="range" min={0} max={clipDur} step={0.05} value={lengthValue}
-              onChange={(e) => updateClip(clip.id, { [lengthKey]: parseFloat(e.target.value) })}
-            />
-            <span className="inspector__slider-value">{lengthValue.toFixed(2)}s</span>
-          </div>
+          <InspectorSlider
+            value={lengthValue} min={0} max={clipDur} step={0.05} def={0} suffix="s"
+            onChange={(v) => updateClip(clip.id, { [lengthKey]: v })}
+          />
         )}
       </div>
 
@@ -1262,7 +1373,7 @@ function TrackInspector({ trackId }) {
           <span className="inspector__slider-value">{index + 1} / {tracks.length} — {layerNote}</span>
         </div>
       </div>
-      <div className="inspector__field"><label className="inspector__label">Opacity</label><div className="inspector__slider"><input type="range" min={0} max={1} step={0.01} value={track.opacity} onChange={(e) => updateTrack(trackId, { opacity: parseFloat(e.target.value) })} /><span className="inspector__slider-value">{(track.opacity * 100).toFixed(0)}%</span></div></div>
+      <div className="inspector__field"><label className="inspector__label">Opacity</label><InspectorSlider value={track.opacity == null ? 1 : track.opacity} min={0} max={1} step={0.01} def={1} scale={100} decimals={0} suffix="%" onChange={(v) => updateTrack(trackId, { opacity: v })} /></div>
       <div className="inspector__field"><label className="inspector__label">Blend Mode</label><BlendModeSelect value={track.blendMode || 'Normal'} onChange={(v) => updateTrack(trackId, { blendMode: v })} /></div>
       <button className="inspector__btn" onClick={() => removeTrack(trackId)} style={{ marginTop: 12, color: 'var(--status-error)' }}>Delete Track</button>
     </div>
@@ -1307,13 +1418,12 @@ function InspectorParam({ nodeId, param, value, onChange, isConnected }) {
   return (
     <div className={`inspector__field ${isConnected ? 'inspector__field--disabled' : ''}`}>
       <label className="inspector__label">{param.name}</label>
-      <div className="inspector__slider">
-        <input type="range" min={param.min} max={param.max} step={param.step} value={value}
-          onChange={(e) => onChange(parseFloat(e.target.value))} disabled={isConnected} />
-        <span className="inspector__slider-value mono" data-node-id={nodeId} data-node-param-display={param.uniformName}>
-          {isConnected ? '⚡ ' + Number(value).toFixed(2) : Number(value).toFixed(2)}
-        </span>
-      </div>
+      <InspectorSlider
+        value={value} min={param.min} max={param.max} step={param.step} def={param.default}
+        onChange={onChange} disabled={isConnected}
+        valuePrefix={isConnected ? '⚡ ' : ''}
+        valueProps={{ 'data-node-id': nodeId, 'data-node-param-display': param.uniformName }}
+      />
     </div>
   )
 }
